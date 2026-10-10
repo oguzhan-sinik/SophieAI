@@ -1,0 +1,6 @@
+{"at": "2026-10-10T18:02:00+00:00", "event": "candidate_created", "candidate_id": "cand_root", "parent_id": null, "generation": 0, "mutation_kind": "baseline"}
+{"at": "2026-10-10T18:02:01+00:00", "event": "validation", "candidate_id": "cand_root", "valid": true, "evidence_type": "static", "errors": []}
+{"at": "2026-10-10T18:03:00+00:00", "event": "candidate_created", "candidate_id": "cand_bad", "parent_id": "cand_root", "generation": 1, "mutation_kind": "change_prompt"}
+{"at": "2026-10-10T18:03:01+00:00", "event": "validation", "candidate_id": "cand_bad", "valid": false, "evidence_type": "static", "errors": ["node lookup: response_mapping references unknown variable"]}
+{"at": "2026-10-10T18:04:00+00:00", "event": "candidate_created", "candidate_id": "cand_good", "parent_id": "cand_root", "generation": 1, "mutation_kind": "add_guard"}
+{"at": "2026-10-10T18:04:01+00:00", "event": "validation", "candidate_id": "cand_good", "valid": true, "evidence_type": "static", "errors": []}

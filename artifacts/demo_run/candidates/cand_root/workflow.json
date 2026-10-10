@@ -1,0 +1,34 @@
+{
+ "initial_node": "greeting",
+ "system_prompt": "You are Freya Bank's assistant.",
+ "nodes": {
+  "greeting": {
+   "name": "greeting",
+   "node_type": "conversation",
+   "task_message": "Say hello and verify identity.",
+   "transitions": [
+    {
+     "target_node": "lookup",
+     "description": "verified"
+    }
+   ]
+  },
+  "lookup": {
+   "name": "lookup",
+   "node_type": "conversation",
+   "task_message": "Look up the account {{account_number}}.",
+   "transitions": [
+    {
+     "target_node": "done",
+     "description": "account found"
+    }
+   ]
+  },
+  "done": {
+   "name": "done",
+   "node_type": "conversation",
+   "task_message": "Goodbye.",
+   "transitions": []
+  }
+ }
+}

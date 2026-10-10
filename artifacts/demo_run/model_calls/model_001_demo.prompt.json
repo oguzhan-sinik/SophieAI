@@ -1,0 +1,1 @@
+{"instruction": "Generate a WorkflowSpec for the supplied policy.", "payload": {"brief": "SYNTHETIC DEMO BRIEF"}, "output_schema": {"type": "object"}}

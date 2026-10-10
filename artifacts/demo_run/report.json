@@ -1,0 +1,15 @@
+{
+ "run_id": "demo_run",
+ "status": "succeeded",
+ "candidate_id": "cand_good",
+ "final_score": 0.75,
+ "strict_pass_rate": 0.75,
+ "evaluation_type": "official_public",
+ "start": "2026-10-10T18:00:00+00:00",
+ "end": "2026-10-10T18:06:00+00:00",
+ "seconds": 360,
+ "simulations": 2,
+ "valid_candidates": 2,
+ "invalid_candidates": 1,
+ "model_calls": 1
+}

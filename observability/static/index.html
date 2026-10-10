@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Freya Builder Studio</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2129;--border:#2d333b;--text:#e6edf3;
+  --dim:#8b949e;--accent:#58a6ff;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--unk:#6e7681;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+header{display:flex;align-items:center;gap:10px;padding:6px 12px;background:var(--panel);border-bottom:1px solid var(--border);flex-wrap:wrap}
+header h1{font-size:14px;margin:0 8px 0 0;color:var(--accent);white-space:nowrap}
+select,input[type=search]{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font:inherit}
+.meta{color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;padding:1px 7px;border-radius:8px;font-size:11px;border:1px solid var(--border);background:var(--panel2)}
+.b-ok{color:var(--ok);border-color:var(--ok)} .b-bad{color:var(--bad);border-color:var(--bad)}
+.b-warn{color:var(--warn);border-color:var(--warn)} .b-unk{color:var(--unk)}
+.b-champ{color:#b392f0;border-color:#b392f0;font-weight:600}
+#live{cursor:pointer} #live.on{color:var(--ok)} #live.off{color:var(--bad)}
+main{flex:1;display:flex;min-height:0}
+.pane{background:var(--panel);overflow:auto;min-width:120px}
+#left{width:22%;border-right:1px solid var(--border)}
+#center{flex:1;background:var(--bg);border-right:1px solid var(--border)}
+#right{width:30%;position:relative;display:flex;flex-direction:column}
+.pane h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:0;padding:8px 10px;border-bottom:1px solid var(--border);position:sticky;top:0;background:var(--panel);z-index:2}
+.stickytools{position:sticky;top:0;background:var(--panel);z-index:3;padding:6px 8px;border-bottom:1px solid var(--border);display:flex;gap:6px;align-items:center}
+.row{padding:5px 10px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;gap:6px;align-items:baseline}
+.row:hover{background:var(--panel2)}
+.row.sel{background:#1f3a5f;outline:1px solid var(--accent)}
+.row .t{font-family:var(--mono);font-size:11px;color:var(--dim);white-space:nowrap}
+.row .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;flex:none;margin-top:3px}
+.dot.succeeded{background:var(--ok)} .dot.failed{background:var(--bad)} .dot.running,.dot.interrupted{background:var(--warn)}
+.dot.warning{background:var(--warn)} .dot.unknown{background:var(--unk)}
+#center .wrap{padding:14px 18px;max-width:1100px}
+.crumbs{color:var(--dim);font-size:12px;margin-bottom:8px;font-family:var(--mono)}
+.crumbs b{color:var(--text)}
+h3.sec{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--accent);margin:18px 0 6px;border-bottom:1px solid var(--border);padding-bottom:3px}
+table.kv{border-collapse:collapse;font-size:12px}
+table.kv td{padding:2px 12px 2px 0;vertical-align:top}
+table.kv td:first-child{color:var(--dim);white-space:nowrap}
+pre.code{background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:10px;font-family:var(--mono);font-size:11.5px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word}
+.errbox{background:#2d1214;border:1px solid var(--bad);border-radius:6px;padding:8px 10px;font-family:var(--mono);font-size:12px;color:#ffb3ad;margin:6px 0;white-space:pre-wrap}
+.warnbox{background:#2a2108;border:1px solid var(--warn);border-radius:6px;padding:8px 10px;font-size:12px;margin:6px 0;white-space:pre-wrap}
+.tabs{display:flex;gap:2px;border-bottom:1px solid var(--border);margin-bottom:10px;flex-wrap:wrap}
+.tabs button{background:none;border:none;color:var(--dim);padding:6px 12px;cursor:pointer;font:inherit;border-bottom:2px solid transparent}
+.tabs button.act{color:var(--text);border-bottom-color:var(--accent)}
+.tabs button:hover{color:var(--text)}
+button.ctl{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:3px 9px;cursor:pointer;font:inherit;font-size:12px}
+button.ctl:hover{border-color:var(--accent)}
+#svgwrap{flex:1;min-height:0;overflow:hidden;cursor:grab}
+#treeSvg{width:100%;height:100%;display:block}
+#graphTools{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:5}
+#warnCount{position:absolute;bottom:8px;left:8px;z-index:5;font-size:11px;color:var(--warn)}
+.gnode{cursor:pointer}
+.gnode rect{fill:var(--panel2);stroke:var(--border);rx:5}
+.gnode.sel rect{stroke:var(--accent);stroke-width:2}
+.gnode.champ rect{stroke:#b392f0;stroke-width:2}
+.gnode.invalid rect{stroke:var(--bad)}
+.gnode text{fill:var(--text);font-family:var(--mono);font-size:11px;pointer-events:none}
+.gnode .sub{fill:var(--dim);font-size:10px}
+.gedge{stroke:#444c56;fill:none;stroke-width:1.4}
+.empty{color:var(--dim);padding:24px;text-align:center}
+.mono{font-family:var(--mono)}
+.score-pill{font-family:var(--mono);font-size:11px;border:1px solid var(--border);border-radius:4px;padding:1px 6px}
+.diffadd{color:var(--ok)} .diffrem{color:var(--bad)}
+::-webkit-scrollbar{width:9px;height:9px} ::-webkit-scrollbar-thumb{background:#30363d;border-radius:5px}
+@media (max-width:1100px){#left{width:28%}#right{width:34%}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Freya Builder Studio</h1>
+  <select id="runPicker" title="Run history"></select>
+  <span id="hdrStatus" class="badge b-unk">—</span>
+  <span class="meta" id="hdrMeta"></span>
+  <span class="meta" id="hdrChampion"></span>
+  <span style="flex:1"></span>
+  <span id="live" class="badge off" title="Toggle live follow (L)">● live</span>
+  <span class="meta" id="hdrUpdated"></span>
+</header>
+<main>
+  <div class="pane" id="left">
+    <h2>Traces</h2>
+    <div class="stickytools"><input type="search" id="traceSearch" placeholder="/ filter (agent, call, error)…"></div>
+    <div id="traceList"><div class="empty">No run selected</div></div>
+  </div>
+  <div class="pane" id="center"><div class="wrap" id="inspector"><div class="empty">Select a trace or a tree node</div></div></div>
+  <div class="pane" id="right">
+    <h2>Evolution lineage — all candidates</h2>
+    <div id="svgwrap"><svg id="treeSvg"></svg></div>
+    <div id="graphTools">
+      <button class="ctl" id="btnFit" title="Fit all (F)">Fit</button>
+      <button class="ctl" id="btnAll" title="Show entire tree">Show all</button>
+    </div>
+    <div id="warnCount"></div>
+  </div>
+</main>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const api=(p)=>fetch("/api/"+p).then(r=>r.json().then(j=>({ok:r.ok,status:r.status,body:j})));
+const fmtTime=t=>t?new Date(t).toLocaleTimeString():"—";
+const dur=ms=>ms==null?"":(ms<1000?ms+"ms":(ms/1000).toFixed(1)+"s");
+
+/* ---------- state (single shared selection; per-run view cache) ---------- */
+const S={
+  runs:[], runId:null, epoch:0, live:true, es:null,
+  tree:null, spans:null, summary:null,
+  sel:{kind:"none"},            // {kind:'span'|'candidate'|'run', id?}
+  traceQ:"", expanded:new Set(),
+  perRun:{}                      // runId -> {sel, traceQ}
+};
+function saveViewState(){ if(S.runId) S.perRun[S.runId]={sel:S.sel,traceQ:S.traceQ}; }
+function restoreViewState(){
+  const v=S.perRun[S.runId]||{};
+  S.sel=v.sel||{kind:"run"}; S.traceQ=v.traceQ||"";
+  $("#traceSearch").value=S.traceQ;
+}
+
+/* ---------- deep links ---------- */
+function pushLink(){
+  let h="#/runs/"+(S.runId||"");
+  if(S.sel.kind==="candidate") h+="?candidate="+encodeURIComponent(S.sel.id);
+  if(S.sel.kind==="span") h+="?span="+encodeURIComponent(S.sel.id);
+  history.replaceState(null,"",h);
+}
+function parseLink(){
+  const m=location.hash.match(/^#\/runs\/([^?]+)/);
+  if(!m) return null;
+  const q=new URLSearchParams(location.hash.split("?")[1]||"");
+  if(q.get("candidate")) return{runId:m[1],sel:{kind:"candidate",id:q.get("candidate")}};
+  if(q.get("span")) return{runId:m[1],sel:{kind:"span",id:q.get("span")}};
+  return{runId:m[1],sel:{kind:"run"}};
+}
+
+/* ---------- data loading ---------- */
+async function loadRuns(){
+  const r=await api("runs"); S.runs=r.body.items||[];
+  const pk=$("#runPicker");
+  pk.innerHTML=S.runs.map(r=>{
+    const s=r.status||"unknown";
+    return `<option value="${esc(r.run_id)}">${esc(r.run_id)} · ${esc(s)}${r.final_score!=null?" · "+r.final_score:""}</option>`;
+  }).join("");
+}
+async function selectRun(runId, sel){
+  if(!runId) {renderEmpty(); return;}
+  saveViewState(); S.epoch++; const ep=S.epoch;
+  if(S.es){S.es.close(); S.es=null;}
+  S.runId=runId; restoreViewState(); if(sel) S.sel=sel;
+  $("#runPicker").value=runId;
+  const [summ,tree,spans]=await Promise.all([
+    api("runs/"+runId), api("runs/"+runId+"/tree"), api("runs/"+runId+"/spans")]);
+  if(ep!==S.epoch) return; // stale response from previous run — drop
+  S.summary=summ.body; S.tree=tree.body; S.spans=spans.body;
+  renderHeader(); renderTraces(); renderTree(); renderInspector();
+  connectSSE(); pushLink();
+}
+function connectSSE(){
+  if(S.es) S.es.close();
+  if(!S.runId) return;
+  const ep=S.epoch;
+  const es=new EventSource("/api/runs/"+encodeURIComponent(S.runId)+"/stream");
+  S.es=es;
+  es.addEventListener("snapshot",()=>setLive(true));
+  es.addEventListener("changed",async()=>{
+    setLive(true);
+    if(!S.live) return;                       // paused: buffer ignored, next toggle refetches
+    const [summ,tree,spans]=await Promise.all([
+      api("runs/"+S.runId+"/tree"), api("runs/"+S.runId+"/spans"), api("runs/"+S.runId)]);
+    if(ep!==S.epoch) return;
+    S.tree=tree.body; S.spans=spans.body; S.summary=summ.body;
+    renderHeader(); renderTraces(); renderTree(); refreshInspectorIfVisible();
+    $("#hdrUpdated").textContent="updated "+fmtTime(new Date().toISOString());
+  });
+  es.onerror=()=>setLive(false);
+}
+function setLive(on){
+  const el=$("#live"); el.classList.toggle("on",on); el.classList.toggle("off",!on);
+  el.textContent=on?"● live":"○ reconnecting";
+}
+$("#live").onclick=()=>{S.live=!S.live; if(S.live) refreshAll();};
+function refreshAll(){ if(S.runId) selectRun(S.runId); }
+
+/* ---------- header ---------- */
+function renderHeader(){
+  const s=S.summary||{};
+  const st=$("#hdrStatus");
+  st.textContent=s.status||"unknown";
+  st.className="badge "+(s.status==="succeeded"||s.status==="completed"?"b-ok":s.status==="failed"?"b-bad":s.status==="interrupted"?"b-warn":"b-unk");
+  $("#hdrMeta").textContent=[s.mode,s.duration_seconds!=null?Math.round(s.duration_seconds)+"s":null,
+    s.candidate_count!=null?s.candidate_count+" candidates":null,
+    (s.builder_model||"").split("/").pop()].filter(Boolean).join(" · ");
+  $("#hdrChampion").textContent=s.champion_candidate_id?("champion "+s.champion_candidate_id+(s.final_score!=null?" · score "+s.final_score+" ("+(s.evaluation_type||"")+")":"")):"";
+  if(S.tree&&S.tree.warnings.length) $("#hdrChampion").textContent+=" ⚠ "+S.tree.warnings.length+" integrity warnings";
+}
+
+/* ---------- left: traces ---------- */
+function statusDot(st){return `<span class="dot ${esc(st||"unknown")}"></span>`;}
+function renderTraces(){
+  const q=S.traceQ.toLowerCase();
+  const spans=(S.spans?.spans||[]);
+  const match=sp=>!q||JSON.stringify([sp.name,sp.kind,sp.call_id,sp.error,sp.model,sp.purpose,sp.status]).toLowerCase().includes(q);
+  const list=spans.filter(match);
+  $("#traceList").innerHTML=list.length?list.map(sp=>{
+    const sel=S.sel.kind==="span"&&S.sel.id===sp.span_id?" sel":"";
+    return `<div class="row${sel}" data-span="${esc(sp.span_id)}">
+      ${statusDot(sp.status)}
+      <span class="t">${esc((sp.start_at||"").slice(11,19))}</span>
+      <span class="nm" title="${esc(sp.error||sp.purpose||"")}">${esc(sp.name)}</span>
+      <span class="t">${esc(dur(sp.duration_ms))}</span></div>`;
+  }).join(""):`<div class="empty">${spans.length?"No trace matches filter":"No recorded trace events"}</div>`;
+  $("#traceList").querySelectorAll("[data-span]").forEach(el=>
+    el.onclick=()=>{S.sel={kind:"span",id:el.dataset.span};renderTraces();renderTree();renderInspector();pushLink();});
+}
+$("#traceSearch").oninput=e=>{S.traceQ=e.target.value;renderTraces();};
+
+/* ---------- right: lineage tree (SVG, pan/zoom) ---------- */
+const T={x:0,y:0,k:1};
+function layoutTree(){
+  const tree=S.tree; if(!tree) return null;
+  const nodes=tree.nodes, byId={}; nodes.forEach(n=>byId[n.candidate_id]=n);
+  const kids=c=>tree.children[c]||[];
+  const NW=170,NH=44,GAPX=60,GAPY=26;
+  let leafY=0; const pos={};
+  (function place(c,depth){
+    const ch=kids(c).filter(k=>byId[k]);
+    if(!ch.length){pos[c]={x:depth*(NW+GAPX),y:leafY*(NH+GAPY)};leafY++;return;}
+    ch.forEach(k=>place(k,depth+1));
+    const ys=ch.map(k=>pos[k].y);
+    pos[c]={x:depth*(NW+GAPX),y:(Math.min(...ys)+Math.max(...ys))/2};
+  })(tree.roots[0]);
+  // forest: remaining roots (orphans etc.)
+  tree.roots.slice(1).forEach(r=>{ if(byId[r]){leafY++;place(r,0);} });
+  return {pos,byId,kids,NW,NH};
+}
+function renderTree(){
+  const svg=$("#treeSvg");
+  if(!S.tree||!S.tree.nodes.length){svg.innerHTML=`<text x="20" y="40" fill="#8b949e">No candidates recorded yet — waiting for builder…</text>`;return;}
+  const L=layoutTree(); if(!L) return;
+  const w=Math.max(...Object.values(L.pos).map(p=>p.x))+L.NW+40;
+  const h=Math.max(...Object.values(L.pos).map(p=>p.y))+L.NH+40;
+  let edges="",bodies="";
+  const seen=new Set();
+  const edgeFor=c=>{
+    const p=L.byId[c].parent_id;
+    if(p&&L.pos[p]&&L.pos[c]&&!seen.has(c)){
+      seen.add(c);
+      const a=L.pos[p],b=L.pos[c],x1=a.x+L.NW,y1=a.y+L.NH/2,x2=b.x,y2=b.y+L.NH/2,mx=(x1+x2)/2;
+      edges+=`<path class="gedge" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;
+    }
+  };
+  S.tree.nodes.forEach(n=>edgeFor(n.candidate_id));
+  for(const c of Object.keys(L.pos)){
+    const n=L.byId[c]||{candidate_id:c};
+    const p=L.pos[c];
+    const sel=S.sel.kind==="candidate"&&S.sel.id===c;
+    const cls="gnode"+(sel?" sel":"")+(n.champion?" champ":"")+(n.valid===false?" invalid":"");
+    const state=n.champion?"★ champion":n.valid===false?"✗ invalid":n.valid===true?"✓ valid":"? unknown";
+    const score=n.score!=null?` · ${n.score}`:"";
+    bodies+=`<g class="${cls}" data-cand="${esc(c)}" transform="translate(${p.x},${p.y})">
+      <rect width="${L.NW}" height="${L.NH}" rx="5"/>
+      <text x="8" y="17">${esc(c.slice(0,18))}</text>
+      <text x="8" y="33" class="sub">${esc(state)}${esc(score)} · gen ${n.generation ?? "?"}</text>
+    </g>`;
+  }
+  svg.innerHTML=`<g id="viewport" transform="translate(${T.x},${T.y}) scale(${T.k})">${edges}${bodies}</g>`;
+  svg.querySelectorAll("[data-cand]").forEach(g=>g.onclick=()=>{
+    S.sel={kind:"candidate",id:g.dataset.cand};
+    renderTree();renderTraces();renderInspector();pushLink();
+  });
+  $("#warnCount").textContent=S.tree.warnings.length?("⚠ "+S.tree.warnings.join(" · ")):"";
+  const hidden=(S.tree.nodes.length-Object.keys(L.pos).length);
+  if(hidden>0) $("#warnCount").textContent=`⚠ ${hidden} nodes hidden by cycle guard · `+$("#warnCount").textContent;
+  applyView();
+}
+function applyView(){
+  const vp=$("#viewport"); if(vp) vp.setAttribute("transform",`translate(${T.x},${T.y}) scale(${T.k})`);
+}
+function fitTree(){
+  const svg=$("#treeSvg"),bb=svg.querySelector("#viewport")?.getBBox();
+  if(!bb||!bb.width) return;
+  const r=svg.getBoundingClientRect();
+  T.k=Math.min(r.width/bb.width,r.height/bb.height,1.5);
+  T.x=(r.width-bb.width*T.k)/2-bb.x*T.k; T.y=(r.height-bb.height*T.k)/2-bb.y*T.k;
+  applyView();
+}
+(function(){
+  const svg=$("#treeSvg"); let drag=null;
+  svg.onwheel=e=>{e.preventDefault();const f=e.deltaY<0?1.12:1/1.12;
+    const r=svg.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;
+    T.x=mx-(mx-T.x)*f;T.y=my-(my-T.y)*f;T.k=Math.min(Math.max(T.k*f,.08),3);applyView();};
+  svg.onmousedown=e=>{drag={x:e.clientX-T.x,y:e.clientY-T.y};svg.style.cursor="grabbing";};
+  window.addEventListener("mousemove",e=>{if(drag){T.x=e.clientX-drag.x;T.y=e.clientY-drag.y;applyView();}});
+  window.addEventListener("mouseup",()=>{drag=null;svg.style.cursor="grab";});
+})();
+$("#btnFit").onclick=fitTree;
+$("#btnAll").onclick=()=>{renderTree();fitTree();};
+
+/* ---------- center: inspector ---------- */
+function refreshInspectorIfVisible(){ if(S.sel.kind!=="none") renderInspector(true); }
+async function renderInspector(soft){
+  const el=$("#inspector");
+  const sel=S.sel;
+  if(sel.kind==="none"||sel.kind==="run"){renderRunOverview(el);return;}
+  if(sel.kind==="span"){
+    const sp=(S.spans?.spans||[]).find(x=>x.span_id===sel.id);
+    if(!sp){el.innerHTML=`<div class="empty">Span not found in this run</div>`;return;}
+    renderSpan(el,sp,soft);return;
+  }
+  if(sel.kind==="candidate"){
+    const r=await api(`runs/${S.runId}/candidates/${encodeURIComponent(sel.id)}`);
+    if(!r.ok){el.innerHTML=`<div class="empty">Candidate not found</div>`;return;}
+    renderCandidate(el,r.body,soft);
+  }
+}
+function kvTable(rows){
+  return `<table class="kv">${rows.filter(r=>r[1]!=null&&r[1]!=="").map(([k,v])=>
+    `<tr><td>${esc(k)}</td><td>${typeof v==="string"&&v.startsWith("<")?v:esc(v)}</td></tr>`).join("")}</table>`;
+}
+function renderRunOverview(el){
+  const s=S.summary||{},m=(s||{}),sp=S.spans||{};
+  el.innerHTML=`<div class="crumbs"><b>${esc(S.runId||"no run")}</b> / run overview</div>
+  <h3 class="sec">Run</h3>${kvTable([
+    ["status",s.status],["mode",s.mode],["builder model",s.builder_model],
+    ["started",s.started_at],["ended",s.ended_at],["duration",s.duration_seconds!=null?Math.round(s.duration_seconds)+"s":null],
+    ["brief hash",(s.brief_hash||"").slice(0,16)],["openapi hash",(s.openapi_hash||"").slice(0,16)],
+    ["champion",s.champion_candidate_id],["final score",s.final_score],
+    ["score evidence",s.evaluation_type],["error",s.error]])}
+  <h3 class="sec">Candidates</h3>
+  <div class="mono">${spans&&S.tree?[`${S.tree.nodes.length} candidates · ${S.tree.recorded?"lineage recorded":"lineage DERIVED from snapshots"}`]:""}</div>
+  ${(S.tree?.warnings||[]).length?`<div class="warnbox">${esc(S.tree.warnings.join("\n"))}</div>`:""}
+  ${(sp.warnings||[]).map(w=>`<div class="warnbox">derived: ${esc(w)}</div>`).join("")}
+  <h3 class="sec">Recorded trace</h3>
+  <div class="meta">${sp.recorded_events||0} recorded events · click a trace row on the left</div>`;
+}
+function renderSpan(el,sp,soft){
+  const tabs=["Overview","Input / Output","Raw event"];
+  el.innerHTML=`<div class="crumbs"><b>${esc(S.runId)}</b> / trace / <b>${esc(sp.name)}</b></div>
+  ${kvTable([["status",sp.status],["kind",sp.kind],["start",sp.start_at],["end",sp.end_at],
+    ["duration",dur(sp.duration_ms)],["model",sp.model],["purpose",sp.purpose],
+    ["prompt version",sp.prompt_version],["prompt hash",(sp.prompt_hash||"").slice(0,20)],
+    ["tokens",sp.tokens?JSON.stringify(sp.tokens):null],["est. cost",sp.estimated_cost]])}
+  ${sp.error?`<div class="errbox">${esc(sp.error)}</div>`:""}
+  ${sp.derived?`<div class="warnbox">derived span — reconstructed from build_trace.log, not a first-class recorded span</div>`:""}
+  ${sp.artifacts?`<h3 class="sec">Model payloads</h3><div id="payloads"></div>`:""}
+  <h3 class="sec">Raw event</h3><pre class="code">${esc(JSON.stringify(sp.detail||{},null,1))}</pre>`;
+  if(sp.artifacts) loadPayloads(sp);
+}
+async function loadPayloads(sp){
+  const host=$("#payloads"); if(!host) return;
+  const r=await api(`runs/${S.runId}/model_calls/${encodeURIComponent(sp.call_id)}`);
+  if(!r.ok){host.innerHTML=`<div class="empty">payloads not captured</div>`;return;}
+  const b=r.body; let out="";
+  const show=(title,val)=>{out+=`<h3 class="sec">${esc(title)}</h3><pre class="code">${esc(JSON.stringify(val,null,1))}</pre>`;};
+  if(b.prompt) show("Prompt (captured)", b.prompt);
+  else out+=`<div class="meta">prompt: not captured</div>`;
+  if(b.response) show("Response (parsed)", b.response);
+  else out+=`<div class="meta">response: not captured</div>`;
+  if(b.raw_response) show("Raw response", b.raw_response);
+  host.innerHTML=out;
+}
+async function renderCandidate(el,c,soft){
+  const wf=c.files.workflow, val=c.files.validation, prop=c.files.proposal;
+  el.innerHTML=`<div class="crumbs"><b>${esc(S.runId)}</b> / candidate / <b>${esc(c.candidate_id)}</b></div>
+  <div style="margin-bottom:6px">
+    ${c.champion?`<span class="badge b-champ">★ CHAMPION</span>`:""}
+    ${val?`<span class="badge ${val.data.valid?"b-ok":"b-bad"}">${val.data.valid?"valid":"invalid"}</span>`:`<span class="badge b-unk">validation unknown</span>`}
+    ${val&&val.data.evidence_type?`<span class="badge">evidence: ${esc(val.data.evidence_type)}</span>`:""}
+    ${c.score!=null?`<span class="score-pill">score ${c.score} ${esc(S.summary.evaluation_type||"")}</span>`:""}
+  </div>
+  ${kvTable([["created",c.created_at],["parent",c.parent_candidate_id],
+    ["lineage",c.recorded_lineage?"recorded":"derived"],
+    ["workflow sha",(wf?wf.sha256:"").slice(0,24)]])}
+  <div class="tabs">
+    <button class="act" data-t="origin">Origin</button>
+    ${c.parent_candidate_id?`<button data-t="diff">Diff vs parent</button>`:""}
+    <button data-t="validation">Validation</button>
+    <button data-t="workflow">Workflow</button>
+    <button data-t="raw">Raw</button>
+  </div>
+  <div id="ctab"></div>`;
+  const show=async t=>{
+    el.querySelectorAll(".tabs button").forEach(b=>b.classList.toggle("act",b.dataset.t===t));
+    const host=$("#ctab");
+    if(t==="origin"){
+      host.innerHTML=`<h3 class="sec">How this candidate was created</h3>`+
+        (prop?`<pre class="code">${esc(JSON.stringify({coverage:prop.data.coverage,architecture:prop.data.architecture,tool_gates:prop.data.tool_gates},null,1))}</pre>`
+             :`<div class="meta">proposal: not captured</div>`)+
+        (c.parent_candidate_id?`<div class="meta" style="margin-top:8px">parent ${esc(c.parent_candidate_id)} → this candidate${c.recorded_lineage?"":" (lineage derived from snapshots; mutation details not recorded)"}</div>`
+             :`<div class="meta">root candidate (ADAS baseline)</div>`);
+    }else if(t==="diff"){
+      host.innerHTML=`<div class="empty">loading diff…</div>`;
+      const r=await api(`runs/${S.runId}/candidates/${encodeURIComponent(c.candidate_id)}/diff`);
+      if(!r.body.diff){host.innerHTML=`<div class="warnbox">${esc(r.body.note||r.body.error||"no diff")}</div>`;return;}
+      const d=r.body;
+      host.innerHTML=`${kvTable([["parent",d.parent_candidate_id],["parent sha",(d.parent_sha256||"").slice(0,24)]])}
+        <div class="mono" style="margin:6px 0">+${d.summary.nodes_added} nodes / -${d.summary.nodes_removed} · ${d.summary.transitions_changed} transitions · ${d.summary.prompt_changes} prompt changes · ${d.summary.other} other</div>
+        <pre class="code">${d.changes.map(ch=>
+          `<span class="${ch.op==="added"?"diffadd":ch.op==="removed"?"diffrem":""}">${esc(ch.op.toUpperCase())} ${esc(ch.path||"/")}\n  before: ${esc(JSON.stringify(ch.before))}\n  after:  ${esc(JSON.stringify(ch.after))}</span>`).join("\n")||"identical"}</pre>`;
+    }else if(t==="validation"){
+      host.innerHTML=val?`<pre class="code">${esc(JSON.stringify(val.data,null,1))}</pre>`
+        :`<div class="meta">validation: not captured</div>`;
+    }else if(t==="workflow"){
+      host.innerHTML=wf?`<pre class="code">${esc(JSON.stringify(wf.data,null,1))}</pre>`
+        :`<div class="meta">workflow snapshot: not captured</div>`;
+    }else{
+      host.innerHTML=`<pre class="code">${esc(JSON.stringify(c,null,1))}</pre>`;
+    }
+  };
+  el.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>show(b.dataset.t));
+  show(soft?"diff":"origin");
+}
+
+/* ---------- keyboard ---------- */
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="INPUT") {if(e.key==="Escape") e.target.blur(); return;}
+  if(e.key==="/"){e.preventDefault();$("#traceSearch").focus();}
+  else if(e.key==="Escape"){S.sel={kind:"run"};renderTraces();renderTree();renderInspector();pushLink();}
+  else if(e.key==="f"||e.key==="F") fitTree();
+  else if(e.key==="l"||e.key==="L") $("#live").onclick();
+});
+
+/* ---------- boot ---------- */
+$("#runPicker").onchange=e=>selectRun(e.target.value);
+(async function(){
+  await loadRuns();
+  const link=parseLink();
+  if(link&&S.runs.some(r=>r.run_id===link.runId)){
+    selectRun(link.runId,link.sel);
+  }else if(link){
+    $("#inspector").innerHTML=`<div class="warnbox">Run "${esc(link.runId)}" not found in ${esc(S.runs.length)} archived runs. Pick one from the selector.</div>`;
+    if(S.runs[0]) selectRun(S.runs[0].run_id);
+  }else if(S.runs.length){
+    selectRun(S.runs[0].run_id);   // most recently active
+  }else{
+    $("#inspector").innerHTML=`<div class="empty">No runs found under artifacts dir.<br>Generate a demo: <span class="mono">python -m observability.demo --out agent/artifacts/demo_run</span></div>`;
+    $("#traceList").innerHTML=`<div class="empty">No runs</div>`;
+  }
+})();
+</script>
+</body>
+</html>
