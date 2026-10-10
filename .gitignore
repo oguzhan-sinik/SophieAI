@@ -1,0 +1,18 @@
+# secrets
+.env
+
+# runs and outputs
+traces/
+out/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# junk
+.DS_Store
+*.log
+.venv/
