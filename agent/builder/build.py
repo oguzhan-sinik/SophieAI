@@ -15,7 +15,7 @@ if __package__ in {None, ''}:
 
 from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
-from .config import AGENT, KIT, Config, Deadline, writable
+from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
 from .contracts import compile_openapi, compile_tools, source_documents, validate_requirements
 from .freya_adapter import FreyaAdapter, public_suite
 from .diagnostics import grounded_diagnoses
@@ -418,6 +418,9 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         cfg = Config.from_env(args.mode)
+        missing = missing_credentials(cfg)
+        if missing:
+            raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
         builder = Builder(cfg, args.briefs, args.openapi, pinned=args.pinned_root, resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief)
         result = builder.run()
     except (ValueError, OSError, KeyError) as exc:

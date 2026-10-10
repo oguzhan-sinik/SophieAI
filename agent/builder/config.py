@@ -21,6 +21,8 @@ def load_env():
     # Process environment wins; agent settings override kit defaults.
     load_dotenv(AGENT / ".env", override=False)
     load_dotenv(KIT / ".env", override=False)
+    # env.sh uses `export KEY=value`, which python-dotenv reads directly.
+    load_dotenv(KIT / "env.sh", override=False)
 
 
 def boolean(name, default):
@@ -33,9 +35,9 @@ def boolean(name, default):
 @dataclass(frozen=True)
 class Config:
     mode: str = "scoring_with_diagnostics"
-    builder_model: str = "nvidia_nim/z-ai/glm-5.3"
-    mutator_model: str = "nvidia_nim/z-ai/glm-5.3"
-    referee_model: str = "nvidia_nim/z-ai/glm-5.3"
+    builder_model: str = "modal/zai-org/GLM-5.3"
+    mutator_model: str = "modal/zai-org/GLM-5.3"
+    referee_model: str = "modal/zai-org/GLM-5.3"
     max_wall_seconds: int = 1800
     reserve: int = 180
     max_candidates: int = 10
@@ -75,9 +77,24 @@ class Config:
         if os.getenv("FREYA_MAX_CONCURRENT_SIMULATIONS", "1") != "1":
             raise ValueError("Freya permits exactly one simulation at a time")
         return cls(**values, mode=mode or os.getenv("BENCHMARK_MODE", cls.mode), builder_model=model,
-                   mutator_model=os.getenv("MUTATOR_MODEL") or model, referee_model=os.getenv("REFEREE_MODEL") or model,
+                   mutator_model=os.getenv("MUTATOR_MODEL") or model, referee_model=os.getenv("REFEREE_MODEL") or cls.referee_model,
                    official=boolean("EVAL_ENABLE_OFFICIAL_PUBLIC", True), tracing=boolean("LANGSMITH_TRACING", True),
                    artifacts=writable(AGENT / os.getenv("ARTIFACTS_DIR", "artifacts")))
+
+
+PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "anthropic/": ("ANTHROPIC_API_KEY",),
+                 "gemini/": ("GOOGLE_API_KEY",), "gemini-": ("GOOGLE_API_KEY",), "openai/": ("OPENAI_API_KEY",)}
+
+
+def missing_credentials(cfg, need_models=True):
+    """Names (never values) of required keys that are unset for this configuration."""
+    need = {"FREYA_API_KEY", "FREYA_BANK_TEAM_KEY"}
+    if need_models:
+        for model in {cfg.builder_model, cfg.mutator_model, cfg.referee_model}:
+            for prefix, keys in PROVIDER_KEYS.items():
+                if model.startswith(prefix):
+                    need |= set(keys)
+    return sorted(key for key in need if not os.getenv(key, "").strip())
 
 
 class Deadline:

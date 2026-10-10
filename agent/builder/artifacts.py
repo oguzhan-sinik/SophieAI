@@ -44,7 +44,7 @@ def write_json(path, value, immutable=False):
 
 class Redactor:
     def __init__(self):
-        self.secrets = [v for k, v in os.environ.items() if any(x in k.upper() for x in ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "TEAM_KEY")) and len(v) >= 6]
+        self.secrets = [v for k, v in os.environ.items() if any(x in k.upper() for x in ("API_KEY", "TOKEN", "SECRET", "PASSWORD", "TEAM_KEY", "MODAL_KEY")) and len(v) >= 6]
 
     def __call__(self, value):
         if isinstance(value, dict):

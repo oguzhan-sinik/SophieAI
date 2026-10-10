@@ -16,3 +16,6 @@ __pycache__/
 .DS_Store
 *.log
 .venv/
+
+# local secrets
+env.sh

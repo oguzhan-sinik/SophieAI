@@ -14,7 +14,7 @@ python3 agent/agent_builder.py briefs/brief-a.md briefs/brief-b.md
 python3 agent/agent_builder.py path/to/policy.md --openapi path/to/openapi.json
 ```
 
-Use the virtual environment's Python if dependencies are not already installed. Settings resolve as CLI mode > process environment > `agent/.env` > root `.env` > defaults. Copy `.env.example` to `agent/.env` only if overrides are needed. Never copy empty credential values over working keys. The existing NVIDIA model/provider remains the default; native Google model names use `GOOGLE_API_KEY` through ADK.
+Use the virtual environment's Python if dependencies are not already installed. Put keys in the kit-root `env.sh` (template provided, git-ignored): `FREYA_API_KEY`, `FREYA_BANK_TEAM_KEY` and the builder LLM settings. The default builder LLM is GLM 5.3 served on Modal (`modal/<served model name>`): set `MODAL_BASE_URL` (the OpenAI-compatible `.../v1` URL), `MODAL_KEY` (`wk-...`) and `MODAL_SECRET` (`ws-...`), sent as Modal proxy-auth headers. Other LiteLLM providers still work (`anthropic/...` needs `ANTHROPIC_API_KEY`, `gemini/...` needs `GOOGLE_API_KEY`). The builder loads it automatically and exits with code 2, naming any missing key, before doing any work. Settings resolve as CLI mode > process environment > `agent/.env` > root `.env` > root `env.sh` > defaults.
 
 Optional public test selectors:
 

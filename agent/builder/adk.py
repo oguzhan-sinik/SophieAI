@@ -34,6 +34,29 @@ def literal_instruction(text):
     return lambda context: text
 
 
+def modal_litellm_kwargs(model, schema, timeout):
+    """LiteLLM settings for an OpenAI-compatible server on Modal behind proxy auth.
+
+    `modal/<served name>` -> `openai/<served name>` at MODAL_BASE_URL, with the
+    Modal-Key / Modal-Secret headers. Credentials come only from the environment.
+    """
+    missing = [k for k in ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET") if not os.getenv(k, "").strip()]
+    if missing:
+        raise KeyError("Missing Modal settings: " + ", ".join(missing))
+    base = os.environ["MODAL_BASE_URL"].strip().rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    kwargs = {"model": "openai/" + model[len("modal/"):], "api_base": base,
+              # The OpenAI client always sends a bearer token; Modal proxy auth ignores it.
+              "api_key": os.getenv("MODAL_API_KEY", "").strip() or "modal-proxy-auth",
+              "extra_headers": {"Modal-Key": os.environ["MODAL_KEY"].strip(), "Modal-Secret": os.environ["MODAL_SECRET"].strip()},
+              "timeout": timeout, "num_retries": 0,
+              "extra_body": {"chat_template_kwargs": {"enable_thinking": os.getenv("MODAL_ENABLE_THINKING", "false").lower() == "true"}}}
+    if os.getenv("MODAL_JSON_SCHEMA", "true").lower() == "true":
+        kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()}}
+    return kwargs
+
+
 class ADKRoles:
     def __init__(self, cfg, deadline, trace, root):
         self.cfg, self.deadline, self.trace, self.root = cfg, deadline, trace, root
@@ -78,15 +101,11 @@ class ADKRoles:
         from google.adk.sessions import InMemorySessionService
         from google.genai import types
         backend = model
-        if "/" in model:
+        if model.startswith("modal/"):
+            kwargs = modal_litellm_kwargs(model, schema, self.cfg.llm_timeout)
+        elif "/" in model:
             kwargs = {"model": model, "timeout": self.cfg.llm_timeout, "num_retries": 0}
-            if model.startswith("nvidia_nim/"):
-                kwargs["api_key"] = os.environ["NVIDIA_API_KEY"]
-                kwargs["response_format"] = {"type": "json_schema", "json_schema": {"name": schema.__name__, "schema": schema.model_json_schema()}}
-            if model.startswith("nvidia_nim/z-ai/"):
-                kwargs["extra_body"] = {"chat_template_kwargs": {"reasoning_effort": os.getenv("BUILDER_REASONING_EFFORT", "low")}}
-            elif model.startswith("nvidia_nim/nvidia/nemotron-3-"):
-                kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        if "/" in model:
             backend = LiteLlm(**kwargs)
         calculator = role == 'ScenarioRefereeAgent'
         capabilities = 'You may use only the pure business_day_dates calculator. Use it for every business-day expectation; copy its returned deadline exactly.' if calculator else 'You have no tools.'
