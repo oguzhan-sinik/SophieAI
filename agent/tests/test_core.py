@@ -1,0 +1,261 @@
+from copy import deepcopy
+from dataclasses import asdict, replace
+import json
+import os
+from pathlib import Path
+import pytest
+from builder.artifacts import Archive, Redactor, Trace, digest, write_json
+from builder.config import Config, Deadline, writable
+from builder.contracts import compile_openapi, compile_tools, source_documents, validate_requirements
+from builder.freya_adapter import contains_definition, public_suite, time_limit
+from builder.scoring import Suite, FeedbackAdapter, score, group_advantages, choose_champion
+from builder.validation import validate, code_errors, apply_mutation
+
+
+def test_scope_and_config(work, monkeypatch):
+    with pytest.raises(ValueError): writable(work.parent.parent.parent / 'outside.json')
+    with pytest.raises(ValueError): Config(mode='both')
+    with pytest.raises(ValueError): Config(max_wall_seconds=1801)
+    with pytest.raises(ValueError): Config(reserve=1800)
+    with pytest.raises(ValueError): Config(group_size=0)
+    monkeypatch.setenv('BENCHMARK_MODE', 'wrong')
+    with pytest.raises(ValueError): Config.from_env()
+
+
+def test_static_good(spec, contracts, requirements):
+    result = validate(spec, contracts, requirements)
+    assert result['valid'], result['errors']
+    assert not result['policy_proven']
+
+
+def test_gate_accepts_declared_alias_and_canonical_response(spec, contracts, requirements):
+    gate = spec['tool_gates'][0]
+    canonical = gate['variable']
+    gate['variable'] = 'verified_alias'
+    node = spec['workflow']['nodes']['verify']
+    node['tools'][0]['response_mapping'] = [{'path': 'data.all_verified', 'variable': 'verified_alias'}]
+    node['transitions'][0]['condition']['conditions'][0]['variable'] = 'verified_alias'
+    assert validate(spec, contracts, requirements)['valid']
+    spec['workflow']['test_variables'] = {canonical: 'true'}
+    assert not validate(spec, contracts, requirements)['valid']
+
+
+def test_model_tool_name_string_is_rejected_without_crashing(spec, contracts, requirements):
+    spec['workflow']['nodes']['verify']['tools'] = ['verify_identity']
+    result = validate(spec, contracts, requirements)
+    assert not result['valid'] and 'array of objects' in result['errors'][0]
+
+
+@pytest.mark.parametrize('fault', ['placement', 'null', 'unsupported', 'passthrough', 'mapping', 'schema', 'retry', 'ungated', 'gate_or', 'after_close', 'skip_close', 'unreachable', 'url', 'required', 'loop_prompt'])
+def test_static_rejects(fault, spec, contracts, requirements):
+    nodes = spec['workflow']['nodes']
+    if fault == 'placement': nodes['verify']['pre_actions'] = []
+    elif fault == 'loop_prompt': nodes['verify']['loop_prompt'] = 'Repeat security question.'
+    elif fault == 'null': nodes['verify']['role_message'] = None
+    elif fault == 'unsupported': nodes['account']['pre_actions'][0]['function']['name'] = 'steal_data'
+    elif fault == 'passthrough': nodes['account']['transitions'] = []
+    elif fault == 'mapping': nodes['account']['pre_actions'][0]['response_mapping'] = [{'path': 'ok', 'variable': 'x'}]
+    elif fault == 'schema': nodes['close']['pre_actions'][0]['function']['parameters']['properties']['body']['properties']['outcome']['enum'] = ['invented']
+    elif fault == 'retry': nodes['close']['pre_actions'][0]['config']['maxRetries'] = 2
+    elif fault == 'ungated': spec['workflow']['initial_node'] = 'account'
+    elif fault == 'gate_or': nodes['verify']['transitions'][0]['condition']['conditions'].append({'operator': 'always'})
+    elif fault == 'after_close': nodes['close']['transitions'][0]['target_node'] = 'account'
+    elif fault == 'skip_close': nodes['verify']['max_turn_transition'] = 'end'
+    elif fault == 'unreachable': nodes['unused'] = {**deepcopy(nodes['end']), 'name': 'unused'}
+    elif fault == 'url': nodes['account']['pre_actions'][0]['function']['parameters']['properties']['url']['default'] = 'https://evil.invalid'
+    elif fault == 'required': nodes['close']['pre_actions'][0]['function']['parameters']['properties']['body']['required'] = []
+    assert not validate(spec, contracts, requirements)['valid']
+
+
+def test_contract_refs_and_changed_fields(work):
+    api = {'openapi': '3.0.3', 'servers': [{'url': 'https://sandbox.invalid/v2'}], 'components': {'schemas': {'Body': {'type': 'object', 'properties': {'tenant': {'type': 'string'}, 'decision': {'type': 'string', 'enum': ['hold', 'release']}}, 'required': ['tenant', 'decision']}}}, 'paths': {'/resolve': {'post': {'operationId': 'resolve', 'requestBody': {'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Body'}}}}, 'responses': {}}}}}
+    path = work / 'api.json'; write_json(path, api)
+    c = compile_openapi(path)
+    assert c['operations']['resolve']['body']['properties']['decision']['enum'] == ['hold', 'release']
+    workflow = {'nodes': {'x': {'tools': [{'bank_operation': 'resolve', 'description': 'CALL when approved.'}]}}}
+    compiled = compile_tools(workflow, c)['nodes']['x']['tools'][0]
+    assert compiled['function']['parameters']['properties']['url']['default'] == 'https://sandbox.invalid/v2/resolve'
+    api['components']['schemas']['Body'] = {'$ref': '#/components/schemas/Body'}
+    write_json(path, api)
+    with pytest.raises(ValueError): compile_openapi(path)
+
+
+def test_provenance_override_and_conflict(work, requirements):
+    first, second = work / 'policy.md', work / 'memo.md'
+    first.write_text('1. The limit is 83 units.\n')
+    second.write_text('1. Replace the limit with 97 units.\n')
+    docs = source_documents([first, second])
+    bundle = deepcopy(requirements)
+    rule = bundle['requirements'][0]
+    rule['source'].update(path=str(first), span=first.read_text().strip())
+    overlay = deepcopy(rule); overlay['rule_id'] = 'R2'
+    overlay['source'].update(path=str(second), span=second.read_text().strip())
+    overlay['precedence']['supersedes'] = ['R1']
+    bundle['requirements'].append(overlay)
+    result = validate_requirements(bundle, docs)
+    assert result['requirements'][0]['precedence']['superseded_by'] == ['R2']
+    bundle['requirements'][1]['interpretation_status'] = 'conflicting'
+    with pytest.raises(ValueError, match='Unresolved'): validate_requirements(bundle, docs)
+    bundle['requirements'][1]['interpretation_status'] = 'resolved'
+    bundle['requirements'][0]['source']['span'] = 'invented'
+    with pytest.raises(ValueError, match='verbatim'): validate_requirements(bundle, docs)
+
+
+def test_code_gate():
+    assert not code_errors("try:\n    vars['x'] = 'known'\nexcept Exception:\n    vars['x'] = 'unknown'")
+    for source in ['import os', "open('/etc/passwd')", "eval('1')", 'import datetime\ndatetime.datetime.now()', "config['url'] = 'https://evil.invalid'"]:
+        assert code_errors('try:\n    ' + source.replace('\n', '\n    ') + '\nexcept Exception:\n    pass')
+
+
+def test_strict_repetitions_unknown():
+    suite = Suite(('a', 'b'), 'hash', 'official_public', 3)
+    raw = {'all_rows': [[{'id': 'a', 'pass': True}, {'id': 'b', 'pass': True}]] * 3}
+    assert score(raw, suite).strict_pass_rate == 1
+    raw['all_rows'][2] = [{'id': 'a', 'pass': False}, {'id': 'b', 'pass': True}]
+    assert score(raw, suite).strict_pass_rate == .5
+    raw['all_rows'].pop()
+    result = score(raw, suite)
+    assert result.unknown == 2 and result.strict_pass_rate is None and not result.complete
+    raw['all_rows'][0][0]['pass'] = 'true'
+    assert score(raw, suite).strict_pass_rate is None
+
+
+def test_mixed_groups_and_champion():
+    s = Suite(('a',), 'same', 'official_public', 1)
+    good = score({'all_rows': [[{'id': 'a', 'pass': True}]]}, s)
+    bad = score({'all_rows': [[{'id': 'a', 'pass': False}]]}, s)
+    advantages, summaries = group_advantages({'a': good, 'b': bad, 'missing': None}, {'a': 'p', 'b': 'p', 'missing': 'p'})
+    assert advantages == {'a': 1, 'b': -1, 'missing': None}
+    equal, summaries = group_advantages({'a': bad, 'b': bad}, {'a': 'p', 'b': 'p'})
+    assert equal == {'a': 0, 'b': 0} and summaries[0]['diversify']
+    mixed, _ = group_advantages({'a': good, 'b': replace(good, suite_key='different')}, {'a': 'p', 'b': 'p'})
+    assert mixed == {'a': None, 'b': None}
+    assert choose_champion('a', 'b', {'a': bad, 'b': good}, {'a': True, 'b': True}) == 'b'
+    assert choose_champion('a', 'b', {'a': bad, 'b': replace(good, hard_fail_count=1)}, {'a': True, 'b': True}) == 'a'
+    assert choose_champion('a', 'b', {'a': bad, 'b': replace(good, suite_key='different')}, {'a': True, 'b': True}) == 'a'
+
+
+def test_feedback_sentinel():
+    record = score({'all_rows': [[{'id': 'a', 'pass': False, 'failed': ['LEAK_TEST_SENTINEL']}]]}, Suite(('a',), 's', 'official_public', 1))
+    diagnostics = [{'repair_hypothesis': '[REDACTED TEST FIXTURE: LEAK_TEST_SENTINEL]'}]
+    scalar = FeedbackAdapter('scoring_only').for_optimizer(record, diagnostics)
+    diagnostic = FeedbackAdapter('scoring_with_diagnostics').for_optimizer(record, diagnostics)
+    assert 'LEAK_TEST_SENTINEL' not in json.dumps(scalar)
+    assert 'LEAK_TEST_SENTINEL' in json.dumps(diagnostic['diagnostics'])
+    assert {k: v for k, v in diagnostic.items() if k != 'diagnostics'} == scalar
+
+
+def test_archive_immutable_and_patch(work, spec):
+    archive = Archive(work / 'archive')
+    parent = archive.add(spec)
+    mutation = {'parent_id': parent['candidate_id'], 'mutation_type': 'adjust_prompt', 'target_nodes': ['verify'], 'target_rule_ids': ['R1'], 'hypothesis': 'Clarify', 'operations': [{'op': 'set_system_prompt', 'target': '', 'value': 'New policy wording'}], 'expected_effect': 'Clarity', 'risk': 'low', 'coverage': spec['coverage']}
+    child = apply_mutation(spec, mutation, parent['candidate_id'])
+    record = archive.add(child, parent=parent['candidate_id'], mutation=mutation)
+    assert archive.spec(parent['candidate_id']) == spec
+    assert record['generation'] == 1 and record['parent_id'] == parent['candidate_id']
+    archive.checkpoint(champion_id=parent['candidate_id'])
+    assert json.loads((work / 'archive/champion.json').read_text())['champion_id'] == parent['candidate_id']
+    path = Path(parent['workflow_snapshot_path']).parent / 'proposal.json'
+    altered = deepcopy(spec); altered['workflow']['system_prompt'] = 'tampered'; path.write_text(json.dumps(altered))
+    with pytest.raises(ValueError, match='modified'): archive.spec(parent['candidate_id'])
+    archive.db.close()
+
+
+def test_redaction_and_telemetry_outage(work, monkeypatch):
+    monkeypatch.setenv('FREYA_API_KEY', 'test_secret_123456789')
+    redactor = Redactor()
+    assert 'test_secret_123456789' not in json.dumps(redactor({'message': 'test_secret_123456789', 'phone_last4': '1234'}))
+    with pytest.raises(ValueError): redactor.assert_no_secrets({'x': 'test_secret_123456789'})
+    monkeypatch.setenv('LANGSMITH_API_KEY', 'fake')
+    import langsmith
+    monkeypatch.setattr(langsmith, 'Client', lambda **kw: (_ for _ in ()).throw(RuntimeError('offline')))
+    trace = Trace(work / 'trace.log', {'run_id': 'test'})
+    trace.event('test', message='test_secret_123456789')
+    trace.close(status='done')
+    assert 'run_end' in (work / 'trace.log').read_text()
+    assert 'test_secret_123456789' not in (work / 'trace.log').read_text()
+
+
+def test_round_trip():
+    contains_definition({'x': 1, 'empty': []}, {'x': 1, 'server_default': True})
+    with pytest.raises(ValueError): contains_definition({'x': 1}, {'x': 2})
+    with pytest.raises(ValueError): contains_definition({'tools': [{'name': 'required'}]}, {'tools': []})
+
+
+def test_timeout():
+    import time
+    with pytest.raises(TimeoutError):
+        with time_limit(.01): time.sleep(.1)
+
+
+def test_code_probes_use_source_values(requirements):
+    from builder.scenarios import run_probes
+    code = "import datetime\ntry:\n    anchor = datetime.date.fromisoformat(vars['now'][:10])\n    vars['next_day'] = (anchor + datetime.timedelta(days=vars['offset'])).isoformat()\nexcept Exception:\n    vars['next_day'] = ''"
+    spec = {'workflow': {'nodes': {'calendar': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': code}}}}}]}}}}
+    probes = {'probes': [{'probe_id': 'changed-date', 'rule_ids': ['R1'], 'node_id': 'calendar', 'variables': {'now': '2031-03-02T12:00', 'offset': 3}, 'expected': {'next_day': '2031-03-05'}}]}
+    result = run_probes(spec, probes, requirements, Deadline(10))
+    assert result['passed'] == 1 and result['evidence_type'] == 'local_code_only'
+    probes['probes'][0]['expected']['next_day'] = 'wrong'
+    assert run_probes(spec, probes, requirements, Deadline(10))['passed'] == 0
+
+
+def test_invalid_probe_metadata_never_becomes_workflow_expectation():
+    from builder.scenarios import validate_probe_targets
+    spec = {'workflow': {'nodes': {'calc': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': "vars['deadline'] = '2031-03-05'"}}}}}]}}}}
+    probes = {'probes': [{'probe_id': 'boundary', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {}, 'expected': {'deadline': '2031-03-05'}}]}
+    validate_probe_targets(spec, probes)
+    probes['probes'][0]['expected']['oracle'] = 'Explanatory prose'
+    with pytest.raises(ValueError, match='written variables'):
+        validate_probe_targets(spec, probes)
+    probes['probes'][0]['node_id'] = 'close_api'
+    with pytest.raises(ValueError, match='code node'):
+        validate_probe_targets(spec, probes)
+
+
+def test_failure_with_missing_repeat_not_complete():
+    suite = Suite(('a',), 's', 'official_public', 2)
+    record = score({'all_rows': [[{'id': 'a', 'pass': False}]]}, suite)
+    assert record.failed == 1 and record.strict_pass_rate is None and record.coverage_ratio == .5
+    proxy = Suite(('a',), 's', 'proxy', 1)
+    record = score({'all_rows': [[{'id': 'a', 'state_ok': False}]]}, proxy)
+    assert record.failed == 1 and not record.complete and record.coverage_ratio == 0
+
+
+def test_hook_cannot_forge_verification(spec, contracts, requirements):
+    spec['workflow']['nodes']['verify']['tools'][0]['post_process_code'] = "try:\n    d = result.get('data', {})\n    d['all_verified'] = True\nexcept Exception:\n    pass"
+    result = validate(spec, contracts, requirements)
+    assert not result['valid']
+    assert any('gate response' in e for e in result['errors'])
+
+
+def test_unknown_tool_binding_rejected(contracts):
+    from builder.contracts import tool_from_contract
+    with pytest.raises(ValueError, match='Unknown argument'):
+        tool_from_contract(contracts['operations']['create_promise'], 'CALL on confirmation', {'not_a_field': 'value'})
+
+
+def test_diagnostics_need_real_evidence(spec, requirements):
+    from builder.diagnostics import grounded_diagnoses
+    d = {'case_id': 'case', 'rule_ids': ['R1'], 'evidence_refs': ['all_rows.0.0.failed.0'], 'likely_workflow_nodes': ['verify'], 'confidence': .8}
+    raw = {'all_rows': [[{'id': 'case', 'failed': ['Observed failure']}]]}
+    assert grounded_diagnoses([d], raw, requirements, spec['workflow'], {'case'}) == [d]
+    d['evidence_refs'] = ['all_rows.9.0.failed.0']
+    assert grounded_diagnoses([d], raw, requirements, spec['workflow'], {'case'}) == []
+
+
+def test_adk_does_not_expand_freya_placeholders():
+    import asyncio
+    from google.adk.agents import LlmAgent
+    from builder.adk import literal_instruction
+    text = 'Bind {{customer_id}} and {{previously_set_variable}} in Freya.'
+    agent = LlmAgent(name='test_literal', model='unused', instruction=literal_instruction(text))
+    instruction, bypass = asyncio.run(agent.canonical_instruction(None))
+    assert instruction == text and bypass is True
+
+
+def test_source_parameter_calendar_calculator():
+    from builder.adk import business_day_dates
+    assert business_day_dates('2028-02-11', [0, 1, 2, 3], ['2028-02-17'], 5) == {
+        'dates': ['2028-02-14', '2028-02-15', '2028-02-16', '2028-02-21', '2028-02-22'], 'deadline': '2028-02-22'}
+    assert business_day_dates('2028-02-28', list(range(7)), [], 1)['deadline'] == '2028-02-29'
+    with pytest.raises(ValueError): business_day_dates('2028-02-11', [], [], 5)

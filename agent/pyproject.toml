@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freya-ticket01-builder"
+version = "0.1.0"
+description = "Source-driven Freya workflow compilation and bounded evolutionary search"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.scripts]
+freya-builder = "builder.build:main"
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["builder*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
