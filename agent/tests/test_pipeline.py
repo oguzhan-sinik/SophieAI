@@ -134,12 +134,12 @@ def test_probe_referee_cannot_see_implementation_or_observations(work, requireme
     builder.probes, builder.pinned, builder.resume = {'probes': []}, None, None
     builder.cfg, builder.root = Config(), work
     builder.requirements, builder.documents = requirements, [{'text': 'Source policy'}]
-    spec = {'workflow': {'nodes': {'calc': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': "vars['deadline'] = '2031-03-05'"}}}}}]}}}}
+    spec = {'workflow': {'nodes': {'calc': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': "vars['band'] = 'late'"}}}}}]}}}}
     seen = []
     class Roles:
         def ask(self, role, purpose, instruction, payload, schema, model=None):
             seen.append((role, payload))
-            return {'probes': [{'probe_id': 'date', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {}, 'expected': {'deadline': '2031-03-05'}, 'rationale': 'Source-derived'}]}
+            return {'probes': [{'probe_id': 'date', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {}, 'expected': {'band': 'late'}, 'rationale': 'Source-derived'}]}
     builder.roles = Roles()
     builder.prepare_probes(spec)
     assert [role for role, _ in seen] == ['ScenarioPlannerAgent', 'ScenarioRefereeAgent']
@@ -155,9 +155,8 @@ def test_remote_schema_rejection_repairs_before_pinning(work, spec, requirements
             if role == 'WorkflowCompilerAgent':
                 self.calls += 1
                 seen.append((role, deepcopy(payload)))
-                changed = deepcopy(spec)  # a real repair returns a changed proposal; an unchanged one stops the loop
-                changed['workflow']['system_prompt'] += f' Repair {self.calls}.'
-                return changed
+                # A repair is a patch: only what changes.
+                return {'operations': [{'op': 'set_system_prompt', 'target': 'system_prompt', 'value': f'Follow the input policy. Repair {self.calls}.'}], 'tool_gates': [], 'summary': 'fixture'}
             return super().ask(role, purpose, instruction, payload, schema, model)
     class RejectingFreya(FakeFreya):
         def validate_remote(self, workflow):
@@ -194,16 +193,38 @@ def test_valid_root_with_dead_end_gets_one_targeted_repair(work, spec, requireme
             return builder, root, builder.archive.get(root)['mutation_kind'], [payload for role, payload in seen if role == 'WorkflowCompilerAgent']
         finally:
             builder.archive.db.close()
-    fixed = deepcopy(trapped)
-    fixed['workflow']['nodes']['verify']['transitions'].insert(1, {'target_node': 'verify', 'description': 'Agreed, ask the next question', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
-    builder, root, kind, repairs = build(fixed)
+    fixed = deepcopy(trapped['workflow']['nodes']['verify'])
+    fixed['transitions'].insert(1, {'target_node': 'verify', 'description': 'Agreed, ask the next question', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
+    builder, root, kind, repairs = build({'operations': [{'op': 'set_node', 'target': 'verify', 'value': fixed}], 'tool_gates': [], 'summary': 'route the agreement'})
     assert len(repairs) == 1 and 'answer can be extracted as' in repairs[0]['compiler_errors'][0]
     assert kind == 'compile_repair' and builder.valid[root] and not builder.best_effort
     # A repair that breaks the workflow never displaces the deployable root it was asked to improve.
-    broken = deepcopy(trapped)
-    broken['workflow']['initial_node'] = 'missing'
-    builder, root, kind, repairs = build(broken)
+    builder, root, kind, repairs = build({'operations': [{'op': 'set_initial_node', 'target': 'initial_node', 'value': 'missing'}], 'tool_gates': [], 'summary': 'breaks it'})
     assert kind == 'baseline' and builder.valid[root] and not builder.best_effort
+    # A patch that cannot be applied leaves the proposal as it was and the next attempt is told why.
+    builder, root, kind, repairs = build({'operations': [{'op': 'set_node', 'target': 'verify', 'value': 'not a stage'}], 'tool_gates': [], 'summary': 'garbled'})
+    assert kind == 'baseline' and len(repairs) == 2 and 'repair patch was rejected' in repairs[1]['compiler_errors'][0]
+
+
+def test_best_effort_root_is_still_searched_and_can_be_beaten(work, spec, requirements):
+    flawed = deepcopy(spec)
+    flawed['tool_gates'] = []  # the gate finding no repair removes
+    seen = []
+    base = fake_roles_factory(flawed, requirements, seen)
+    class Roles(base):
+        def ask(self, role, purpose, instruction, payload, schema, model=None):
+            if role == 'WorkflowCompilerAgent':
+                raise ValueError('model returned nothing usable')
+            return super().ask(role, purpose, instruction, payload, schema, model)
+    cfg = Config(mode='scoring_only', artifacts=work, tracing=False, max_candidates=4, max_depth=1, max_simulations=4)
+    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles, adapter_factory=FakeFreya, only=['PUB-01'])
+    builder.submission_dir = work / 'out'
+    result = builder.run()
+    mutations = [payload for role, payload in seen if role == 'MutationDesignerAgent']
+    assert result['best_effort_root'] and mutations and 'missing source-backed deterministic tool gate' in mutations[0]['parent_static_findings'][0]
+    # The fake passes every simulation after the first: a child carrying only the root's finding is measured and wins.
+    assert result['candidate_id'] != result['root_candidate_id'] and result['strict_pass_rate'] == 1.0
+    assert result['status'] == 'exported_best_effort' and not builder.valid[result['candidate_id']] and builder.usable[result['candidate_id']]
 
 
 def lock_worker(path, queue):

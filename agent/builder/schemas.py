@@ -63,6 +63,14 @@ class WorkflowSpec(Record):
     architecture: str
 
 
+class CalendarExpectation(Record):
+    variable: str = Field(description='The expected output variable holding the calculated day.')
+    anchor: str = Field(description='ISO date (or date-time) the count starts after, normally the call now of this probe.')
+    weekdays: list[int] = Field(description='Business weekdays from the source, Monday=0.')
+    excluded_dates: list[str] = Field(description='Every non-business ISO date the source lists.')
+    count: int = Field(ge=1, le=366, description='Which business day after the anchor.')
+
+
 class CodeProbe(Record):
     probe_id: str
     rule_ids: list[str]
@@ -70,7 +78,7 @@ class CodeProbe(Record):
     variables: dict[str, Any]
     expected: dict[str, Any] = Field(description='Only actual output variable names and expected values. No explanations or metadata.')
     rationale: str = ''
-    calculated: dict[str, str] = Field(default_factory=dict, description='Referee only: for each expected variable whose value came from the calculator, that variable name mapped to the deadline the calculator returned.')
+    calendar: list[CalendarExpectation] = Field(default_factory=list, description='One entry per expected variable that is the Nth business day after a date. The controller calculates the day and writes it into expected.')
 
 
 class CodeProbes(Record):
@@ -81,6 +89,13 @@ class Edit(Record):
     op: Literal["set_node", "remove_node", "set_system_prompt", "set_initial_node", "set_global_nodes"]
     target: str
     value: Any = None
+
+
+class RepairPatch(Record):
+    """Only what a repair changes. Rewriting a whole workflow to fix two stages has corrupted the rest."""
+    operations: list[Edit] = Field(min_length=1, description='set_node carries the complete corrected stage under its own name.')
+    tool_gates: list[ToolGate] = Field(default_factory=list, description='The complete new gate list, only when a gate declaration itself must change.')
+    summary: str
 
 
 class Mutation(Record):

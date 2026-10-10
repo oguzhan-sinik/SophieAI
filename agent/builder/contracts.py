@@ -203,10 +203,16 @@ def normalize_spec(spec, contracts, protected=("get_account", "create_promise"))
 def compile_tools(workflow, contracts):
     """Expand explicit bank_operation references; endpoint configuration is Python-owned."""
     workflow = deepcopy(workflow)
+    for group in ("nodes", "global_nodes"):
+        if not isinstance(workflow.get(group, {}), dict):
+            raise ValueError(f"workflow.{group} must be an object mapping each stage name to its stage")
     for node in list(workflow.get("nodes", {}).values()) + list(workflow.get("global_nodes", {}).values()):
+        # Anything that is not a stage object or a tool object is left for the validator, which names it.
+        if not isinstance(node, dict):
+            continue
         for placement in ("tools", "pre_actions"):
-            for i, tool in enumerate(node.get(placement, [])):
-                if "bank_operation" not in tool:
+            for i, tool in enumerate(node[placement] if isinstance(node.get(placement), list) else []):
+                if not isinstance(tool, dict) or "bank_operation" not in tool:
                     continue
                 name = tool["bank_operation"]
                 if name not in contracts["operations"]:
@@ -216,6 +222,8 @@ def compile_tools(workflow, contracts):
                 unknown = set(tool) - allowed - {"type", "config"}
                 if unknown:
                     raise ValueError(f"{node.get('name')}: unknown bank tool specification fields {sorted(unknown)} on {name}")
+                if not isinstance(tool.get("description"), str) or not isinstance(tool.get("bindings", {}), dict):
+                    raise ValueError(f"{node.get('name')}: bank tool {name} needs a text description and an object of bindings")
                 compiled = tool_from_contract(contracts["operations"][name], tool["description"], tool.get("bindings"))
                 for key in ("response_mapping", "pre_process_code", "post_process_code"):
                     if key in tool:

@@ -1,9 +1,11 @@
 """Source-derived deterministic code checks; never evidence of bank-state success."""
 import json
 import ast
+import re
 from pathlib import Path
 import subprocess
 import sys
+from .adk import business_day_dates
 from .config import AGENT
 from .schemas import CodeProbes
 from .validation import code_errors
@@ -32,31 +34,35 @@ def validate_probe_targets(spec, proposals):
             raise ValueError(f'{probe.probe_id}: expected keys must be actual written variables: {sorted(written)}')
 
 
-def reconcile_probes(proposals, calculations):
-    """Make the calculator's results, not the referee's copy of them, the expected dates.
+def reconcile_probes(proposals):
+    """Calculate every business-day expectation here; no model's arithmetic becomes a test.
 
-    A referee has been seen to compute the right day and leave the planner's wrong one in
-    `expected`. Where it names the calculated variables the controller writes the returned value
-    itself; a probe that used the calculator without saying where the result belongs is dropped."""
+    A probe declares the calendar parameters it read from the source and the controller counts the
+    days. A calendar date in `expected` that is neither declared nor one of the probe's own inputs
+    was worked out by a model in its head, which has been wrong while the code was right: it is
+    removed, and a probe left with nothing to check is dropped."""
     kept, notes = [], []
     for probe in CodeProbes.model_validate(proposals).model_dump()['probes']:
-        inputs = [v for v in probe['variables'].values() if isinstance(v, str)]
-        deadlines = set()
-        for record in calculations or []:
-            arguments, result = record.get('arguments') or {}, record.get('result') or {}
-            result = result.get('result', result) if isinstance(result, dict) else {}
-            anchor = str(arguments.get('anchor', ''))[:10]
-            if anchor and isinstance(result, dict) and result.get('deadline') and any(v.startswith(anchor) for v in inputs):
-                deadlines.add(result['deadline'])
-        named = {key: value for key, value in probe.pop('calculated', {}).items() if key in probe['expected']}
-        if deadlines and (not named or not set(named.values()) <= deadlines):
-            notes.append(f"{probe['probe_id']}: dropped, calculator results {sorted(deadlines)} were not tied to its expectations")
+        name = probe['probe_id']
+        try:
+            for entry in probe['calendar']:
+                day = business_day_dates(entry['anchor'], entry['weekdays'], entry['excluded_dates'], entry['count'])['deadline']
+                if probe['expected'].get(entry['variable']) != day:
+                    notes.append(f"{name}: {entry['variable']} set to calculated {day} (was {probe['expected'].get(entry['variable'])})")
+                probe['expected'][entry['variable']] = day
+        except (ValueError, TypeError) as exc:
+            notes.append(f'{name}: dropped, calendar parameters unusable ({exc})')
             continue
-        for key, value in named.items() if deadlines else []:
-            if probe['expected'][key] != value:
-                notes.append(f"{probe['probe_id']}: {key} corrected from {probe['expected'][key]} to calculated {value}")
-                probe['expected'][key] = value
-        kept.append(probe)
+        declared = {entry['variable'] for entry in probe['calendar']}
+        given = {value[:10] for value in probe['variables'].values() if isinstance(value, str)}
+        for key, value in list(probe['expected'].items()):
+            if key not in declared and isinstance(value, str) and re.match(r'\d{4}-\d{2}-\d{2}', value) and value[:10] not in given:
+                del probe['expected'][key]
+                notes.append(f'{name}: {key} removed, a calendar date nobody calculated')
+        if probe['expected']:
+            kept.append(probe)
+        else:
+            notes.append(f'{name}: dropped, nothing verifiable left')
     return {'probes': kept}, notes
 
 

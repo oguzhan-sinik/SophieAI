@@ -20,10 +20,10 @@ from .contracts import compile_openapi, compile_tools, normalize_spec, source_do
 from .freya_adapter import FreyaAdapter, public_suite
 from .diagnostics import grounded_diagnoses
 from . import prompts, runtime
-from .schemas import CodeProbes, Diagnostics, MutationGroup, RequirementsBundle, WorkflowSpec
+from .schemas import CodeProbes, Diagnostics, MutationGroup, RepairPatch, RequirementsBundle, WorkflowSpec
 from .scenarios import reconcile_probes, run_probes, validate_probe_targets
 from .scoring import FeedbackAdapter, Suite, choose_champion, group_advantages, score, select_beam
-from .validation import apply_mutation, validate
+from .validation import apply_mutation, apply_patch, validate
 
 
 def source_manifest(documents, api_path):
@@ -77,6 +77,8 @@ class Builder:
                 self.pinned = self.resume / 'pinned_root.json'
         self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions, cfg.seed) if cfg.official else (None, [])
         self.scores, self.feedback, self.valid, self.kinds, self.advantages = {}, {}, {}, {}, {}
+        # usable: may be deployed and ranked. A valid candidate, or one whose only findings its shipped parent already has.
+        self.usable, self.findings = {}, {}
         self.exports = {}
         self.champion = self.best_official = self.best_proxy = None
         self.simulations = 0
@@ -164,7 +166,7 @@ class Builder:
             payload = {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}}
             spec = self.roles.ask('ADASDesignerAgent', 'Design and generate source-driven Freya root', prompts.DESIGNER, payload, WorkflowSpec)
-        fallbacks, accepted = [], None
+        fallbacks, accepted, carried = [], None, []
 
         def pin(traps, cid, spec):
             self.champion = cid
@@ -230,20 +232,23 @@ class Builder:
                 raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
             if attempt == 2:
                 break
-            before = digest(compact.get('workflow'))
             try:
-                spec = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.REPAIR + prompts.DESIGNER,
-                                      {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
-                                       'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
-                                       'proposal': compact, 'compiler_errors': validation['errors'],
-                                       'advisory_warnings': validation.get('warnings', [])}, WorkflowSpec)
+                # A repair names only the stages it changes; rewriting the whole workflow has corrupted the rest.
+                patch = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.REPAIR + prompts.DESIGNER,
+                                       {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
+                                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
+                                        'proposal': compact, 'compiler_errors': carried + validation['errors'],
+                                        'advisory_warnings': validation.get('warnings', []) + ([] if validation['valid'] else validation.get('dead_ends', []))}, RepairPatch)
             except (ValueError, TimeoutError) as exc:
                 self.trace.event('repair_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
                 break
-            if digest(spec.get('workflow')) == before:
-                # The model handed the proposal back untouched; asking again the same way costs minutes for nothing.
-                self.trace.event('repair_no_change', attempt=attempt + 1)
-                break
+            try:
+                spec, carried = apply_patch(compact, patch), []
+                self.trace.event('repair_patch_applied', edits=[f"{e['op']} {e['target']}" for e in patch['operations']][:40], gates_replaced=bool(patch['tool_gates']))
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                # Nothing usable came back. The proposal is unchanged and the next attempt is told why.
+                spec, carried = compact, ['Your last repair patch was rejected: ' + self.trace.redact(str(exc))[:400]]
+                self.trace.event('repair_patch_rejected', message=carried[0])
         if accepted:
             return pin(*accepted)
         # No candidate passed every local gate. A phone agent the platform accepts still beats none:
@@ -257,6 +262,8 @@ class Builder:
                 continue
             self.champion, self.best_effort = cid, True
             self.kinds[cid] = 'baseline'
+            # It is the agent being shipped, so it is also the agent worth measuring and improving.
+            self.usable[cid] = True
             self.trace.event('best_effort_root', candidate_id=cid, unresolved_local_findings=count)
             return cid
         raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
@@ -286,14 +293,14 @@ class Builder:
                 probes = json.loads(saved_probes.read_text())
             else:
                 probes = self.roles.ask('ScenarioPlannerAgent', 'Generate source-grounded deterministic code probes',
-                'Create at most six independent code-node probes. Give synthetic input vars and expected output vars grounded in cited rule IDs. Cover date boundaries, changed call now, amount floors and malformed inputs where present. Target only supplied code nodes. expected must contain only variables actually written by that node, never oracle descriptions or explanatory notes; put explanations in rationale. Do not test API hooks. Do not use real customer data or claim these tests prove bank behavior. Use source parameters rather than code implementation as the expectation oracle.',
+                'Create at most six independent code-node probes. Give synthetic input vars and expected output vars grounded in cited rule IDs. Cover date boundaries, changed call now, amount floors and malformed inputs where present. Target only supplied code nodes. expected must contain only variables actually written by that node, never oracle descriptions or explanatory notes; put explanations in rationale. Do not test API hooks. Do not use real customer data or claim these tests prove bank behavior. Use source parameters rather than code implementation as the expectation oracle. Never count business days yourself: for every expected variable that is the Nth business day after a date, add a calendar entry (variable, anchor, weekdays with Monday=0, every excluded date the source lists, count) and the controller calculates the day. Expect no other calendar date unless it is one of the input values.',
                 {'requirements': self.requirements, 'code_nodes': code_nodes, 'probe_errors': errors}, CodeProbes)
             try:
                 validate_probe_targets(spec, probes)
                 probes = self.roles.ask('ScenarioRefereeAgent', 'Independently verify source-derived test expectations',
-                    'Audit each proposed test using ONLY source policy and its synthetic inputs. Return corrected CodeProbes. Recalculate expected dates step by step: identify weekdays, exclude every listed holiday, and count the exact number of business days. Put calculation in rationale, never expected. For every expected variable you took from the calculator, also list it in calculated as variable name -> the returned deadline; the controller writes that value into expected itself. Reject or remove tests whose expected behavior is not prescribed by a source rule. Preserve node/output variable names. Do not invent fallback behavior for malformed inputs unless prescribed. You cannot see implementation outputs; do not infer expected results from them.',
+                    'Audit each proposed test using ONLY source policy and its synthetic inputs. Return corrected CodeProbes. Never count business days yourself: the controller calculates each calendar entry and writes the day into expected. Check every calendar entry against the source instead: the anchor, the business weekdays, every excluded date and the count; correct them, and add an entry for any business-day expectation that lacks one. Reject or remove tests whose expected behavior is not prescribed by a source rule. Preserve node/output variable names. Do not invent fallback behavior for malformed inputs unless prescribed. You cannot see implementation outputs; do not infer expected results from them.',
                     {'documents': self.documents, 'requirements': self.requirements, 'proposed_probes': probes}, CodeProbes, self.cfg.referee_model)
-                probes, notes = reconcile_probes(probes, getattr(self.roles, 'calculations', []))
+                probes, notes = reconcile_probes(probes)
                 if notes:
                     self.trace.event('code_probes_reconciled', notes=notes)
                 validate_probe_targets(spec, probes)
@@ -306,7 +313,8 @@ class Builder:
         write_json(self.root / 'code_probe_suite.json', self.probes)
 
     def record_validation(self, cid, result):
-        self.valid[cid] = result['valid']
+        self.valid[cid] = self.usable[cid] = result['valid']
+        self.findings[cid] = list(result.get('errors', []))
         write_json(self.root / 'candidates' / cid / 'validation.json', result, immutable=True)
         self.archive.event('validation', candidate_id=cid, **result)
 
@@ -357,7 +365,7 @@ class Builder:
         self.feedback[cid] = self.feedback_adapter.for_optimizer(frozen, diagnoses)
         if frozen.hard_fail_count and self.champion == cid:
             self.champion = None
-        self.champion = choose_champion(self.champion, cid, self.scores, self.valid)
+        self.champion = choose_champion(self.champion, cid, self.scores, self.usable)
         if self.champion and self.scores.get(self.champion) and self.scores[self.champion].complete:
             self.best_official = self.champion
         self.checkpoint()
@@ -384,7 +392,7 @@ class Builder:
                 proposals = self.roles.ask('MutationDesignerAgent', 'Generate diverse typed sibling workflow patches', prompts.MUTATOR + prompts.DESIGNER,
                                             {'parent_id': parent_id, 'parent': parent, 'requirements': self.requirements, 'contracts': self.contracts,
                                              'feedback': feedback, 'number_of_proposals': limit, 'diversify': diversify, 'seed': self.random.randrange(2**31),
-                                             'rejected_siblings': rejected.get(parent_id, [])[-12:]}, MutationGroup, self.cfg.mutator_model)['proposals']
+                                             'rejected_siblings': rejected.get(parent_id, [])[-12:], 'parent_static_findings': self.findings.get(parent_id, [])[:20]}, MutationGroup, self.cfg.mutator_model)['proposals']
                 usable, ready = 0, []
                 for proposal in proposals[:limit]:
                     count += 1
@@ -394,27 +402,33 @@ class Builder:
                         child = apply_mutation(parent, proposal, parent_id)
                         child['workflow'] = compile_tools(child['workflow'], self.contracts)
                         validation = validate(child, self.contracts, self.requirements)
-                        if validation['valid'] and self.probes['probes']:
+                        # The parent was shipped with its findings; a child that adds none is no worse and may be measured.
+                        inherited = bool(not validation['valid'] and not self.valid.get(parent_id) and self.usable.get(parent_id)
+                                         and set(validation['errors']) <= set(self.findings.get(parent_id, [])))
+                        if (validation['valid'] or inherited) and self.probes['probes']:
                             # Probes are unverified tests, so a child is rejected only for a regression:
                             # failing a probe its parent passes. Inherited failures do not block it.
                             failing = lambda s: {row['id'] for row in run_probes(s, self.probes, self.requirements, self.deadline)['results'] if not row['pass'] and not row.get('skipped')}
                             regressed = sorted(failing(child) - failing(parent))
                             if regressed:
-                                validation = {'valid': False, 'errors': ['Code probes that passed on the parent now fail: ' + ', '.join(regressed)], 'evidence_type': 'local_code_only'}
+                                validation, inherited = {'valid': False, 'errors': ['Code probes that passed on the parent now fail: ' + ', '.join(regressed)], 'evidence_type': 'local_code_only'}, False
                     except Exception as exc:
-                        child = parent
+                        child, inherited = parent, False
                         validation = {'valid': False, 'errors': [str(exc)], 'evidence_type': 'static'}
                     record = self.archive.add(child, parent=parent_id, mutation=proposal, group=group, mutation_kind=proposal.get('mutation_type', 'other'), brief_sha256=self.brief_hash, openapi_sha256=self.contracts['sha256'])
                     cid = record['candidate_id']
                     self.kinds[cid] = proposal.get('mutation_type', 'other')
                     self.record_validation(cid, validation)
+                    if inherited:
+                        self.usable[cid] = True
+                        self.trace.event('inherited_findings_accepted', candidate_id=cid, parent_id=parent_id, findings=len(validation['errors']))
                     children.append(cid)
-                    if validation['valid'] and not record['duplicate_of']:
+                    if self.usable[cid] and not record['duplicate_of']:
                         usable += 1
                         ready.append((cid, proposal))
                     else:
                         # Compiler findings only: the same structural facts both feedback modes may see.
-                        reasons = ['Same workflow as an earlier candidate'] if validation['valid'] else [self.trace.redact(str(e))[:300] for e in validation['errors'][:4]]
+                        reasons = ['Same workflow as an earlier candidate'] if self.usable[cid] else [self.trace.redact(str(e))[:300] for e in validation['errors'][:4]]
                         rejected.setdefault(parent_id, []).append({'mutation_type': proposal.get('mutation_type'), 'edited': [str(o.get('target')) for o in proposal.get('operations', []) if isinstance(o, dict)], 'refused_because': reasons})
                     self.checkpoint()
                 barren[parent_id] = 0 if usable else barren.get(parent_id, 0) + 1
@@ -427,7 +441,7 @@ class Builder:
                 self.advantages.update(advantages)
                 diversify = not summaries or any(s['diversify'] for s in summaries)
                 self.archive.event('relative_rank', group_id=group, advantages=advantages, summaries=summaries, diversify=diversify)
-            beam = select_beam(beam + children, self.scores, self.valid, self.kinds, self.advantages, self.cfg.beam_width)
+            beam = select_beam(beam + children, self.scores, self.usable, self.kinds, self.advantages, self.cfg.beam_width)
             if not beam:
                 break
 
@@ -459,10 +473,10 @@ class Builder:
         write_json(folder / 'core_score.json', self.held_out_score, immutable=True)
         # Held-out results never go to a mutator. A verified safety regression vetoes export.
         if frozen.hard_fail_count:
-            self.valid[self.champion] = False
+            self.usable[self.champion] = False
             self.champion = None
             for candidate in self.scores:
-                self.champion = choose_champion(self.champion, candidate, self.scores, self.valid)
+                self.champion = choose_champion(self.champion, candidate, self.scores, self.usable)
         self.checkpoint()
 
     def run(self):
@@ -479,12 +493,11 @@ class Builder:
                     self.exports[root_id] = self.adapter.export(workflow, self.root / 'root.workflow.json')
                     self.checkpoint()
                     self.evaluate(root_id)
-                    if self.best_effort:
-                        self.trace.event('search_skipped', reason='best_effort_root_has_unresolved_local_findings')
-                    else:
-                        self.search(root_id)
-                        self.revalidate_finalist()
-                    status = 'exported_best_effort' if self.best_effort else 'exported'
+                    # A best-effort root is searched too: it is what gets submitted, and a build that
+                    # stops improving exactly when its first design was weakest helps nobody.
+                    self.search(root_id)
+                    self.revalidate_finalist()
+                    status = 'exported_best_effort' if self.best_effort and not self.valid.get(self.champion) else 'exported'
                 except (Exception, KeyboardInterrupt) as exc:
                     error = self.trace.redact(str(exc) or type(exc).__name__)
                     status = 'terminated_by_budget' if isinstance(exc, TimeoutError) else 'exported_with_errors'

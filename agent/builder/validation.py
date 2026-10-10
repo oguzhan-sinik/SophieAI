@@ -3,7 +3,8 @@ import ast
 from copy import deepcopy
 import re
 
-from .schemas import Mutation, WorkflowSpec
+from . import runtime
+from .schemas import Mutation, RepairPatch, WorkflowSpec
 
 TOP = {"initial_node", "system_prompt", "nodes", "global_nodes", "test_variables", "context_variables", "nodePositions"}
 NODE = {"name", "node_type", "task_message", "role_message", "on_enter", "on_enter_first_entry_only", "transitions", "routing_prompt", "loop_condition", "loop_prompt", "extraction_schema", "tools", "pre_actions", "response_mapping", "passthrough", "passthrough_default_transition", "max_node_turns", "max_turn_transition", "terminal", "disable_inactivity_monitor", "suppress_tool_results", "truncation_strategy", "truncation_window_size", "reasoning_override", "condition", "description", "excluded_nodes", "is_tool_call"}
@@ -89,6 +90,35 @@ def _entails(condition, variables, values):
 
 
 PROTECTED = {"get_account", "create_promise"}
+SILENT = ("code", "api_request")
+
+
+def _routed_variables(condition, found):
+    if isinstance(condition, dict):
+        for child in condition.get("conditions") or []:
+            _routed_variables(child, found)
+        if condition.get("variable"):
+            found.add(condition["variable"])
+
+
+def _variable_use(node):
+    """Variables a stage's code writes, and every other name its code mentions (reads)."""
+    written, read = set(), set()
+    for tool in node.get("pre_actions", []):
+        function = tool.get("function", {})
+        sources = [tool.get("pre_process_code"), tool.get("post_process_code")]
+        if isinstance(function, dict) and function.get("handler") == "__function__:code_exec":
+            sources.append(function.get("parameters", {}).get("properties", {}).get("code", {}).get("default"))
+        for source in sources:
+            try:
+                tree = ast.parse(runtime.strip(source))
+            except (SyntaxError, TypeError, ValueError):
+                continue
+            targets = {id(item.slice) for item in ast.walk(tree) if isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Store) and isinstance(item.slice, ast.Constant)}
+            for item in ast.walk(tree):
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    (written if id(item) in targets else read).add(item.value)
+    return written, read
 
 
 def _tested(condition, equal, unequal):
@@ -305,6 +335,45 @@ def validate(spec, contracts, requirements):
         errors.append("Reachable nodes cannot reach end_call: " + str(sorted(reachable - terminating)))
     if set(nodes) - reachable:
         errors.append("Unreachable nodes: " + str(sorted(set(nodes) - reachable)))
+    # A stage that offers a value some check computed, and whose route runs straight back into that
+    # check, only makes progress if the check reads the offer. Otherwise an accepted offer changes
+    # nothing: the check rejects the original value again and the call goes round until it is cut off.
+    statuses = set()
+    for node in nodes.values():
+        for transition in node.get("transitions", []):
+            _routed_variables(transition.get("condition"), statuses)
+    for key, node in normal.items():
+        shown = set(re.findall(r"\{\{\s*([A-Za-z_]\w*)\s*\}\}", str(node.get("task_message", "")))) - statuses
+        if node.get("node_type") != "conversation" or not shown:
+            continue
+        for transition in node.get("transitions", []):
+            first = transition.get("target_node")
+            if first == key or nodes.get(first, {}).get("node_type") not in SILENT:
+                continue
+            chain, pending, returns = set(), [first], False
+            while pending:
+                current = pending.pop()
+                if current in chain:
+                    continue
+                chain.add(current)
+                for target, _ in edges[current]:
+                    if target == key:
+                        returns = True
+                    elif nodes[target].get("node_type") in SILENT:
+                        pending.append(target)
+            if not returns:
+                continue
+            written, read = set(), set()
+            for member in chain:
+                w, r = _variable_use(nodes[member])
+                written |= w
+                read |= r
+            offered = shown & written
+            if offered and not offered & read:
+                dead_ends.append(f"{key}: offers {sorted(offered)}, computed by {sorted(chain)}, and its route to {first} runs straight back into that check, which never reads "
+                                 f"{sorted(offered)}. If that route is ever taken because the customer accepted the offer, nothing is applied: the check rejects the "
+                                 "original value again and the call loops. Give acceptance its own route through a code stage that copies the offered value into "
+                                 "the variable the check reads. A route taken only with a new value from the customer needs no change")
     rule_ids = {r["rule_id"] for r in requirements["requirements"]}
     active_ids = {r["rule_id"] for r in requirements["requirements"] if not r["precedence"]["superseded_by"]}
     if not active_ids <= set(parsed.coverage):
@@ -404,22 +473,45 @@ def validate(spec, contracts, requirements):
     return {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "dead_ends": sorted(set(dead_ends)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
 
 
+def _edit(spec, operations):
+    workflow = spec.get("workflow")
+    if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), dict):
+        raise ValueError("The proposal has no workflow.nodes object to edit")
+    for edit in operations:
+        if edit.op == "set_node":
+            if not isinstance(edit.value, dict) or edit.value.get("name") != edit.target:
+                raise ValueError(f"set_node {edit.target}: value must be the complete stage object with name {edit.target}")
+            workflow["nodes"][edit.target] = deepcopy(edit.value)
+        elif edit.op == "remove_node":
+            if edit.target not in workflow["nodes"]:
+                raise ValueError(f"remove_node {edit.target}: no such stage")
+            del workflow["nodes"][edit.target]
+        elif edit.op == "set_system_prompt":
+            workflow["system_prompt"] = edit.value
+        elif edit.op == "set_initial_node":
+            workflow["initial_node"] = edit.value
+        elif edit.op == "set_global_nodes":
+            workflow["global_nodes"] = deepcopy(edit.value)
+
+
+def apply_patch(spec, patch):
+    """Apply a repair to the proposal it was written for; everything the patch does not name is kept."""
+    patch = RepairPatch.model_validate(patch)
+    repaired = deepcopy(spec)
+    _edit(repaired, patch.operations)
+    if patch.tool_gates:
+        repaired["tool_gates"] = [gate.model_dump() for gate in patch.tool_gates]
+    if repaired.get("workflow") == spec.get("workflow") and repaired.get("tool_gates") == spec.get("tool_gates"):
+        raise ValueError("The patch changes nothing")
+    return repaired
+
+
 def apply_mutation(parent, mutation, parent_id):
     mutation = Mutation.model_validate(mutation)
     if mutation.parent_id != parent_id or not mutation.operations or not mutation.hypothesis:
         raise ValueError("Mutation needs correct parent, edits and rationale")
     child = deepcopy(parent)
-    for edit in mutation.operations:
-        if edit.op == "set_node":
-            child["workflow"]["nodes"][edit.target] = deepcopy(edit.value)
-        elif edit.op == "remove_node":
-            del child["workflow"]["nodes"][edit.target]
-        elif edit.op == "set_system_prompt":
-            child["workflow"]["system_prompt"] = edit.value
-        elif edit.op == "set_initial_node":
-            child["workflow"]["initial_node"] = edit.value
-        elif edit.op == "set_global_nodes":
-            child["workflow"]["global_nodes"] = deepcopy(edit.value)
+    _edit(child, mutation.operations)
     child["coverage"] = {k: v.model_dump() for k, v in mutation.coverage.items()}
     if child["workflow"] == parent["workflow"]:
         raise ValueError("Mutation did not change workflow")

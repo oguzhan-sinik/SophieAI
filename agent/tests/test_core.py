@@ -361,20 +361,70 @@ def test_diagnosis_evidence_carries_failed_call_steps(work, spec, requirements):
     assert grounded_diagnoses([d], {**raw, 'calls': calls}, requirements, spec['workflow'], {'bad'}) == [d]
 
 
-def test_calculator_result_overrides_the_referees_copy():
+def test_business_day_expectations_are_calculated_by_the_controller():
     from builder.scenarios import reconcile_probes
-    probe = {'probe_id': 'P', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {'now': '2031-03-03T11:00'}, 'expected': {'deadline': '2031-03-06', 'band': 'late'}, 'rationale': 'Deadline = 2031-03-07'}
-    used = [{'arguments': {'anchor': '2031-03-03', 'count': 4}, 'result': {'dates': [], 'deadline': '2031-03-07'}}]
-    # Named: the controller writes the calculator's value, whatever the model left in expected.
-    fixed, notes = reconcile_probes({'probes': [{**probe, 'calculated': {'deadline': '2031-03-07'}}]}, used)
-    assert fixed['probes'][0]['expected'] == {'deadline': '2031-03-07', 'band': 'late'} and 'corrected' in notes[0] and 'calculated' not in fixed['probes'][0]
-    # Calculator used but its result tied to nothing, or to a value it never returned: not a trustworthy test.
-    assert reconcile_probes({'probes': [probe]}, used)[0] == {'probes': []}
-    assert reconcile_probes({'probes': [{**probe, 'calculated': {'deadline': '2031-03-06'}}]}, used)[0] == {'probes': []}
-    # A probe the calculator was never used for (another call date, or no date at all) is left alone.
-    other = [{'arguments': {'anchor': '2031-04-01', 'count': 4}, 'result': {'deadline': '2031-04-07'}}]
-    assert reconcile_probes({'probes': [probe]}, other)[0]['probes'][0]['expected'] == probe['expected']
-    assert reconcile_probes({'probes': [probe]}, [])[1] == []
+    # 2031-03-03 is a Monday; with the 5th excluded the fourth business day after it is the 10th.
+    entry = {'variable': 'deadline', 'anchor': '2031-03-03T11:00', 'weekdays': [0, 1, 2, 3, 4], 'excluded_dates': ['2031-03-05'], 'count': 4}
+    probe = {'probe_id': 'P', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {'now': '2031-03-03T11:00', 'asked': '2031-03-20'},
+             'expected': {'deadline': '2031-03-07', 'band': 'late', 'echo': '2031-03-20', 'today': '2031-03-03', 'guess': '2031-03-14'}, 'rationale': '', 'calendar': [entry]}
+    fixed, notes = reconcile_probes({'probes': [probe]})
+    # The model's 7th is replaced, inputs echoed back stay, and a date nobody calculated is not a test.
+    assert fixed['probes'][0]['expected'] == {'deadline': '2031-03-10', 'band': 'late', 'echo': '2031-03-20', 'today': '2031-03-03'}
+    assert any('set to calculated 2031-03-10' in n for n in notes) and any('guess removed' in n for n in notes)
+    # Unusable parameters, or nothing verifiable left: no test rather than a wrong one.
+    assert reconcile_probes({'probes': [{**probe, 'calendar': [{**entry, 'weekdays': [9]}]}]})[0] == {'probes': []}
+    assert reconcile_probes({'probes': [{**probe, 'calendar': [], 'expected': {'deadline': '2031-03-07'}}]})[0] == {'probes': []}
+
+
+def test_malformed_proposal_gets_named_errors_not_a_crash(spec, contracts, requirements):
+    broken = deepcopy(spec)
+    broken['workflow']['nodes']['verify']['tools'] = [True]
+    broken['workflow']['nodes']['stray'] = [{'operation': 'get_account'}]
+    result = validate({**broken, 'workflow': compile_tools(broken['workflow'], contracts)}, contracts, requirements)
+    assert not result['valid'] and any('stray: node must be an object' in e for e in result['errors']) and any('verify: tools must be an array of objects' in e for e in result['errors'])
+    broken['workflow']['nodes'] = ['verify']
+    with pytest.raises(ValueError, match='workflow.nodes must be an object'):
+        compile_tools(broken['workflow'], contracts)
+
+
+def test_repair_patch_changes_only_what_it_names(spec):
+    from builder.validation import apply_patch
+    node = deepcopy(spec['workflow']['nodes']['verify'])
+    node['task_message'] = 'Ask the security question.'
+    patched = apply_patch(spec, {'operations': [{'op': 'set_node', 'target': 'verify', 'value': node}], 'tool_gates': [], 'summary': 'x'})
+    assert patched['workflow']['nodes']['verify']['task_message'] == 'Ask the security question.' and spec['workflow']['nodes']['verify']['task_message'] != 'Ask the security question.'
+    assert {k: v for k, v in patched['workflow']['nodes'].items() if k != 'verify'} == {k: v for k, v in spec['workflow']['nodes'].items() if k != 'verify'}
+    assert patched['tool_gates'] == spec['tool_gates'] and patched['coverage'] == spec['coverage']
+    for bad in ([{'op': 'set_node', 'target': 'verify', 'value': spec['workflow']['nodes']['verify']}], [{'op': 'set_node', 'target': 'verify', 'value': {'name': 'other'}}],
+                [{'op': 'remove_node', 'target': 'nowhere'}], []):
+        with pytest.raises(ValueError):
+            apply_patch(spec, {'operations': bad, 'tool_gates': [], 'summary': 'x'})
+
+
+def test_accepted_offer_that_is_never_applied_is_a_dead_end(spec, contracts, requirements):
+    def code(name, source, targets):
+        return {'name': name, 'node_type': 'code', 'passthrough': True, 'passthrough_default_transition': targets[-1][0],
+                'pre_actions': [{'type': 'function', 'function': {'name': 'run', 'handler': '__function__:code_exec', 'parameters': {'type': 'object', 'properties': {'code': {'type': 'string', 'default': source}}}}}],
+                'transitions': [{'target_node': t, 'description': 'next', 'condition': c} for t, c in targets]}
+    always = {'operator': 'always'}
+    nodes = spec['workflow']['nodes']
+    nodes['account']['transitions'] = [{'target_node': 'check', 'description': 'Check the day', 'condition': always}]
+    nodes['account']['passthrough_default_transition'] = 'check'
+    nodes['check'] = code('check', "try:\n    vars['status'] = 'ok' if vars.get('day') == 'x' else 'late'\n    vars['offer'] = 'y'\nexcept Exception:\n    vars['status'] = 'late'",
+                          [('close', {'logic': 'or', 'conditions': [{'variable': 'status', 'operator': 'equals', 'operand': 'ok'}]}), ('offer_day', always)])
+    nodes['offer_day'] = {'name': 'offer_day', 'node_type': 'conversation', 'task_message': 'The status is {{status}}. Offer {{offer}} instead.', 'max_node_turns': 3, 'max_turn_transition': 'close',
+                          'extraction_schema': [{'name': 'reply', 'type': 'string', 'enum_values': ['accept', 'refuse'], 'description': 'Answer.', 'min_confidence': 0.7}],
+                          'transitions': [{'target_node': 'check', 'description': 'Accepted', 'condition': {'logic': 'or', 'conditions': [{'variable': 'reply', 'operator': 'equals', 'operand': 'accept'}]}},
+                                          {'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'reply', 'operator': 'equals', 'operand': 'refuse'}]}},
+                                          {'target_node': 'close', 'description': 'Otherwise', 'condition': always}]}
+    result = validate(spec, contracts, requirements)
+    assert result['valid'], result['errors']
+    assert len(result['dead_ends']) == 1 and "offer_day: offers ['offer']" in result['dead_ends'][0]
+    # Applying the accepted offer before the check runs again is what makes the round trip progress.
+    nodes['apply_offer'] = code('apply_offer', "try:\n    vars['day'] = vars.get('offer', '')\nexcept Exception:\n    vars['day'] = ''", [('check', always)])
+    nodes['offer_day']['transitions'][0]['target_node'] = 'apply_offer'
+    result = validate(spec, contracts, requirements)
+    assert result['valid'] and not result['dead_ends'], result
 
 
 def test_vague_period_is_not_extracted_as_a_day(contracts):

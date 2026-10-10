@@ -77,7 +77,9 @@ listed value, and tests that value before any is_set route on the date.
 Never replace a value the customer gave without their agreement. When code must change or reject a
 day or an amount (not allowed, outside a limit, missing), it sets a status variable and the proposed
 alternative, and routes to a conversation stage that states the reason and offers the alternative;
-only an accepted value reaches the read-back and the write. Each such status needs its own route,
+only an accepted value reaches the read-back and the write. When the customer accepts an offered
+alternative, the accepting route first passes a code stage that copies the offered value into the
+variable the check reads; routing an acceptance straight back into the check changes nothing and loops. Each such status needs its own route,
 checked before the generic success route. A stage that speaks after a code check must receive the
 outcome through variables in its task_message and must not confirm anything the check rejected.
 A read-back states exactly the variables the write tool is bound to. After a failed write, apologise
@@ -105,9 +107,14 @@ unnecessary graph size. Prompts must explain each state's job, not narrate inter
 """
 
 REPAIR = """You are repairing the supplied proposal. compiler_errors lists what blocks it; each one names
-the stage or gate at fault. Change those stages so every listed error is gone, and return the whole
-corrected WorkflowSpec. Returning the proposal unchanged is a failure. Do not redesign stages that
-are not named. advisory_warnings are hints; act on one only where the source supports it.
+the stage or gate at fault. Return a RepairPatch, never a whole WorkflowSpec: operations that touch
+only what must change. set_node replaces one stage: target is the stage name and value is that
+complete corrected stage (same compact bank tool shape, name equal to target). Add a stage with
+set_node under a new name; remove one with remove_node. Every stage you do not name is kept exactly
+as it is, so do not repeat unchanged stages. Give tool_gates (the complete list) only when a gate
+declaration itself is wrong. A patch that changes nothing is a failure. advisory_warnings are hints;
+act on one only where the source supports it. The rules below describe a whole workflow: every
+stage you write must follow them, but your output is the patch.
 
 """
 
@@ -118,6 +125,8 @@ complete coverage. Each proposal needs a different meaningful mutation family an
 hypothesis. Use only authorized supplied feedback. Absent diagnoses are unknown, not invented
 failures. Diagnostics are uncertain hypotheses. Never insert benchmark labels, transcripts or
 practice customer facts into the workflow; repair general behavior. No builder source edits.
+parent_static_findings lists compiler findings the parent still carries. A child may keep them but
+must not add any; removing one is a valid mutation.
 rejected_siblings lists earlier proposals for this parent that the compiler refused, with the stages
 they edited and the reason. Do not submit them again: avoid each stated cause. Python runs only in
 code stages (pre_actions with code_exec) or as pre_process_code/post_process_code on a bank tool

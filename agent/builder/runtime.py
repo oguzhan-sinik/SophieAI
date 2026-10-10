@@ -250,9 +250,10 @@ def wrap(body, code):
 def apply(workflow, contracts):
     """Rewrite date extraction to spoken words and compile the prelude into code nodes and tool hooks."""
     every = [n for group in ("nodes", "global_nodes") for n in (workflow.get(group) or {}).values() if isinstance(n, dict)]
+    rows = lambda value: [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
     dates = []
     for node in every:
-        for item in node.get("extraction_schema") or []:
+        for item in rows(node.get("extraction_schema")):
             if not isinstance(item, dict) or not item.get("name"):
                 continue
             if item.get("type") in ("date", "datetime") or SAID in str(item.get("description", "")):
@@ -266,7 +267,7 @@ def apply(workflow, contracts):
     structured = []
     for node in every:
         for placement in ("tools", "pre_actions"):
-            for tool in node.get(placement) or []:
+            for tool in rows(node.get(placement)):
                 function = tool.get("function") if isinstance(tool, dict) else None
                 if not isinstance(function, dict) or function.get("handler") != "__function__:api_call":
                     continue
@@ -276,7 +277,7 @@ def apply(workflow, contracts):
                 schema = contract["responses"].get("200", {}).get("content", {}).get("application/json", {}).get("schema", {}).get("properties", {})
                 mappings = tool.get("response_mapping") if placement == "tools" else node.get("response_mapping")
                 pairs = []
-                for mapping in mappings or []:
+                for mapping in rows(mappings):
                     path, variable = str(mapping.get("path", "")), mapping.get("variable")
                     field = path[len("data."):]
                     if path.startswith("data.") and "." not in field and variable and schema.get(field, {}).get("type") in ("array", "object"):
@@ -299,7 +300,7 @@ def apply(workflow, contracts):
     for node in every:
         if node.get("node_type") != "code":
             continue
-        for tool in node.get("pre_actions") or []:
+        for tool in rows(node.get("pre_actions")):
             code = tool.get("function", {}).get("parameters", {}).get("properties", {}).get("code", {}) if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
             if isinstance(code.get("default"), str):
                 code["default"] = wrap(parts, code["default"]) if parts else strip(code["default"])
