@@ -40,6 +40,11 @@ Protect account access with deterministic response-based gates on EVERY path inc
 Keep get_account/create_promise downstream of successful identity responses, away from identity
 tools. Declare tool_gates: operation, source rule_ids, variable, allowed_values, producer_operation,
 response_path. Use flattened tool_response.data.* or mapped response variables. Speech is not proof.
+Declare tool_gates only for get_account and create_promise. producer_operation is a declared bank
+operation, response_path a data.* field of its response, variable the mapped response variable, and
+every route into the protected tool tests that variable with equals. In the compact bank tool shape
+write only the listed keys (no type, config or function). Every node any route should reach must be
+the target_node of some transition; do not leave stages unreachable.
 
 Compute dates/amounts in code nodes using vars and source constants. Accept string/list products.
 code_exec is pre_actions with code.default; wrap in try/except, set fallback state. Only import

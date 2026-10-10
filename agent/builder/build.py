@@ -16,7 +16,7 @@ if __package__ in {None, ''}:
 from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
 from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
-from .contracts import compile_openapi, compile_tools, source_documents, validate_requirements
+from .contracts import compile_openapi, compile_tools, normalize_spec, source_documents, validate_requirements
 from .freya_adapter import FreyaAdapter, public_suite
 from .diagnostics import grounded_diagnoses
 from . import prompts
@@ -63,6 +63,7 @@ class Builder:
         self.baseline_raw = self.baseline_suite = None
         self.probes = {'probes': []}
         self.held_out_score = None
+        self.best_effort = False
         self.feedback_adapter = FeedbackAdapter(cfg.mode)
         self.adapter = None
         self.submission_dir = AGENT / 'out'
@@ -142,15 +143,25 @@ class Builder:
             payload = {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}}
             spec = self.roles.ask('ADASDesignerAgent', 'Design and generate source-driven Freya root', prompts.DESIGNER, payload, WorkflowSpec)
+        fallbacks = []
         for attempt in range(3):
+            # The model keeps seeing its own compact proposal; only the archived copy is expanded.
+            compact, compiled_ok = spec, False
             try:
-                spec['workflow'] = compile_tools(spec['workflow'], self.contracts)
+                compact, notes = normalize_spec(spec, self.contracts)
+                if notes:
+                    self.trace.event('proposal_normalized', count=len(notes), notes=notes[:20])
+                spec = {**compact, 'workflow': compile_tools(compact['workflow'], self.contracts)}
                 validation = validate(spec, self.contracts, self.requirements)
+                compiled_ok = True
             except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                validation = {'valid': False, 'errors': [str(exc)], 'evidence_type': 'static'}
+                validation = {'valid': False, 'errors': [f'{type(exc).__name__}: {exc}'], 'evidence_type': 'static'}
             candidate = self.archive.add(spec, mutation_kind='baseline' if attempt == 0 else 'compile_repair', brief_sha256=self.brief_hash, openapi_sha256=self.contracts['sha256'])
             cid = candidate['candidate_id']
             self.record_validation(cid, validation)
+            self.trace.event('static_validation', candidate_id=cid, valid=validation['valid'], errors=validation['errors'][:40], warnings=validation.get('warnings', [])[:40])
+            if compiled_ok and not validation['valid']:
+                fallbacks.append((len(validation['errors']), attempt, cid))
             if validation['valid']:
                 self.prepare_probes(spec)
                 probe_result = run_probes(spec, self.probes, self.requirements, self.deadline)
@@ -158,6 +169,7 @@ class Builder:
                 if any(not row['pass'] for row in probe_result['results']):
                     validation = {'valid': False, 'errors': ['Source-derived code probe failed: ' + json.dumps(probe_result)], 'evidence_type': 'local_code_only'}
                     self.valid[cid] = False
+                    fallbacks.append((sum(not row['pass'] for row in probe_result['results']), attempt, cid))
                     self.archive.event('code_probe_rejected', candidate_id=cid, **validation)
             if validation['valid'] and self.adapter:
                 try:
@@ -172,12 +184,33 @@ class Builder:
                 write_json(self.root / 'pinned_root.json', {'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'requirements': self.requirements, 'spec': spec, 'code_probes': self.probes}, immutable=True)
                 write_json(self.root / 'reports/coverage.json', spec['coverage'])
                 return cid
-            if attempt == 2 or self.pinned:
+            if self.pinned:
                 raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
-            spec = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.DESIGNER,
-                                  {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
-                                   'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
-                                   'proposal': spec, 'compiler_errors': validation['errors']}, WorkflowSpec)
+            if attempt == 2:
+                break
+            try:
+                spec = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.DESIGNER,
+                                      {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
+                                       'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
+                                       'proposal': compact, 'compiler_errors': validation['errors'],
+                                       'advisory_warnings': validation.get('warnings', [])}, WorkflowSpec)
+            except (ValueError, TimeoutError) as exc:
+                self.trace.event('repair_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
+                break
+        # No candidate passed every local gate. A phone agent the platform accepts still beats none:
+        # ship the least-flawed compiled candidate, clearly labelled, never as a validated root.
+        for count, _, cid in sorted(fallbacks):
+            try:
+                if self.adapter:
+                    self.adapter.validate_remote(self.archive.spec(cid)['workflow'])
+            except Exception as exc:
+                self.archive.event('remote_validation_rejected', candidate_id=cid, errors=['Freya dry-run rejected: ' + self.trace.redact(str(exc))])
+                continue
+            self.champion, self.best_effort = cid, True
+            self.kinds[cid] = 'baseline'
+            self.trace.event('best_effort_root', candidate_id=cid, unresolved_local_findings=count)
+            return cid
+        raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
 
     def prepare_probes(self, spec):
         if self.probes['probes'] or self.pinned or not any(n.get('node_type') == 'code' for n in spec['workflow']['nodes'].values()):
@@ -352,14 +385,21 @@ class Builder:
                     self.exports[root_id] = self.adapter.export(workflow, self.root / 'root.workflow.json')
                     self.checkpoint()
                     self.evaluate(root_id)
-                    self.search(root_id)
-                    self.revalidate_finalist()
-                    status = 'exported'
+                    if self.best_effort:
+                        self.trace.event('search_skipped', reason='best_effort_root_has_unresolved_local_findings')
+                    else:
+                        self.search(root_id)
+                        self.revalidate_finalist()
+                    status = 'exported_best_effort' if self.best_effort else 'exported'
                 except (Exception, KeyboardInterrupt) as exc:
                     error = self.trace.redact(str(exc) or type(exc).__name__)
                     status = 'terminated_by_budget' if isinstance(exc, TimeoutError) else 'exported_with_errors'
                     self.trace.event('search_stopped', error=type(exc).__name__, message=error)
                 finally:
+                    if not self.champion and root_id:
+                        # A measured failure vetoes promotion, not submission: an imperfect agent outscores none.
+                        self.champion = root_id
+                        self.trace.event('champion_fallback_to_root', candidate_id=root_id)
                     if self.champion:
                         self.adapter.exporting = True
                         workflow = self.archive.spec(self.champion)['workflow']
@@ -396,7 +436,7 @@ class Builder:
                       'strict_pass_rate': final_score.strict_pass_rate if final_score else None,
                       'root_score': asdict(self.scores[root_id]) if root_id in self.scores else None,
                       'final_score': asdict(final_score) if final_score else None, 'held_out_score': self.held_out_score,
-                      'status': status if exported else 'failed', 'error': error, 'start': self.started, 'end': now(),
+                      'status': status if exported else 'failed', 'best_effort_root': self.best_effort, 'error': error, 'start': self.started, 'end': now(),
                       'seconds': round(time.monotonic() - self.start_clock, 2), 'simulations': self.simulations,
                       'valid_candidates': sum(self.valid.values()), 'invalid_candidates': sum(not v for v in self.valid.values()), 'model_calls': self.roles.calls}
             write_json(self.root / 'report.json', result)

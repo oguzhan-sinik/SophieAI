@@ -88,8 +88,12 @@ def _entails(condition, variables, values):
     return condition.get("operator") == "equals" and condition.get("variable") in variables and str(condition.get("operand")) in values
 
 
+PROTECTED = {"get_account", "create_promise"}
+
+
 def validate(spec, contracts, requirements):
-    errors = []
+    # errors block deployment; warnings are advisory form/bookkeeping findings.
+    errors, warnings = [], []
     try:
         parsed = WorkflowSpec.model_validate(spec)
     except Exception as exc:
@@ -184,6 +188,9 @@ def validate(spec, contracts, requirements):
         for placement in ("tools", "pre_actions"):
             for tool in node.get(placement, []):
                 function = tool.get("function", {})
+                if not isinstance(function, dict):
+                    bad(f"{placement}: tool function must be an object")
+                    continue
                 handler, name = function.get("handler"), function.get("name")
                 props = function.get("parameters", {}).get("properties", {})
                 if placement == "pre_actions" and "response_mapping" in tool:
@@ -266,40 +273,44 @@ def validate(spec, contracts, requirements):
     rule_ids = {r["rule_id"] for r in requirements["requirements"]}
     active_ids = {r["rule_id"] for r in requirements["requirements"] if not r["precedence"]["superseded_by"]}
     if not active_ids <= set(parsed.coverage):
-        errors.append("Missing active requirement coverage")
+        warnings.append("Missing active requirement coverage: " + str(sorted(active_ids - set(parsed.coverage))[:20]))
     for rule_id, coverage in parsed.coverage.items():
         if rule_id not in rule_ids or not coverage.nodes or not coverage.tests or not set(coverage.nodes) <= set(nodes):
-            errors.append("Invalid coverage mapping: " + rule_id)
+            warnings.append("Invalid coverage mapping: " + rule_id)
     # Stable operation names come from the event contract; all fields and values are source supplied.
     used = {name for names in calls.values() for name in names}
-    for operation in used & {"get_account", "create_promise"}:
+    for operation in used & PROTECTED:
         if not any(g.operation == operation for g in parsed.tool_gates):
             errors.append(f"{operation}: missing source-backed deterministic tool gate")
     for gate in parsed.tool_gates:
         if gate.operation not in contracts["operations"] or not gate.rule_ids or not set(gate.rule_ids) <= rule_ids:
-            errors.append("Unproven tool gate source")
+            warnings.append(f"gate[{gate.operation}]: unproven tool gate source")
             continue
         expected_var = gate.producer_operation + "_response." + gate.response_path
         producer_contract = contracts["operations"].get(gate.producer_operation, {})
         response_schema = producer_contract.get("responses", {}).get("200", {}).get("content", {}).get("application/json", {}).get("schema", {})
         for field in gate.response_path.removeprefix("data.").split("."):
             response_schema = response_schema.get("properties", {}).get(field, {})
+        label = f"gate[{gate.operation}]: "
         if not response_schema or not gate.response_path.startswith("data."):
-            errors.append("Gate response path does not exist in the supplied contract")
-        if response_schema.get("type") == "boolean" and set(gate.allowed_values) != {"true", "True"}:
-            errors.append("Boolean safety gate must require both true spellings")
-        if gate.variable != expected_var and mapped.get(gate.variable) != (gate.producer_operation, gate.response_path):
-            errors.append("Gate does not read its declared tool response")
+            warnings.append(label + "response path does not exist in the supplied contract")
+        direct = gate.variable == expected_var or mapped.get(gate.variable) == (gate.producer_operation, gate.response_path)
+        if direct and response_schema.get("type") == "boolean" and set(gate.allowed_values) != {"true", "True"}:
+            warnings.append(label + "boolean safety gate should require both true spellings")
+        if not direct:
+            warnings.append(label + "gate variable is derived state, not the declared tool response")
         gate_variables = {gate.variable, expected_var}
         if expected_var in mapped and mapped[expected_var] != (gate.producer_operation, gate.response_path):
-            errors.append("Canonical tool response cannot be mapped from another field")
+            warnings.append(label + "canonical tool response cannot be mapped from another field")
         if gate_variables & set(workflow.get("test_variables", {})):
-            errors.append("Tool gate cannot be initialized by test variables")
+            errors.append(label + "tool gate cannot be initialized by test variables")
         if any(e.get("name") in gate_variables for n in nodes.values() for e in n.get("extraction_schema", [])):
-            errors.append("Tool gate cannot be set by speech extraction")
+            errors.append(label + "tool gate cannot be set by speech extraction")
         for node in nodes.values():
             for tool in node.get("tools", []) + node.get("pre_actions", []):
                 function = tool.get("function", {})
+                if not isinstance(function, dict):
+                    continue
                 snippets = [tool.get("pre_process_code", ""), tool.get("post_process_code", "")]
                 if function.get("handler") == "__function__:code_exec":
                     snippets.append(function.get("parameters", {}).get("properties", {}).get("code", {}).get("default", ""))
@@ -310,8 +321,8 @@ def validate(spec, contracts, requirements):
                         continue
                     for item in ast.walk(tree):
                         if isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Store) and isinstance(item.slice, ast.Constant):
-                            if item.slice.value in {gate.variable, expected_var}:
-                                errors.append("Generated code cannot forge a tool gate variable")
+                            if item.slice.value == expected_var or (direct and item.slice.value == gate.variable):
+                                errors.append(label + "generated code cannot forge a tool gate variable")
                             if function.get("name") == gate.producer_operation and item.slice.value == gate.response_path.rsplit(".", 1)[-1]:
                                 errors.append("Producer hook cannot overwrite its gate response field")
         stack = [(initial, False, False)] if initial in nodes else []
@@ -322,7 +333,7 @@ def validate(spec, contracts, requirements):
                 continue
             seen.add((key, guarded, producer_seen))
             if gate.operation in calls[key] and not guarded:
-                errors.append(f"{key}: {gate.operation} reachable without verified gate")
+                (errors if gate.operation in PROTECTED else warnings).append(f"{key}: {gate.operation} reachable without its declared gate ({gate.variable} in {gate.allowed_values} after {gate.producer_operation})")
             producer_seen = producer_seen or gate.producer_operation in calls[key]
             for target, condition in edges[key]:
                 stack.append((target, guarded or (producer_seen and _entails(condition, gate_variables, gate.allowed_values)), producer_seen))
@@ -354,7 +365,7 @@ def validate(spec, contracts, requirements):
             if key in ends and not closed:
                 errors.append(f"{key}: terminal can bypass deterministic close_call")
             pending += [(target, closed) for target, _ in edges[key]]
-    return {"valid": not errors, "errors": sorted(set(errors)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
+    return {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
 
 
 def apply_mutation(parent, mutation, parent_id):

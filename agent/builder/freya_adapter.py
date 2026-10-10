@@ -141,7 +141,9 @@ class FreyaAdapter:
                 raise ValueError("Candidate is not the latest published version")
             stored = self.api("GET", f"/api/v2/workflow/{deployment['workflow_id']}", workspaceId=self.client.workspace_id())["workflow"]["workflow"]
             contains_definition(workflow, stored)
-            self.deployment = {**deployment, "workflow_hash": digest(workflow)}
+            every = list(workflow.get("nodes", {}).values()) + list(workflow.get("global_nodes", {}).values())
+            self.deployment = {**deployment, "workflow_hash": digest(workflow), "steps": len(every),
+                               "tools": sum(len(n.get("tools", [])) + len(n.get("pre_actions", [])) for n in every)}
             self.trace.event("candidate_published", **self.deployment)
             return self.deployment
 

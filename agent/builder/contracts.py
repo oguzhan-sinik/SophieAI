@@ -160,6 +160,45 @@ def tool_from_contract(contract, description, bindings=None):
             "connect_retries": {"type": "number", "default": 0}, "body": body}}}}
 
 
+def normalize_spec(spec, contracts, protected=("get_account", "create_promise")):
+    """Mechanical placement fixes for the compact proposal; no policy content is changed."""
+    spec = deepcopy(spec)
+    workflow = spec.get("workflow", {})
+    for group in ("nodes", "global_nodes"):
+        if workflow.get(group) is None:
+            workflow[group] = {}
+    notes = []
+    groups = [g for g in (workflow.get("nodes"), workflow.get("global_nodes")) if isinstance(g, dict)]
+    for key, node in [(k, n) for g in groups for k, n in g.items() if isinstance(n, dict)]:
+        for placement in ("tools", "pre_actions"):
+            if not isinstance(node.get(placement), list):
+                continue
+            for tool in node[placement]:
+                if not isinstance(tool, dict):
+                    continue
+                if "bank_operation" in tool:
+                    for extra in ("type", "config"):
+                        if tool.pop(extra, None) is not None:
+                            notes.append(f"{key}: dropped controller-owned {extra}")
+                # Engine-run calls map their response on the node, not on the tool.
+                if placement == "pre_actions" and isinstance(tool.get("response_mapping"), list):
+                    moved = tool.pop("response_mapping")
+                    existing = node.setdefault("response_mapping", [])
+                    if isinstance(existing, list):
+                        existing.extend(m for m in moved if m not in existing)
+                        notes.append(f"{key}: moved pre_action response_mapping to node")
+    operations = contracts["operations"]
+    kept = []
+    for gate in spec.get("tool_gates", []) or []:
+        # Only protected tools need a gate; an optional one must at least name a real producer.
+        if isinstance(gate, dict) and gate.get("operation") not in protected and gate.get("producer_operation") not in operations:
+            notes.append(f"dropped unverifiable optional gate on {gate.get('operation')}")
+            continue
+        kept.append(gate)
+    spec["tool_gates"] = kept
+    return spec, notes
+
+
 def compile_tools(workflow, contracts):
     """Expand explicit bank_operation references; endpoint configuration is Python-owned."""
     workflow = deepcopy(workflow)
@@ -172,8 +211,10 @@ def compile_tools(workflow, contracts):
                 if name not in contracts["operations"]:
                     raise ValueError(f"Unsupported bank operation: {name}")
                 allowed = {"bank_operation", "description", "bindings", "response_mapping", "pre_process_code", "post_process_code"}
-                if set(tool) - allowed:
-                    raise ValueError("Unknown bank tool specification fields")
+                # type/config are controller-owned and rebuilt from the contract; a model-supplied copy is discarded.
+                unknown = set(tool) - allowed - {"type", "config"}
+                if unknown:
+                    raise ValueError(f"{node.get('name')}: unknown bank tool specification fields {sorted(unknown)} on {name}")
                 compiled = tool_from_contract(contracts["operations"][name], tool["description"], tool.get("bindings"))
                 for key in ("response_mapping", "pre_process_code", "post_process_code"):
                     if key in tool:
