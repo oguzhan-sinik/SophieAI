@@ -202,6 +202,58 @@ class Store:
 
     # ------------------------------------------------------------- lineage tree
 
+    def effective_parents(self, run_id: str) -> dict:
+        """candidate -> (parent, derived?). The builder records a compile repair without a parent
+        although it rewrites the candidate created just before it; link those so changes are visible."""
+        out, previous = {}, None
+        for e in self.lineage_events(run_id)[0]:
+            if e.get("event") != "candidate_created" or not e.get("candidate_id"):
+                continue
+            parent, derived = e.get("parent_id"), False
+            if not parent and e.get("mutation_kind") == "compile_repair" and previous:
+                parent, derived = previous, True
+            out[e["candidate_id"]] = (parent, derived)
+            previous = e["candidate_id"]
+        return out
+
+    def _candidate_stats(self, run_id: str, cid: str, parent: str | None) -> dict:
+        base = self.run_dir(run_id)
+        out: dict = {}
+        wf_path = base / "candidates" / cid / "workflow.json"
+        wf = self._cache.get(wf_path, _load_json) if wf_path.is_file() else None
+        if isinstance(wf, dict):
+            every = [n for g in ("nodes", "global_nodes") for n in (wf.get(g) or {}).values() if isinstance(n, dict)]
+            out["steps"] = len(every)
+            out["tools"] = sum(len(n.get("tools") or []) + len(n.get("pre_actions") or []) for n in every)
+        val_path = base / "candidates" / cid / "validation.json"
+        val = self._cache.get(val_path, _load_json) if val_path.is_file() else None
+        if isinstance(val, dict):
+            out["warning_count"] = len(val.get("warnings") or [])
+        ev_root = base / "evaluations"
+        if ev_root.is_dir():
+            tests = []
+            for d in sorted((d for d in ev_root.iterdir() if d.is_dir() and d.name.startswith(cid)), key=lambda d: d.stat().st_mtime):
+                out["deployed"] = True
+                score = self._cache.get(d / "core_score.json", _load_json) if (d / "core_score.json").is_file() else None
+                if isinstance(score, dict):
+                    tests.append({"passed": score.get("passed"), "total": score.get("total"), "failed": score.get("failed"),
+                                  "unknown": score.get("unknown"), "complete": score.get("complete"),
+                                  "hard_fail_count": score.get("hard_fail_count"), "evidence": score.get("evidence_type")})
+            if tests:
+                out["test"] = tests[-1]
+        if parent and isinstance(wf, dict):
+            pw_path = base / "candidates" / parent / "workflow.json"
+            pw = self._cache.get(pw_path, _load_json) if pw_path.is_file() else None
+            if isinstance(pw, dict):
+                from . import diff as diffmod
+                d = diffmod.diff_workflows(pw, wf)
+                added = sorted(set(wf.get("nodes") or {}) - set(pw.get("nodes") or {}))
+                removed = sorted(set(pw.get("nodes") or {}) - set(wf.get("nodes") or {}))
+                changed = [n for n in d["changed_nodes"] if n not in added and n not in removed]
+                out["changes"] = {"added": added, "removed": removed, "changed": changed, "identical": d["identical"],
+                                  "total": len(d["changes"])}
+        return out
+
     def tree(self, run_id: str) -> dict:
         ev, recorded = self.lineage_events(run_id)
         nodes: dict[str, dict] = {}
@@ -240,12 +292,26 @@ class Store:
                     v["probe_errors"] = e.get("errors") or []
                     v["probe_evidence"] = e.get("evidence_type")
 
+        parents = self.effective_parents(run_id)
+        repairs = 0
         for cid, n in nodes.items():
             v = validation.get(cid)
             if v:
                 n["valid"] = v.get("valid")
                 n["validation_evidence"] = v.get("evidence_type")
                 n["errors"] = (v.get("errors") or []) + (v.get("probe_errors") or [])
+            parent, derived = parents.get(cid, (n["parent_id"], False))
+            if derived:
+                n["parent_id"], n["parent_derived"] = parent, True
+            kind = n["mutation_kind"]
+            if kind == "compile_repair":
+                repairs += 1
+                n["label"] = f"Repair {repairs}"
+            elif kind == "baseline":
+                n["label"], repairs = "First design", 0
+            else:
+                n["label"] = "Mutation: " + str(kind).replace("_", " ")
+            n.update(self._candidate_stats(run_id, cid, n["parent_id"]))
 
         # graph integrity
         for cid, n in nodes.items():
@@ -303,6 +369,9 @@ class Store:
         for e in self.lineage_events(run_id)[0]:
             if e.get("candidate_id") == candidate_id and e.get("event") == "candidate_created":
                 created, parent_id = e.get("created_at") or e.get("at"), e.get("parent_id")
+        parent_derived = False
+        if not parent_id:
+            parent_id, parent_derived = self.effective_parents(run_id).get(candidate_id, (None, False))
         report = self.report(run_id)
         out = {
             "run_id": run_id,
@@ -310,6 +379,7 @@ class Store:
             "recorded_lineage": recorded,
             "created_at": created,
             "parent_candidate_id": parent_id,
+            "parent_derived": parent_derived,
             "champion": report.get("candidate_id") == candidate_id,
             "score": _safe_int(report.get("final_score")) if report.get("candidate_id") == candidate_id else None,
             "files": {},
@@ -339,6 +409,14 @@ class Store:
         usage: dict[str, dict] = {}
         open_starts: list[dict] = []
         spans: list[dict] = []
+        groups: list[dict] = []  # open deploy / practice-test spans; platform calls fold into them
+        eval_root = self.run_dir(run_id) / "evaluations"
+        eval_dirs = sorted((d for d in eval_root.iterdir() if d.is_dir() and not d.name.startswith("held_out")),
+                           key=lambda d: d.stat().st_mtime) if eval_root.is_dir() else []
+        tests_seen = 0
+
+        def child(e, label):
+            groups[-1]["children"].append({"at": e.get("at"), "label": label})
 
         def close(sp, end_ev):
             sp["end_at"] = end_ev.get("at")
@@ -384,21 +462,101 @@ class Store:
                 spans.append({"span_id": f"seq_{seq}", "kind": "resume", "name": kind,
                               "start_at": at, "status": "succeeded",
                               "source": e.get("source"), "seq": seq, "detail": e})
-            elif kind in ("FreyaDeploy_start", "FreyaDeploy_end", "FreyaDeploy_error"):
-                spans.append({"span_id": f"seq_{seq}", "kind": "freya", "name": kind,
-                              "start_at": at,
-                              "status": "failed" if kind.endswith("error") else "succeeded",
-                              "workflow_hash": e.get("workflow_hash"),
-                              "error": e.get("error"), "seq": seq, "detail": e})
-            elif kind == "freya_api":
-                spans.append({"span_id": f"seq_{seq}", "kind": "freya", "name": f"freya {e.get('method')} {e.get('path')}",
-                              "start_at": at, "status": "succeeded", "seq": seq, "detail": e})
+            elif kind == "FreyaDeploy_start":
+                sp = {"span_id": f"seq_{seq}", "kind": "deploy", "name": "Deploy to Freya", "start_at": at,
+                      "status": "running", "workflow_hash": e.get("workflow_hash"), "slot": e.get("slot"),
+                      "children": [], "seq": seq, "derived": True, "detail": e}
+                groups.append(sp)
+                spans.append(sp)
+            elif kind == "OfficialBenchmark_start":
+                folder = e.get("evaluation_folder")
+                if not folder and eval_dirs:  # older traces: pair tests with evaluation folders in order
+                    if not e.get("repetition"):
+                        tests_seen += 1
+                    folder = eval_dirs[min(tests_seen, len(eval_dirs)) - 1].name
+                sp = {"span_id": f"seq_{seq}", "kind": "benchmark", "name": "Practice test", "start_at": at,
+                      "status": "running", "repetition": e.get("repetition") or 0, "evaluation_folder": folder,
+                      "children": [], "seq": seq, "derived": True, "detail": e}
+                groups.append(sp)
+                spans.append(sp)
+            elif kind in ("FreyaDeploy_end", "FreyaDeploy_error", "OfficialBenchmark_end", "OfficialBenchmark_error"):
+                want = "deploy" if kind.startswith("FreyaDeploy") else "benchmark"
+                for sp in reversed(groups):
+                    if sp["kind"] == want:
+                        if kind.endswith("_error"):
+                            sp["failed"], sp["error"] = True, e.get("message") or e.get("error")
+                        else:
+                            sp["end_at"] = at
+                            sp["status"] = "failed" if sp.get("failed") else "succeeded"
+                            groups.remove(sp)
+                        break
+            elif kind == "candidate_published" and groups:
+                g = groups[-1]
+                g.update({k: e.get(k) for k in ("workflow_id", "agent_id", "version", "steps", "tools")})
+                g["name"] = f"Deploy to Freya · v{e.get('version')}" + (f" · {e.get('steps')} steps, {e.get('tools')} tools" if e.get("steps") is not None else "")
+            elif kind == "official_result":
+                target = groups[-1] if groups else next((s for s in reversed(spans) if s["kind"] == "benchmark"), None)
+                if target is not None:
+                    target["passed"], target["total"] = e.get("passed"), e.get("total")
+                    target["name"] = f"Practice test · {e.get('passed')}/{e.get('total')} passed"
+            elif kind in ("freya_api", "workflow_export"):
+                label = f"{e.get('method')} {e.get('path')}" if kind == "freya_api" else "export workflow"
+                if groups:
+                    child(e, label)
+                elif kind == "workflow_export" and spans and spans[-1]["kind"] == "freya":
+                    spans[-1].update({"name": "Export workflow from Freya", "path": e.get("path")})
+                else:
+                    name = "Freya dry-run (schema check)" if label == "POST /api/v2/workflow" else "freya " + label
+                    spans.append({"span_id": f"seq_{seq}", "kind": "freya", "name": name,
+                                  "start_at": at, "status": "succeeded", "seq": seq, "detail": e})
+            elif kind == "static_validation":
+                errors, warns = e.get("errors") or [], e.get("warnings") or []
+                spans.append({"span_id": f"seq_{seq}", "kind": "validation", "start_at": at, "seq": seq, "detail": e,
+                              "name": f"Validation · {'passed' if e.get('valid') else str(len(errors)) + ' error' + ('' if len(errors) == 1 else 's')}"
+                                      + (f", {len(warns)} warnings" if warns else ""),
+                              "status": "succeeded" if e.get("valid") else "failed", "candidate_id": e.get("candidate_id"),
+                              "errors": errors, "warnings": warns})
+            elif kind in ("best_effort_root", "search_skipped", "evaluation_skipped", "benchmark_incomplete", "held_out_skipped",
+                          "champion_fallback_to_root", "repair_unavailable", "diagnosis_unavailable", "proposal_normalized",
+                          "cached_export_fallback"):
+                spans.append({"span_id": f"seq_{seq}", "kind": "note", "name": kind.replace("_", " "), "start_at": at,
+                              "status": "succeeded" if kind == "proposal_normalized" else "warning",
+                              "error": e.get("message") or e.get("reason"), "seq": seq, "detail": e})
             elif kind == "structured_output_retry":
                 spans.append({"span_id": f"seq_{seq}", "kind": "retry", "name": "structured_output_retry",
                               "start_at": at, "status": "warning", "role": e.get("role"),
                               "seq": seq, "detail": e})
 
         for sp in spans:
+            if sp["kind"] in ("deploy", "benchmark") and sp["status"] == "running":
+                sp["status"] = "failed" if sp.get("failed") else "running"
+            if sp["kind"] == "benchmark" and sp.get("evaluation_folder"):
+                folder = eval_root / sp["evaluation_folder"]
+                raw = self._cache.get(folder / "raw_runner.json", _load_json) if (folder / "raw_runner.json").is_file() else None
+                rows = (raw or {}).get("all_rows") or []
+                if sp["repetition"] < len(rows):
+                    sp["results"] = rows[sp["repetition"]]
+                    sims = (raw or {}).get("simulations") or []
+                    if sp["repetition"] < len(sims):
+                        sp["simulation"] = sims[sp["repetition"]]
+                    if sp.get("passed") is None:
+                        sp["passed"], sp["total"] = sum(1 for r in sp["results"] if r.get("pass")), len(sp["results"])
+                        sp["name"] = f"Practice test · {sp['passed']}/{sp['total']} passed"
+                if (folder / f"calls_{sp['repetition']}.json").is_file():
+                    sp["transcripts"] = f"evaluations/{sp['evaluation_folder']}/calls_{sp['repetition']}.json"
+                live_path = folder / f"live_{sp['repetition']}.json"
+                if not sp.get("results") and live_path.is_file():
+                    # Provisional per-customer progress published by the builder while the simulation runs.
+                    live = self._cache.get(live_path, _load_json) or {}
+                    rows = live.get("rows") or []
+                    done = [r for r in rows if r.get("state") == "finished"]
+                    sp["live"] = {"updated_at": live.get("updated_at"), "rows": rows}
+                    sp["name"] = f"Practice test · {len(done)}/{len(rows)} finished, {sum(1 for r in done if r.get('pass'))} passing"
+                    if (folder / f"live_calls_{sp['repetition']}.json").is_file():
+                        sp["transcripts"] = f"evaluations/{sp['evaluation_folder']}/live_calls_{sp['repetition']}.json"
+                        sp["transcripts_live"] = True
+                if (folder / "diagnostics.json").is_file():
+                    sp["diagnostics"] = f"evaluations/{sp['evaluation_folder']}/diagnostics.json"
             if sp["kind"] == "llm":
                 u = usage.get(sp.get("call_id") or "")
                 if u and not sp.get("tokens"):
