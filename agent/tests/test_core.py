@@ -324,3 +324,71 @@ def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contract
     assert guard['condition'] == {'variable': 'verify.total_turns', 'operator': 'greater_than', 'operand': 20}
     assert compile_tools(once, contracts) == once
     assert validate({**spec, 'workflow': once}, contracts, requirements)['valid']
+
+
+def test_extracted_value_without_route_is_a_dead_end(spec, contracts, requirements):
+    node = spec['workflow']['nodes']['verify']
+    node['extraction_schema'] = [{'name': 'answer', 'type': 'string', 'enum_values': ['agrees', 'refuses', 'unclear'], 'description': 'What the caller said.', 'min_confidence': 0.7}]
+    node['transitions'] += [{'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'refuses'}]}},
+                            {'target_node': 'verify', 'description': 'Stay', 'condition': {'operator': 'always'}}]
+    result = validate(spec, contracts, requirements)
+    # A stay can be intended, so the finding asks for a repair and never blocks deployment.
+    assert result['valid'] and len(result['dead_ends']) == 1 and "verify: answer can be extracted as ['agrees', 'unclear']" in result['dead_ends'][0]
+    # An explicit route back to the stage is a decision; an unlisted value is an oversight.
+    node['transitions'].insert(1, {'target_node': 'verify', 'description': 'Ask again', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'unclear'}, {'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
+    assert not validate(spec, contracts, requirements)['dead_ends']
+    # A stage whose unmatched answers move on elsewhere cannot trap the call.
+    node['transitions'][1]['condition'] = {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'unclear'}]}
+    assert validate(spec, contracts, requirements)['dead_ends']
+    node['transitions'][-1]['target_node'] = 'close'
+    assert not validate(spec, contracts, requirements)['dead_ends']
+    node['transitions'][-1]['target_node'] = 'verify'
+    # A variable the stage only records, without routing on it, is not checked.
+    node['transitions'] = node['transitions'][:1] + node['transitions'][-1:]
+    assert not validate(spec, contracts, requirements)['dead_ends']
+
+
+def test_diagnosis_evidence_carries_failed_call_steps(work, spec, requirements):
+    from builder.build import call_evidence
+    from builder.diagnostics import grounded_diagnoses
+    turns = [{'role': 'assistant', 'node': 'verify', 'text': f'turn {i}'} for i in range(100)]
+    write_json(work / 'calls_0.json', {'bad': {'call_id': 'c1', 'turns': turns}, 'good': {'call_id': 'c2', 'turns': turns[:2]}})
+    raw = {'all_rows': [[{'id': 'bad', 'pass': False, 'failed': ['stuck']}, {'id': 'good', 'pass': True, 'failed': []}], [{'id': 'bad', 'pass': False, 'failed': ['no record']}]]}
+    calls = call_evidence(work, raw)
+    assert list(calls[0]) == ['bad'] and calls[1] == {}
+    assert len(calls[0]['bad']['turns']) == 80 and calls[0]['bad']['turns_omitted'] == 20 and calls[0]['bad']['turns'][-1]['text'] == 'turn 99'
+    d = {'case_id': 'bad', 'rule_ids': ['R1'], 'evidence_refs': ['calls.0.bad.turns.3'], 'likely_workflow_nodes': ['verify'], 'confidence': .8}
+    assert grounded_diagnoses([d], {**raw, 'calls': calls}, requirements, spec['workflow'], {'bad'}) == [d]
+
+
+def test_calculator_result_overrides_the_referees_copy():
+    from builder.scenarios import reconcile_probes
+    probe = {'probe_id': 'P', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {'now': '2031-03-03T11:00'}, 'expected': {'deadline': '2031-03-06', 'band': 'late'}, 'rationale': 'Deadline = 2031-03-07'}
+    used = [{'arguments': {'anchor': '2031-03-03', 'count': 4}, 'result': {'dates': [], 'deadline': '2031-03-07'}}]
+    # Named: the controller writes the calculator's value, whatever the model left in expected.
+    fixed, notes = reconcile_probes({'probes': [{**probe, 'calculated': {'deadline': '2031-03-07'}}]}, used)
+    assert fixed['probes'][0]['expected'] == {'deadline': '2031-03-07', 'band': 'late'} and 'corrected' in notes[0] and 'calculated' not in fixed['probes'][0]
+    # Calculator used but its result tied to nothing, or to a value it never returned: not a trustworthy test.
+    assert reconcile_probes({'probes': [probe]}, used)[0] == {'probes': []}
+    assert reconcile_probes({'probes': [{**probe, 'calculated': {'deadline': '2031-03-06'}}]}, used)[0] == {'probes': []}
+    # A probe the calculator was never used for (another call date, or no date at all) is left alone.
+    other = [{'arguments': {'anchor': '2031-04-01', 'count': 4}, 'result': {'deadline': '2031-04-07'}}]
+    assert reconcile_probes({'probes': [probe]}, other)[0]['probes'][0]['expected'] == probe['expected']
+    assert reconcile_probes({'probes': [probe]}, [])[1] == []
+
+
+def test_vague_period_is_not_extracted_as_a_day(contracts):
+    from builder import runtime
+    workflow = {'nodes': {'ask': {'name': 'ask', 'node_type': 'conversation', 'extraction_schema': [{'name': 'pay_day', 'type': 'date', 'description': 'The day the customer will pay.', 'min_confidence': 0.7}], 'transitions': []}}, 'global_nodes': {}}
+    once = runtime.apply(deepcopy(workflow), contracts)
+    item = once['nodes']['ask']['extraction_schema'][0]
+    assert item['type'] == 'string' and runtime.SINGLE_DAY in item['description']
+    assert runtime.apply(deepcopy(once), contracts) == once
+
+
+def test_simulations_go_first_to_mutations_aimed_at_failed_customers():
+    from builder.build import Builder
+    feedback = {'diagnostics': [{'case_id': 'a', 'likely_workflow_nodes': ['ask_day']}, {'case_id': 'b', 'likely_workflow_nodes': ['ask_day', 'confirm']}, {'case_id': 'c', 'likely_workflow_nodes': ['close']}]}
+    edit = lambda *nodes: {'operations': [{'op': 'set_node', 'target': n, 'value': {}} for n in nodes]}
+    assert [Builder.failed_cases_addressed(feedback, edit(*n)) for n in (['ask_day'], ['close'], ['greeting'], ['confirm', 'close'])] == [2, 1, 0, 2]
+    assert Builder.failed_cases_addressed({'strict_pass_rate': 0.5}, edit('ask_day')) == 0

@@ -51,7 +51,7 @@ class Config:
     seed: int = 42
     repetitions: int = 1
     final_repetitions: int = 3
-    max_simulations: int = 2
+    max_simulations: int = 4
     llm_timeout: int = 480
     request_timeout: int = 90
     official: bool = True

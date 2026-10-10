@@ -32,6 +32,34 @@ def validate_probe_targets(spec, proposals):
             raise ValueError(f'{probe.probe_id}: expected keys must be actual written variables: {sorted(written)}')
 
 
+def reconcile_probes(proposals, calculations):
+    """Make the calculator's results, not the referee's copy of them, the expected dates.
+
+    A referee has been seen to compute the right day and leave the planner's wrong one in
+    `expected`. Where it names the calculated variables the controller writes the returned value
+    itself; a probe that used the calculator without saying where the result belongs is dropped."""
+    kept, notes = [], []
+    for probe in CodeProbes.model_validate(proposals).model_dump()['probes']:
+        inputs = [v for v in probe['variables'].values() if isinstance(v, str)]
+        deadlines = set()
+        for record in calculations or []:
+            arguments, result = record.get('arguments') or {}, record.get('result') or {}
+            result = result.get('result', result) if isinstance(result, dict) else {}
+            anchor = str(arguments.get('anchor', ''))[:10]
+            if anchor and isinstance(result, dict) and result.get('deadline') and any(v.startswith(anchor) for v in inputs):
+                deadlines.add(result['deadline'])
+        named = {key: value for key, value in probe.pop('calculated', {}).items() if key in probe['expected']}
+        if deadlines and (not named or not set(named.values()) <= deadlines):
+            notes.append(f"{probe['probe_id']}: dropped, calculator results {sorted(deadlines)} were not tied to its expectations")
+            continue
+        for key, value in named.items() if deadlines else []:
+            if probe['expected'][key] != value:
+                notes.append(f"{probe['probe_id']}: {key} corrected from {probe['expected'][key]} to calculated {value}")
+                probe['expected'][key] = value
+        kept.append(probe)
+    return {'probes': kept}, notes
+
+
 def run_probes(spec, proposals, requirements, deadline):
     probes = CodeProbes.model_validate(proposals).probes
     rule_ids = {r['rule_id'] for r in requirements['requirements']}

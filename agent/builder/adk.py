@@ -61,6 +61,7 @@ class ADKRoles:
     def __init__(self, cfg, deadline, trace, root):
         self.cfg, self.deadline, self.trace, self.root = cfg, deadline, trace, root
         self.calls = 0
+        self.calculations = []
 
     def ask(self, role, purpose, instruction, payload, schema, model=None):
         for attempt in range(2):
@@ -116,12 +117,16 @@ class ADKRoles:
         session = await sessions.create_session(app_name="freya_builder", user_id="builder", session_id=uuid.uuid4().hex)
         runner = Runner(agent=agent, app_name="freya_builder", session_service=sessions)
         message = types.Content(role="user", parts=[types.Part(text=json.dumps({"input": payload, "output_schema": schema.model_json_schema()}, ensure_ascii=False))])
-        texts, usage = [], []
+        texts, usage, pending = [], [], {}
+        self.calculations = []
         async for event in runner.run_async(user_id="builder", session_id=session.id, new_message=message, run_config=RunConfig(max_llm_calls=8 if calculator else 1)):
             for call in event.get_function_calls():
                 self.trace.event('pure_calculator_call', name=call.name, arguments=call.args)
+                pending[call.id] = call.args
             for response in event.get_function_responses():
                 self.trace.event('pure_calculator_result', name=response.name, result=response.response)
+                # Kept so the controller, not the model, has the last word on calculated dates.
+                self.calculations.append({'arguments': pending.get(response.id) or {}, 'result': response.response or {}})
             if event.usage_metadata:
                 usage.append(event.usage_metadata.model_dump(exclude_none=True))
             if event.content and event.is_final_response():

@@ -50,7 +50,7 @@ Static checks reject misplaced fields, unsupported operations and URLs, missing 
 
 LangSmith is optional at runtime: local durable logs survive missing credentials/outages. Remote traces contain metadata and artifact references rather than customer transcripts. Local evidence is restricted to the synthetic kit, with credentials and structured identity fields redacted. No real customer data is supported. LangSmith receipt is unverified unless a configured account receives a trace.
 
-No model weight training, frontend or builder self-rewriting is included. Search uses GRPO-style relative normalization only on complete matched sibling suites. With the default two-simulation budget, most children will have unknown fitness; they cannot displace a measured champion without comparable evidence.
+No model weight training, frontend or builder self-rewriting is included. Search uses GRPO-style relative normalization only on complete matched sibling suites. With the default four-simulation budget, some children will still have unknown fitness; they cannot displace a measured champion without comparable evidence.
 
 Restore after an interrupted run without another model call:
 

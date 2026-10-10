@@ -14,6 +14,9 @@ START = "# controller: runtime prelude"
 END = "# controller: end of runtime prelude"
 SAID = ("If the customer states a complete calendar date including its year, give it as YYYY-MM-DD. Otherwise give the customer's own final "
         "words for the day exactly as said (for example: tomorrow, this Friday, the 26th, 6 November) and do not work out a calendar date yourself.")
+# Words are captured, so without this a period would count as a given day in every `is_set` route.
+SINGLE_DAY = ("Fill this only when the words name one single day. A period or a condition (for example: next week, the week after next, "
+              "end of the month, in a few days, when my salary comes) is not a day: leave this variable out entirely.")
 
 # Pure calendar arithmetic. Interpretation of ambiguous wording is a parameter, never a constant:
 # policy code may call ctl_date again with the reading its own source prescribes.
@@ -256,6 +259,8 @@ def apply(workflow, contracts):
                 item["type"] = "string"
                 if SAID not in str(item.get("description", "")):
                     item["description"] = (str(item.get("description", "")).strip() + " " + SAID).strip()
+                if SINGLE_DAY not in item["description"]:
+                    item["description"] += " " + SINGLE_DAY
                 if item["name"] not in dates:
                     dates.append(item["name"])
     structured = []

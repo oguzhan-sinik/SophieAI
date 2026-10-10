@@ -91,9 +91,20 @@ def _entails(condition, variables, values):
 PROTECTED = {"get_account", "create_promise"}
 
 
+def _tested(condition, equal, unequal):
+    """Collect the operands a stage's routes compare each variable with."""
+    if not isinstance(condition, dict):
+        return
+    for child in condition.get("conditions") or []:
+        _tested(child, equal, unequal)
+    if condition.get("operator") in ("equals", "not_equals") and condition.get("variable"):
+        (equal if condition["operator"] == "equals" else unequal).setdefault(condition["variable"], set()).add(str(condition.get("operand")))
+
+
 def validate(spec, contracts, requirements):
-    # errors block deployment; warnings are advisory form/bookkeeping findings.
-    errors, warnings = [], []
+    # errors block deployment; warnings are advisory form/bookkeeping findings. dead_ends are stages
+    # that can trap a call: worth one repair, but a stay can be intended, so they never block.
+    errors, warnings, dead_ends = [], [], []
     try:
         parsed = WorkflowSpec.model_validate(spec)
     except Exception as exc:
@@ -159,6 +170,22 @@ def validate(spec, contracts, requirements):
                     bad(f"{field} target does not resolve")
                 else:
                     edges[key].append((node[field], {"operator": "always"}))
+        if kind == "conversation":
+            # A value the extractor may return but no route tests leaves the call in the stage with
+            # nothing to do; the dialogue model then improvises until the customer hangs up.
+            equal, unequal = {}, {}
+            for transition in transitions:
+                _tested(transition.get("condition"), equal, unequal)
+            fallthrough = next((t.get("target_node") for t in transitions if isinstance(t.get("condition"), dict) and t["condition"].get("operator") == "always"), key)
+            # Only a stage that keeps the call when nothing matches can trap it.
+            for extraction in node.get("extraction_schema", []) if fallthrough == key else []:
+                name, values = extraction.get("name"), extraction.get("enum_values")
+                if not isinstance(values, list) or name not in equal:
+                    continue
+                unrouted = [str(v) for v in values if str(v) not in equal[name] and not unequal.get(name, set()) - {str(v)}]
+                if unrouted:
+                    dead_ends.append(f"{key}: {name} can be extracted as {unrouted} but no transition of this stage tests those values, so the call stays here with no way on. "
+                        "Give each value its own transition; a transition back to this stage counts where staying is intended")
         if "max_node_turns" in node and "max_turn_transition" not in node:
             bad("Turn cap has no fallback target")
         if node.get("passthrough"):
@@ -374,7 +401,7 @@ def validate(spec, contracts, requirements):
             if key in ends and not closed:
                 errors.append(f"{key}: terminal can bypass deterministic close_call")
             pending += [(target, closed) for target, _ in edges[key]]
-    return {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
+    return {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "dead_ends": sorted(set(dead_ends)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
 
 
 def apply_mutation(parent, mutation, parent_id):

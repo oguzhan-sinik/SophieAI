@@ -35,6 +35,9 @@ max_turn_transition. End nodes use __function__:end_call terminal. If source req
 before close, speak it in the close api_request on_enter TTS; terminal can use message_mode none.
 
 Routing belongs in transitions, extraction in extraction_schema with explicit min_confidence.
+List the values of every variable a stage routes on in enum_values, and give each listed value its
+own transition in that stage (back to the same stage where staying is intended). An agreement to
+what the stage just proposed is such a value: route it, never wait for the customer to repeat it.
 Top grouped conditions use OR (nest AND). Match true/True strings, never boolean operands.
 Protect account access with deterministic response-based gates on EVERY path including fallbacks.
 Keep get_account/create_promise downstream of successful identity responses, away from identity
@@ -67,6 +70,9 @@ the source rule for a missing or vague day, never substitute a default silently.
 prescribes its own reading of a phrase, call ctl_date(vars.get('<name>_said'), vars.get('now'),
 next_weekday='following_week' or 'next_occurrence') in your code and apply the source rule there.
 Do not ask the extractor to do calendar arithmetic and do not use platform date placeholders.
+A date variable is filled only when the customer names one single day; a vague period leaves it
+unset. So a stage that asks for a day extracts the date there, routes a vague answer through its own
+listed value, and tests that value before any is_set route on the date.
 
 Never replace a value the customer gave without their agreement. When code must change or reject a
 day or an amount (not allowed, outside a limit, missing), it sets a status variable and the proposed
@@ -112,11 +118,20 @@ complete coverage. Each proposal needs a different meaningful mutation family an
 hypothesis. Use only authorized supplied feedback. Absent diagnoses are unknown, not invented
 failures. Diagnostics are uncertain hypotheses. Never insert benchmark labels, transcripts or
 practice customer facts into the workflow; repair general behavior. No builder source edits.
+rejected_siblings lists earlier proposals for this parent that the compiler refused, with the stages
+they edited and the reason. Do not submit them again: avoid each stated cause. Python runs only in
+code stages (pre_actions with code_exec) or as pre_process_code/post_process_code on a bank tool
+object, never as a field of a stage and never in a conversation stage.
 """
 
 DIAGNOSIS = """Read-only referee: core score is frozen and cannot change. Diagnose observed failures only.
-Cite evidence_refs as exact dot paths into the supplied evidence object, such as all_rows.0.0.failed.0.
-Cite source rule IDs, likely workflow nodes, repair hypothesis and
+evidence.calls holds, per repetition and failed case, the call step by step: each spoken turn with the
+stage (node) it ran in, every stage change with the route that fired, extracted values, tool calls and
+results. Read it before the judge's summary: find the stage where the call stopped making progress and
+the extracted value or route condition that kept it there, and name that stage in likely_workflow_nodes.
+Cite evidence_refs as exact dot paths into the supplied evidence object, such as all_rows.0.0.failed.0
+or calls.0.<case id>.turns.12. Give at most four references per diagnosis: the judge's finding and the
+one or two turns where the call first went wrong, never a run of consecutive turns. Cite source rule IDs, likely workflow nodes, repair hypothesis and
 counterfactual test. Never infer a bank commit from speech or fabricate missing evidence. No
 evidence means no diagnosis. Every diagnosis is an uncertain hypothesis, never a replacement score.
 """

@@ -70,6 +70,7 @@ class CodeProbe(Record):
     variables: dict[str, Any]
     expected: dict[str, Any] = Field(description='Only actual output variable names and expected values. No explanations or metadata.')
     rationale: str = ''
+    calculated: dict[str, str] = Field(default_factory=dict, description='Referee only: for each expected variable whose value came from the calculator, that variable name mapped to the deadline the calculator returned.')
 
 
 class CodeProbes(Record):
@@ -100,10 +101,11 @@ class MutationGroup(Record):
 
 class Diagnostic(Record):
     case_id: str
-    rule_ids: list[str]
-    evidence_refs: list[str]
+    rule_ids: list[str] = Field(max_length=6)
+    # Bounded: asked for "every turn", a model has enumerated references until its output ran out.
+    evidence_refs: list[str] = Field(max_length=4)
     failure_type: str
-    likely_workflow_nodes: list[str]
+    likely_workflow_nodes: list[str] = Field(max_length=4)
     repair_hypothesis: str
     confidence: float = Field(ge=0, le=1)
     counterfactual_test: str

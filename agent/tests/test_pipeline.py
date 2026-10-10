@@ -173,6 +173,39 @@ def test_remote_schema_rejection_repairs_before_pinning(work, spec, requirements
     assert len(repairs) == 2 and 'Freya dry-run rejected' in repairs[0]['compiler_errors'][0]
 
 
+def test_valid_root_with_dead_end_gets_one_targeted_repair(work, spec, requirements):
+    trapped = deepcopy(spec)
+    node = trapped['workflow']['nodes']['verify']
+    node['extraction_schema'] = [{'name': 'answer', 'type': 'string', 'enum_values': ['agrees', 'refuses'], 'description': 'What the caller said.', 'min_confidence': 0.7}]
+    node['transitions'] += [{'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'refuses'}]}},
+                            {'target_node': 'verify', 'description': 'Stay', 'condition': {'operator': 'always'}}]
+    def build(repaired):
+        seen = []
+        base = fake_roles_factory(trapped, requirements, seen)
+        class Roles(base):
+            def ask(self, role, purpose, instruction, payload, schema, model=None):
+                if role == 'WorkflowCompilerAgent':
+                    seen.append((role, deepcopy(payload)))
+                    return deepcopy(repaired)
+                return super().ask(role, purpose, instruction, payload, schema, model)
+        builder = Builder(Config(artifacts=work, tracing=False, official=False, max_depth=0), [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles)
+        try:
+            root = builder.compile()
+            return builder, root, builder.archive.get(root)['mutation_kind'], [payload for role, payload in seen if role == 'WorkflowCompilerAgent']
+        finally:
+            builder.archive.db.close()
+    fixed = deepcopy(trapped)
+    fixed['workflow']['nodes']['verify']['transitions'].insert(1, {'target_node': 'verify', 'description': 'Agreed, ask the next question', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
+    builder, root, kind, repairs = build(fixed)
+    assert len(repairs) == 1 and 'answer can be extracted as' in repairs[0]['compiler_errors'][0]
+    assert kind == 'compile_repair' and builder.valid[root] and not builder.best_effort
+    # A repair that breaks the workflow never displaces the deployable root it was asked to improve.
+    broken = deepcopy(trapped)
+    broken['workflow']['initial_node'] = 'missing'
+    builder, root, kind, repairs = build(broken)
+    assert kind == 'baseline' and builder.valid[root] and not builder.best_effort
+
+
 def lock_worker(path, queue):
     with file_lock(path, Deadline(10)):
         start = time.monotonic()
@@ -205,3 +238,25 @@ def test_cached_real_export_survives_restore_outage(work, spec, requirements):
     assert result['status'] == 'exported_cached' and result['remote_restored'] is False
     assert result['export_path']
     assert result['strict_pass_rate'] is None
+
+
+def test_search_stops_asking_after_two_barren_groups_and_reports_refusals(work, spec, requirements):
+    seen = []
+    base = fake_roles_factory(spec, requirements, seen)
+    class Roles(base):
+        def ask(self, role, purpose, instruction, payload, schema, model=None):
+            if role == 'MutationDesignerAgent':
+                self.calls += 1
+                seen.append((role, deepcopy(payload)))
+                node = deepcopy(payload['parent']['workflow']['nodes']['verify'])
+                node['pre_actions'] = []  # not allowed on a conversation stage: every child is refused
+                return {'proposals': [{'parent_id': payload['parent_id'], 'mutation_type': 'add_guard', 'target_nodes': ['verify'], 'target_rule_ids': ['R1'], 'hypothesis': 'Fixture', 'operations': [{'op': 'set_node', 'target': 'verify', 'value': node}], 'expected_effect': 'none', 'risk': 'low', 'coverage': spec['coverage']}]}
+            return super().ask(role, purpose, instruction, payload, schema, model)
+    cfg = Config(mode='scoring_only', artifacts=work, tracing=False, max_candidates=10, max_depth=3, max_simulations=4)
+    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles, adapter_factory=FakeFreya, only=['PUB-01'])
+    builder.submission_dir = work / 'out'
+    result = builder.run()
+    asked = [payload for role, payload in seen if role == 'MutationDesignerAgent']
+    assert result['export_path'] and len(asked) == 2
+    assert asked[0]['rejected_siblings'] == [] and asked[1]['rejected_siblings'][0]['edited'] == ['verify']
+    assert 'pre_actions' in asked[1]['rejected_siblings'][0]['refused_because'][0]

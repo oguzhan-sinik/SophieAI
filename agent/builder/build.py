@@ -21,7 +21,7 @@ from .freya_adapter import FreyaAdapter, public_suite
 from .diagnostics import grounded_diagnoses
 from . import prompts, runtime
 from .schemas import CodeProbes, Diagnostics, MutationGroup, RequirementsBundle, WorkflowSpec
-from .scenarios import run_probes, validate_probe_targets
+from .scenarios import reconcile_probes, run_probes, validate_probe_targets
 from .scoring import FeedbackAdapter, Suite, choose_champion, group_advantages, score, select_beam
 from .validation import apply_mutation, validate
 
@@ -30,6 +30,26 @@ def source_manifest(documents, api_path):
     paths = [Path(d['path']) for d in documents] + [api_path]
     paths += [KIT / f for f in ('README.md', 'VERSION', 'docs/api.md', 'docs/workflow-format.md', 'docs/tools-and-code.md', 'freya.py', 'tools/run_cases.py', 'tools/score.py')]
     return [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]
+
+
+def call_evidence(folder, raw, limit=80):
+    """Step-by-step record of every failed call, per repetition, for the diagnosis role only."""
+    calls = []
+    for repetition, rows in enumerate(raw.get('all_rows', [])):
+        path = Path(folder) / f'calls_{repetition}.json'
+        recorded = json.loads(path.read_text()) if path.exists() else {}
+        failed = {}
+        for row in rows:
+            call = recorded.get(row.get('id'))
+            if row.get('pass') is True or not isinstance(call, dict):
+                continue
+            turns = call.get('turns', [])
+            if len(turns) > limit:
+                # A stuck call repeats itself; its start and its end carry the information.
+                call = {**call, 'turns': turns[:limit // 2] + turns[-(limit // 2):], 'turns_omitted': len(turns) - limit}
+            failed[row['id']] = call
+        calls.append(failed)
+    return calls
 
 
 class Builder:
@@ -60,6 +80,7 @@ class Builder:
         self.exports = {}
         self.champion = self.best_official = self.best_proxy = None
         self.simulations = 0
+        self.slowest_simulation = 0.0
         self.baseline_raw = self.baseline_suite = None
         self.probes = {'probes': []}
         self.held_out_score = None
@@ -143,7 +164,15 @@ class Builder:
             payload = {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}}
             spec = self.roles.ask('ADASDesignerAgent', 'Design and generate source-driven Freya root', prompts.DESIGNER, payload, WorkflowSpec)
-        fallbacks = []
+        fallbacks, accepted = [], None
+
+        def pin(traps, cid, spec):
+            self.champion = cid
+            self.kinds[cid] = 'baseline'
+            write_json(self.root / 'pinned_root.json', {'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'requirements': self.requirements, 'spec': spec, 'code_probes': self.probes}, immutable=True)
+            write_json(self.root / 'reports/coverage.json', spec['coverage'])
+            return cid
+
         for attempt in range(3):
             # The model keeps seeing its own compact proposal; only the archived copy is expanded.
             compact, compiled_ok = spec, False
@@ -188,11 +217,15 @@ class Builder:
                     self.valid[cid] = False
                     self.archive.event('remote_validation_rejected', candidate_id=cid, **validation)
             if validation['valid']:
-                self.champion = cid
-                self.kinds[cid] = 'baseline'
-                write_json(self.root / 'pinned_root.json', {'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'requirements': self.requirements, 'spec': spec, 'code_probes': self.probes}, immutable=True)
-                write_json(self.root / 'reports/coverage.json', spec['coverage'])
-                return cid
+                traps = validation.get('dead_ends', [])
+                if accepted is None or len(traps) < len(accepted[0]):
+                    accepted = (traps, cid, spec)
+                if not traps or self.pinned or attempt == 2 or self.deadline.remaining() < 420:
+                    break
+                # A deployable root that can trap a call gets a repair aimed at those stages;
+                # it stays the root unless the repair is itself valid and traps fewer.
+                self.trace.event('dead_end_repair', candidate_id=cid, stages=traps[:20])
+                validation = {**validation, 'errors': traps}
             if self.pinned:
                 raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
             if attempt == 2:
@@ -211,6 +244,8 @@ class Builder:
                 # The model handed the proposal back untouched; asking again the same way costs minutes for nothing.
                 self.trace.event('repair_no_change', attempt=attempt + 1)
                 break
+        if accepted:
+            return pin(*accepted)
         # No candidate passed every local gate. A phone agent the platform accepts still beats none:
         # ship the least-flawed compiled candidate, clearly labelled, never as a validated root.
         for count, _, _, cid in sorted(fallbacks):
@@ -256,8 +291,11 @@ class Builder:
             try:
                 validate_probe_targets(spec, probes)
                 probes = self.roles.ask('ScenarioRefereeAgent', 'Independently verify source-derived test expectations',
-                    'Audit each proposed test using ONLY source policy and its synthetic inputs. Return corrected CodeProbes. Recalculate expected dates step by step: identify weekdays, exclude every listed holiday, and count the exact number of business days. Put calculation in rationale, never expected. Reject or remove tests whose expected behavior is not prescribed by a source rule. Preserve node/output variable names. Do not invent fallback behavior for malformed inputs unless prescribed. You cannot see implementation outputs; do not infer expected results from them.',
+                    'Audit each proposed test using ONLY source policy and its synthetic inputs. Return corrected CodeProbes. Recalculate expected dates step by step: identify weekdays, exclude every listed holiday, and count the exact number of business days. Put calculation in rationale, never expected. For every expected variable you took from the calculator, also list it in calculated as variable name -> the returned deadline; the controller writes that value into expected itself. Reject or remove tests whose expected behavior is not prescribed by a source rule. Preserve node/output variable names. Do not invent fallback behavior for malformed inputs unless prescribed. You cannot see implementation outputs; do not infer expected results from them.',
                     {'documents': self.documents, 'requirements': self.requirements, 'proposed_probes': probes}, CodeProbes, self.cfg.referee_model)
+                probes, notes = reconcile_probes(probes, getattr(self.roles, 'calculations', []))
+                if notes:
+                    self.trace.event('code_probes_reconciled', notes=notes)
                 validate_probe_targets(spec, probes)
                 self.probes = probes
                 break
@@ -277,7 +315,7 @@ class Builder:
                                 active_deployment_id=self.adapter.deployment if self.adapter else None)
 
     def evaluate(self, cid):
-        if not self.suite or self.simulations + self.suite.repetitions > self.cfg.max_simulations or self.deadline.remaining() < 60:
+        if not self.suite or self.simulations + self.suite.repetitions > self.cfg.max_simulations or self.deadline.remaining() < max(60, 1.2 * self.slowest_simulation * self.suite.repetitions):
             self.trace.event('evaluation_skipped', candidate_id=cid, reason='no_authorized_suite_or_budget')
             return
         folder = self.root / 'evaluations' / (cid + '_' + uuid.uuid4().hex[:6])
@@ -300,6 +338,7 @@ class Builder:
             raw = json.loads(path.read_text()) if path.exists() else {'all_rows': []}
             if isinstance(exc, KeyboardInterrupt):
                 raise
+        self.slowest_simulation = max([self.slowest_simulation] + [float(s.get('seconds') or 0) for s in raw.get('simulations', [])])
         frozen = score(raw, self.suite)
         self.scores[cid] = frozen
         write_json(folder / 'core_score.json', asdict(frozen), immutable=True)
@@ -307,10 +346,11 @@ class Builder:
         diagnoses = []
         if self.cfg.mode == 'scoring_with_diagnostics' and frozen.failed and self.deadline.remaining() > 30:
             try:
+                evidence = self.trace.redact({**raw, 'calls': call_evidence(folder, raw)})
                 result = self.roles.ask('DiagnosisAgent', 'Diagnose frozen failures without changing score', prompts.DIAGNOSIS,
-                                        {'core_score': asdict(frozen), 'evidence': self.trace.redact(raw), 'requirements': self.requirements,
+                                        {'core_score': asdict(frozen), 'evidence': evidence, 'requirements': self.requirements,
                                          'workflow': spec['workflow']}, Diagnostics, self.cfg.referee_model)
-                diagnoses = grounded_diagnoses(result['diagnoses'], raw, self.requirements, spec['workflow'], set(self.suite.case_ids))
+                diagnoses = grounded_diagnoses(result['diagnoses'], evidence, self.requirements, spec['workflow'], set(self.suite.case_ids))
                 write_json(folder / 'diagnostics.json', diagnoses, immutable=True)
             except Exception as exc:
                 self.trace.event('diagnosis_unavailable', error=type(exc).__name__)
@@ -324,11 +364,16 @@ class Builder:
 
     def search(self, root_id):
         beam, count, diversify = [root_id], 1, False
+        rejected, barren = {}, {}
         for depth in range(1, self.cfg.max_depth + 1):
             if count >= self.cfg.max_candidates or self.deadline.remaining() < 30:
                 break
             children = []
             for parent_id in beam:
+                if barren.get(parent_id, 0) >= 2:
+                    # Two whole groups without one usable child: more of the same prompt will not help.
+                    self.trace.event('parent_exhausted', candidate_id=parent_id)
+                    continue
                 self.deadline.require(20)
                 group = 'group_' + uuid.uuid4().hex[:8]
                 parent = self.archive.spec(parent_id)
@@ -338,7 +383,9 @@ class Builder:
                 feedback = self.feedback.get(parent_id, {'strict_pass_rate': None, 'complete': False, 'unknown_count': len(self.cases), 'evidence_type': 'unknown'})
                 proposals = self.roles.ask('MutationDesignerAgent', 'Generate diverse typed sibling workflow patches', prompts.MUTATOR + prompts.DESIGNER,
                                             {'parent_id': parent_id, 'parent': parent, 'requirements': self.requirements, 'contracts': self.contracts,
-                                             'feedback': feedback, 'number_of_proposals': limit, 'diversify': diversify, 'seed': self.random.randrange(2**31)}, MutationGroup, self.cfg.mutator_model)['proposals']
+                                             'feedback': feedback, 'number_of_proposals': limit, 'diversify': diversify, 'seed': self.random.randrange(2**31),
+                                             'rejected_siblings': rejected.get(parent_id, [])[-12:]}, MutationGroup, self.cfg.mutator_model)['proposals']
+                usable, ready = 0, []
                 for proposal in proposals[:limit]:
                     count += 1
                     try:
@@ -363,7 +410,17 @@ class Builder:
                     self.record_validation(cid, validation)
                     children.append(cid)
                     if validation['valid'] and not record['duplicate_of']:
-                        self.evaluate(cid)
+                        usable += 1
+                        ready.append((cid, proposal))
+                    else:
+                        # Compiler findings only: the same structural facts both feedback modes may see.
+                        reasons = ['Same workflow as an earlier candidate'] if validation['valid'] else [self.trace.redact(str(e))[:300] for e in validation['errors'][:4]]
+                        rejected.setdefault(parent_id, []).append({'mutation_type': proposal.get('mutation_type'), 'edited': [str(o.get('target')) for o in proposal.get('operations', []) if isinstance(o, dict)], 'refused_because': reasons})
+                    self.checkpoint()
+                barren[parent_id] = 0 if usable else barren.get(parent_id, 0) + 1
+                # Simulations are scarce: the children aimed at the most failed customers are measured first.
+                for cid, proposal in sorted(ready, key=lambda item: -self.failed_cases_addressed(feedback, item[1])):
+                    self.evaluate(cid)
                     self.checkpoint()
                 sibling_scores = {cid: self.scores.get(cid) for cid in children if self.archive.get(cid)['sibling_group_id'] == group}
                 advantages, summaries = group_advantages(sibling_scores, {cid: parent_id for cid in sibling_scores})
@@ -373,6 +430,12 @@ class Builder:
             beam = select_beam(beam + children, self.scores, self.valid, self.kinds, self.advantages, self.cfg.beam_width)
             if not beam:
                 break
+
+    @staticmethod
+    def failed_cases_addressed(feedback, proposal):
+        """How many diagnosed customers a mutation's edited stages are blamed for (0 without diagnoses)."""
+        edited = {str(o.get('target')) for o in proposal.get('operations', []) if isinstance(o, dict)}
+        return len({d['case_id'] for d in feedback.get('diagnostics', []) if edited & set(d['likely_workflow_nodes'])})
 
     def revalidate_finalist(self):
         repetitions = self.cfg.final_repetitions
