@@ -120,7 +120,10 @@ def test_resume_revalidates_saved_proposal_without_model_call(work, spec, requir
     resumed = Builder(cfg, [policy], KIT / 'tools/openapi.json', roles_factory=roles, resume=old.root)
     try:
         candidate = resumed.compile()
-        assert resumed.archive.spec(candidate) == spec
+        # The archived candidate is the saved proposal plus controller-owned runtime support only.
+        from builder.contracts import compile_openapi, compile_tools
+        compiled = compile_tools(spec['workflow'], compile_openapi(KIT / 'tools/openapi.json'))
+        assert resumed.archive.spec(candidate) == {**spec, 'workflow': compiled}
         assert not seen
     finally:
         resumed.archive.db.close()
@@ -152,7 +155,9 @@ def test_remote_schema_rejection_repairs_before_pinning(work, spec, requirements
             if role == 'WorkflowCompilerAgent':
                 self.calls += 1
                 seen.append((role, deepcopy(payload)))
-                return deepcopy(spec)
+                changed = deepcopy(spec)  # a real repair returns a changed proposal; an unchanged one stops the loop
+                changed['workflow']['system_prompt'] += f' Repair {self.calls}.'
+                return changed
             return super().ask(role, purpose, instruction, payload, schema, model)
     class RejectingFreya(FakeFreya):
         def validate_remote(self, workflow):

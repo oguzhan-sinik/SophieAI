@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import signal
 import sys
+import threading
 import time
 
 from .artifacts import digest, write_json
@@ -85,6 +86,34 @@ def contains_definition(expected, actual, location="workflow"):
         raise ValueError(f"Round-trip changed field {location}")
 
 
+def compact_call(call):
+    """Readable record of one simulated call: speech, steps, tool calls and routes; no variable tables."""
+    turns = []
+    for message in call.get("messages", []):
+        role, text, at = message.get("role"), message.get("message"), message.get("secondsFromStart")
+        if role in ("assistant", "user"):
+            turns.append({"t": at, "role": role, "node": message.get("nodeId"), "text": text})
+            continue
+        try:
+            event = json.loads(text)
+        except (TypeError, ValueError):
+            continue
+        kind = event.get("event")
+        if kind == "node_enter":
+            turns.append({"t": at, "role": "step", "node": event.get("node"), "from": event.get("from_node"), "text": event.get("reason", "")})
+        elif kind == "function_call_start":
+            turns.append({"t": at, "role": "tool_call", "node": message.get("nodeId"), "tool": event.get("function"),
+                          "url": (event.get("args") or {}).get("url"), "body": (event.get("args") or {}).get("body")})
+        elif kind == "function_call_complete":
+            result = event.get("result") or {}
+            turns.append({"t": at, "role": "tool_result", "node": message.get("nodeId"), "tool": event.get("function"),
+                          "status_code": result.get("status_code"), "data": result.get("data")})
+        elif kind == "variable_extracted":
+            turns.append({"t": at, "role": "extracted", "node": event.get("source_node"), "name": event.get("name"), "value": event.get("value")})
+    return {"call_id": call.get("id"), "ended": call.get("endedReason"), "duration": call.get("duration"),
+            "judge": (call.get("successCriteriaResult") or {}).get("reason"), "turns": turns}
+
+
 class FreyaAdapter:
     def __init__(self, cfg, deadline, trace):
         self.cfg, self.deadline, self.trace = cfg, deadline, trace
@@ -98,13 +127,27 @@ class FreyaAdapter:
         self.exporting = False
         self.lease = self.runtime / "simulation.json"
         self.deployment = None
+        self.current_simulation = None
 
     def api(self, method, path, body=None, **params):
-        with time_limit(self.deadline.timeout(self.cfg.request_timeout, self.exporting)):
-            result = self.original_api(method, path, body, **params)
+        # A platform outage is not a verdict on the workflow. 503 means the request was not
+        # processed, so it is safe to repeat; 502/504 are repeated only for reads.
+        for attempt in range(6):
+            try:
+                with time_limit(self.deadline.timeout(self.cfg.request_timeout, self.exporting)):
+                    result = self.original_api(method, path, body, **params)
+                break
+            except RuntimeError as exc:
+                text = str(exc)
+                transient = "-> 503:" in text or (method == "GET" and ("-> 502:" in text or "-> 504:" in text))
+                if not transient or attempt == 5 or self.deadline.remaining(self.exporting) < 30:
+                    raise
+                self.trace.event("freya_retry", method=method, path=path, attempt=attempt + 1, message=text[:160])
+                time.sleep(min(5 * (attempt + 1), 20))
         self.trace.event("freya_api", method=method, path=path)
         if method == "POST" and path == "/api/v2/simulations":
             sim_id = (result.get("simulation") or result)["id"]
+            self.current_simulation = sim_id
             write_json(self.lease, {"simulation_id": sim_id})
         return result
 
@@ -174,6 +217,49 @@ class FreyaAdapter:
             if call_id:
                 self.api("POST", "/api/v2/chat/end", {"callId": call_id})
 
+    def watch(self, stop, folder, repetition, cases, persona_ids, customers, scorer, ledger_http):
+        """Publish per-customer progress while the simulation runs. Read-only and best effort:
+        it never touches the frozen score, and any failure here only leaves the live view stale."""
+        by_persona = {persona: case_id for case_id, persona in persona_ids.items()}
+        by_id = {case["id"]: case for case in cases}
+        transcripts, finished = {}, set()
+        while not stop.wait(12):
+            try:
+                sim_id = self.current_simulation
+                if not sim_id:
+                    continue
+                listing = self.original_api("GET", f"/api/v2/simulations/{sim_id}/iterations")
+                listing = listing.get("iterations") or listing.get("items") or listing
+                if not listing:
+                    continue
+                runs = self.original_api("GET", f"/api/v2/simulations/{sim_id}/iterations/{listing[0]['id']}", limit=100, offset=0).get("runs", [])
+                rows = []
+                for run in runs:
+                    case_id = by_persona.get(run.get("personaId"))
+                    if not case_id:
+                        continue
+                    outcome = run.get("outcome")
+                    # "analyzing": the call is over and the judge has not ruled yet.
+                    state = outcome if outcome in ("queued", "running", "analyzing") else "finished"
+                    row = {"id": case_id, "family": by_id[case_id].get("family"), "level": by_id[case_id].get("level"), "state": state,
+                           "judge": outcome if state == "finished" else None, "judge_reason": run.get("reason") if state == "finished" else None,
+                           "turns": run.get("turnCount"), "call_id": run.get("callId")}
+                    if run.get("callId") and case_id not in finished:
+                        transcripts[case_id] = compact_call(self.original_api("GET", f"/api/v2/call/{run['callId']}")["call"])
+                    if state != "queued" and customers.get(case_id):
+                        ledger = ledger_http("/v1/practice/ledger/" + customers[case_id])
+                        row["tools"] = [call["tool"] for call in ledger.get("calls", [])]
+                        if state == "finished":
+                            bank = scorer.score_ledger(by_id[case_id], ledger)
+                            row["bank_failed"] = bank["failed"]
+                            row["pass"] = bank["pass"] and outcome == "pass"
+                            finished.add(case_id)
+                    rows.append(row)
+                write_json(folder / f"live_{repetition}.json", self.trace.redact({"simulation_id": sim_id, "updated_at": time.strftime("%H:%M:%S", time.gmtime()), "rows": rows}))
+                write_json(folder / f"live_calls_{repetition}.json", self.trace.redact(transcripts))
+            except Exception:
+                continue
+
     def evaluate(self, cases, suite, folder):
         if suite.evidence_type != "official_public":
             raise ValueError("Freya runner only evaluates official public suites")
@@ -207,18 +293,36 @@ class FreyaAdapter:
         self.client.get_iteration = checked_iteration
         ledgers = {}
         original_http = runner.http
+        customers = {}
         def captured_http(path, body=None):
             result = original_http(path, body)
             if "/ledger/" in path:
                 ledgers[path.rsplit("/", 1)[-1]] = result
+            elif path.endswith("/practice/sessions") and isinstance(body, dict) and isinstance(result, dict):
+                customers[body.get("case")] = (result.get("variables") or {}).get("customer_id")
             return result
         runner.http = captured_http
+        calls = {}
+        original_call = self.client.get_call
+        def captured_call(call_id):
+            result = original_call(call_id)
+            calls[call_id] = result
+            return result
+        self.client.get_call = captured_call
         try:
             for repetition in range(suite.repetitions):
                 self.deadline.require(20)
                 output = io.StringIO()
-                with self.trace.span("OfficialBenchmark", repetition=repetition, suite_key=suite.key), time_limit(self.deadline.remaining()), redirect_stdout(output):
-                    rows, sim_id, iteration_id, status, seconds, median = runner.run_once(self.deployment["agent_id"], cases, ids)
+                self.current_simulation = None
+                stop = threading.Event()
+                watcher = threading.Thread(target=self.watch, args=(stop, folder, repetition, cases, ids, customers, scorer, original_http), daemon=True)
+                watcher.start()
+                try:
+                    with self.trace.span("OfficialBenchmark", repetition=repetition, suite_key=suite.key, evaluation_folder=folder.name), time_limit(self.deadline.remaining()), redirect_stdout(output):
+                        rows, sim_id, iteration_id, status, seconds, median = runner.run_once(self.deployment["agent_id"], cases, ids)
+                finally:
+                    stop.set()
+                    watcher.join(timeout=20)
                 for row in rows:
                     ledger = ledgers.get(row.get("customer_id"), {})
                     row["verified_hard_failure"] = any(c.get("tool") in {"get_account", "create_promise"} and c.get("result", {}).get("error") == "identity not verified" for c in ledger.get("calls", []))
@@ -230,10 +334,12 @@ class FreyaAdapter:
                 write_json(folder / "raw_runner.json", self.trace.redact(raw))
                 write_json(folder / f"iteration_{repetition}.json", self.trace.redact(iterations[-1]))
                 write_json(folder / f"ledgers_{repetition}.json", self.trace.redact(list(ledgers.values())))
+                write_json(folder / f"calls_{repetition}.json", self.trace.redact({row["id"]: compact_call(calls[row["call_id"]]) for row in rows if row.get("call_id") in calls}))
                 self.trace.event("official_result", suite_key=suite.key, repetition=repetition, passed=sum(r["pass"] for r in rows), total=len(rows), status=status)
             return raw
         finally:
             self.client.get_iteration = original_iteration
+            self.client.get_call = original_call
             runner.http = original_http
             write_json(folder / "raw_runner.json", self.trace.redact(raw))
 

@@ -241,6 +241,14 @@ def validate(spec, contracts, requirements):
                                 bad(f"{field}: baked value violates contract")
                     if "call" not in function.get("description", "").lower():
                         bad("Tool description must state CALL trigger")
+                    if placement == "tools":
+                        # A read-back that names other variables than the request sends can confirm one value and write another.
+                        spoken = str(node.get("task_message", ""))
+                        heard = {"{{" + str(item.get("name")) + "}}" for item in node.get("extraction_schema", [])}  # the caller's own answer needs no read-back
+                        unspoken = sorted({ph for field, schema in properties.items() if field not in ("customer_id", "product_id")
+                                           for ph in re.findall(r"\{\{[A-Za-z_][\w.]*\}\}", str(schema.get("default", ""))) if ph not in spoken and ph not in heard})
+                        if unspoken:
+                            warnings.append(f"{key}: {name} sends {', '.join(unspoken)} but the stage's task_message never states them; read back the same variables the tool writes")
                 else:
                     bad("Unsupported handler outside terminal")
                 for hook in ("pre_process_code", "post_process_code"):
@@ -305,7 +313,8 @@ def validate(spec, contracts, requirements):
         if gate_variables & set(workflow.get("test_variables", {})):
             errors.append(label + "tool gate cannot be initialized by test variables")
         if any(e.get("name") in gate_variables for n in nodes.values() for e in n.get("extraction_schema", [])):
-            errors.append(label + "tool gate cannot be set by speech extraction")
+            errors.append(label + f"the gate variable {gate.variable} is filled by speech extraction. A tool gate must be the identity check's own result: "
+                          f"declare the variable that response_mapping fills from {gate.producer_operation} {gate.response_path}, and route on what the caller says separately")
         for node in nodes.values():
             for tool in node.get("tools", []) + node.get("pre_actions", []):
                 function = tool.get("function", {})

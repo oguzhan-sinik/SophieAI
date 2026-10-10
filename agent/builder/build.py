@@ -19,7 +19,7 @@ from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
 from .contracts import compile_openapi, compile_tools, normalize_spec, source_documents, validate_requirements
 from .freya_adapter import FreyaAdapter, public_suite
 from .diagnostics import grounded_diagnoses
-from . import prompts
+from . import prompts, runtime
 from .schemas import CodeProbes, Diagnostics, MutationGroup, RequirementsBundle, WorkflowSpec
 from .scenarios import run_probes, validate_probe_targets
 from .scoring import FeedbackAdapter, Suite, choose_champion, group_advantages, score, select_beam
@@ -160,17 +160,26 @@ class Builder:
             cid = candidate['candidate_id']
             self.record_validation(cid, validation)
             self.trace.event('static_validation', candidate_id=cid, valid=validation['valid'], errors=validation['errors'][:40], warnings=validation.get('warnings', [])[:40])
-            if compiled_ok and not validation['valid']:
-                fallbacks.append((len(validation['errors']), attempt, cid))
-            if validation['valid']:
-                self.prepare_probes(spec)
-                probe_result = run_probes(spec, self.probes, self.requirements, self.deadline)
-                write_json(self.root / 'candidates' / cid / 'code_probes.json', probe_result)
-                if any(not row['pass'] for row in probe_result['results']):
-                    validation = {'valid': False, 'errors': ['Source-derived code probe failed: ' + json.dumps(probe_result)], 'evidence_type': 'local_code_only'}
-                    self.valid[cid] = False
-                    fallbacks.append((sum(not row['pass'] for row in probe_result['results']), attempt, cid))
-                    self.archive.event('code_probe_rejected', candidate_id=cid, **validation)
+            if compiled_ok:
+                # Policy code is checked for every compiled candidate, not only statically clean ones:
+                # a best-effort export with wrong arithmetic fails customers just the same.
+                probe_errors = []
+                try:
+                    self.prepare_probes(spec)
+                    if self.probes['probes']:
+                        probe_result = run_probes(spec, self.probes, self.requirements, self.deadline)
+                        write_json(self.root / 'candidates' / cid / 'code_probes.json', probe_result)
+                        probe_errors = [self.probe_message(row) for row in probe_result['results'] if not row['pass'] and not row.get('skipped')]
+                        self.trace.event('code_probes', candidate_id=cid, passed=probe_result['passed'], total=probe_result['total'], failed=len(probe_errors))
+                except (ValueError, TimeoutError) as exc:
+                    self.trace.event('code_probes_unavailable', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
+                if probe_errors:
+                    # A probe's expectation is itself model-written and has been observed wrong while the
+                    # code was right, so a failed probe informs the repair but never blocks a candidate.
+                    validation = {**validation, 'warnings': validation.get('warnings', []) + ['unverified test, check against the source before changing code: ' + e for e in probe_errors]}
+                    self.archive.event('code_probe_flagged', candidate_id=cid, errors=probe_errors, evidence_type='local_code_only')
+                if not validation['valid']:
+                    fallbacks.append((len(validation['errors']), len(probe_errors), attempt, cid))
             if validation['valid'] and self.adapter:
                 try:
                     self.adapter.validate_remote(spec['workflow'])
@@ -188,8 +197,9 @@ class Builder:
                 raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
             if attempt == 2:
                 break
+            before = digest(compact.get('workflow'))
             try:
-                spec = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.DESIGNER,
+                spec = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.REPAIR + prompts.DESIGNER,
                                       {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
                                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
                                        'proposal': compact, 'compiler_errors': validation['errors'],
@@ -197,9 +207,13 @@ class Builder:
             except (ValueError, TimeoutError) as exc:
                 self.trace.event('repair_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
                 break
+            if digest(spec.get('workflow')) == before:
+                # The model handed the proposal back untouched; asking again the same way costs minutes for nothing.
+                self.trace.event('repair_no_change', attempt=attempt + 1)
+                break
         # No candidate passed every local gate. A phone agent the platform accepts still beats none:
         # ship the least-flawed compiled candidate, clearly labelled, never as a validated root.
-        for count, _, cid in sorted(fallbacks):
+        for count, _, _, cid in sorted(fallbacks):
             try:
                 if self.adapter:
                     self.adapter.validate_remote(self.archive.spec(cid)['workflow'])
@@ -212,10 +226,24 @@ class Builder:
             return cid
         raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
 
+    @staticmethod
+    def probe_message(row):
+        return (f"code probe {row['id']} on {row.get('node_id')} (rules {', '.join(row.get('rule_ids', []))}): with variables "
+                f"{json.dumps(row.get('variables'))} the source requires {json.dumps(row.get('expected'))} but the code gave "
+                f"{json.dumps(row.get('observed'))}" + (f" [{row['error']}]" if row.get('error') else '') + (f". Reason: {row['rationale']}" if row.get('rationale') else ''))
+
     def prepare_probes(self, spec):
         if self.probes['probes'] or self.pinned or not any(n.get('node_type') == 'code' for n in spec['workflow']['nodes'].values()):
             return
-        code_nodes = {key: node for key, node in spec['workflow']['nodes'].items() if node.get('node_type') == 'code'}
+        # The planner sees the model's own code; the controller prelude is not what is under test.
+        code_nodes = {}
+        for key, node in spec['workflow']['nodes'].items():
+            if node.get('node_type') == 'code':
+                code_nodes[key] = json.loads(json.dumps(node))
+                for tool in code_nodes[key].get('pre_actions', []):
+                    code = tool.get('function', {}).get('parameters', {}).get('properties', {}).get('code', {})
+                    if isinstance(code.get('default'), str):
+                        code['default'] = runtime.strip(code['default'])
         errors = []
         for attempt in range(2):
             saved_probes = self.resume / 'code_probe_suite.json' if self.resume else None
@@ -320,9 +348,12 @@ class Builder:
                         child['workflow'] = compile_tools(child['workflow'], self.contracts)
                         validation = validate(child, self.contracts, self.requirements)
                         if validation['valid'] and self.probes['probes']:
-                            probe_result = run_probes(child, self.probes, self.requirements, self.deadline)
-                            if any(not row['pass'] for row in probe_result['results']):
-                                validation = {'valid': False, 'errors': ['Fixed source-derived code suite failed'], 'evidence_type': 'local_code_only'}
+                            # Probes are unverified tests, so a child is rejected only for a regression:
+                            # failing a probe its parent passes. Inherited failures do not block it.
+                            failing = lambda s: {row['id'] for row in run_probes(s, self.probes, self.requirements, self.deadline)['results'] if not row['pass'] and not row.get('skipped')}
+                            regressed = sorted(failing(child) - failing(parent))
+                            if regressed:
+                                validation = {'valid': False, 'errors': ['Code probes that passed on the parent now fail: ' + ', '.join(regressed)], 'evidence_type': 'local_code_only'}
                     except Exception as exc:
                         child = parent
                         validation = {'valid': False, 'errors': [str(exc)], 'evidence_type': 'static'}

@@ -46,7 +46,37 @@ every route into the protected tool tests that variable with equals. In the comp
 write only the listed keys (no type, config or function). Every node any route should reach must be
 the target_node of some transition; do not leave stages unreachable.
 
-Compute dates/amounts in code nodes using vars and source constants. Accept string/list products.
+Compute dates/amounts in code nodes using vars and source constants. Verified platform behaviour:
+response_mapping stores scalar fields only. For a list or object field (for example the account's
+product list) still declare the mapping; the controller then delivers that variable to code nodes as
+a JSON string, so read it with json.loads and also accept a list. Never bind a tool argument to a
+variable that no code node or scalar mapping sets. Code that depends on such data must set an explicit
+ready flag and route to a safe close when the data is missing, never continue with empty values.
+An engine-run call flattens its result under <node name>_response.data.*, a model-called tool under
+<tool name>_response.data.*; prefer mapped variables in routes.
+
+Spoken dates: the platform resolves a date extraction against the real clock, not call now, so the
+controller handles them. Declare every calendar date the customer may say (a payment day, a callback
+day, a date of birth) as extraction type date and never write your own parser for spoken dates: a
+complete date with its year arrives as YYYY-MM-DD from the extractor, anything else is resolved by
+the controller. At run time
+the controller captures the customer's words and, before any code node or bound tool call, replaces
+the variable with the ISO day resolved against call now; <name>_said keeps the words. The variable is
+'' when the words name no single day (a vague period, or nothing): treat '' as not given and follow
+the source rule for a missing or vague day, never substitute a default silently. If the source
+prescribes its own reading of a phrase, call ctl_date(vars.get('<name>_said'), vars.get('now'),
+next_weekday='following_week' or 'next_occurrence') in your code and apply the source rule there.
+Do not ask the extractor to do calendar arithmetic and do not use platform date placeholders.
+
+Never replace a value the customer gave without their agreement. When code must change or reject a
+day or an amount (not allowed, outside a limit, missing), it sets a status variable and the proposed
+alternative, and routes to a conversation stage that states the reason and offers the alternative;
+only an accepted value reaches the read-back and the write. Each such status needs its own route,
+checked before the generic success route. A stage that speaks after a code check must receive the
+outcome through variables in its task_message and must not confirm anything the check rejected.
+A read-back states exactly the variables the write tool is bound to. After a failed write, apologise
+in neutral words and avoid the phrasing reserved for confirming success. Promise an action aloud
+(callback, transfer, record) only in the stage whose tool performs it, after that tool succeeded.
 code_exec is pre_actions with code.default; wrap in try/except, set fallback state. Only import
 json/re/datetime. No adjacent '{{' or '}}' in code (space nested braces). No network, files, private
 attributes, eval/exec/getattr, dynamic imports or host clock. Hooks may access only config['body']
@@ -60,9 +90,19 @@ No path after close can reach any bank tool. Every terminal must pass close. Com
 reason first using source policy and results. If source forbids notes on transfers, defer all notes
 until non-transfer commitment so earlier refusals cannot write notes before a later transfer.
 
+tool_gates describe identity only: the proof that the caller passed the security check, read from
+the identity tool's response. A customer's spoken confirmation is not a tool gate; route on it, but
+never declare it in tool_gates.
 coverage maps every active rule to real nodes and test IDs. tool_gates/coverage are outside workflow.
 architecture is a short rationale. Separate stages for tool boundaries and computations; avoid
 unnecessary graph size. Prompts must explain each state's job, not narrate internal routing.
+"""
+
+REPAIR = """You are repairing the supplied proposal. compiler_errors lists what blocks it; each one names
+the stage or gate at fault. Change those stages so every listed error is gone, and return the whole
+corrected WorkflowSpec. Returning the proposal unchanged is a failure. Do not redesign stages that
+are not named. advisory_warnings are hints; act on one only where the source supports it.
+
 """
 
 MUTATOR = """Propose the requested number of distinct sibling Mutation objects for one immutable parent.

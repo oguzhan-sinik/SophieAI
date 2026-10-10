@@ -37,13 +37,17 @@ def run_probes(spec, proposals, requirements, deadline):
     rule_ids = {r['rule_id'] for r in requirements['requirements']}
     results = []
     for probe in probes:
-        result = {'id': probe.probe_id, 'rule_ids': probe.rule_ids, 'evidence_type': 'local_code_only', 'pass': False}
+        result = {'id': probe.probe_id, 'rule_ids': probe.rule_ids, 'node_id': probe.node_id, 'variables': probe.variables,
+                  'rationale': probe.rationale, 'evidence_type': 'local_code_only', 'pass': False}
         try:
             if not probe.rule_ids or not set(probe.rule_ids) <= rule_ids or not probe.expected:
                 raise ValueError('Probe requires grounded rules and nonempty expectations')
-            node = spec['workflow']['nodes'][probe.node_id]
-            if node['node_type'] != 'code':
-                raise ValueError('Probe target must be a code node')
+            node = spec['workflow']['nodes'].get(probe.node_id)
+            if not isinstance(node, dict) or node.get('node_type') != 'code':
+                # A repair may rename or remove the stage a probe was written for; that is not a failed check.
+                result.update(skipped=True, error='target stage no longer exists')
+                results.append(result)
+                continue
             code = [t['function']['parameters']['properties']['code']['default'] for t in node['pre_actions']]
             errors = [error for source in code for error in code_errors(source)]
             if errors:

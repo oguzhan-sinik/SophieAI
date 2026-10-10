@@ -259,3 +259,68 @@ def test_source_parameter_calendar_calculator():
         'dates': ['2028-02-14', '2028-02-15', '2028-02-16', '2028-02-21', '2028-02-22'], 'deadline': '2028-02-22'}
     assert business_day_dates('2028-02-28', list(range(7)), [], 1)['deadline'] == '2028-02-29'
     with pytest.raises(ValueError): business_day_dates('2028-02-11', [], [], 5)
+
+
+def _helpers():
+    from builder import runtime
+    scope = {}
+    exec(runtime.DATE_HELPERS, scope, scope)
+    return scope['ctl_date']
+
+
+@pytest.mark.parametrize('said,expected', [
+    ('tomorrow', '2026-10-15'), ('Maria can be reached tomorrow morning around eleven', '2026-10-15'),
+    ('today', '2026-10-14'), ('the day after tomorrow', '2026-10-16'),
+    ('this Friday', '2026-10-16'), ('Friday', '2026-10-16'), ('next Friday', '2026-10-23'), ('on wednesday', '2026-10-14'),
+    ('Monday the twenty sixth', '2026-10-26'), ('the 26th', '2026-10-26'), ('the twenty-second of October', '2026-10-22'),
+    ('6 November', '2026-11-06'), ('November 6th', '2026-11-06'), ('the 3rd', '2026-11-03'), ('january the 5th', '2027-01-05'),
+    ('in two weeks', '2026-10-28'), ('in 3 days', '2026-10-17'), ('2026-10-20', '2026-10-20'),
+    ('I may pay on the 30th', '2026-10-30'),
+    ('the week after next', ''), ('next week', ''), ('end of the month', ''), ('when my salary comes', ''), ('', ''),
+])
+def test_spoken_days_resolve_against_call_now(said, expected):
+    assert _helpers()(said, '2026-10-14T11:00') == expected
+
+
+def test_weekday_reading_is_a_parameter_not_a_constant():
+    resolve = _helpers()
+    assert resolve('next Friday', '2026-10-16T09:00') == '2026-10-23'
+    assert resolve('next Friday', '2026-10-14T09:00', 'next_occurrence') == '2026-10-16'
+    assert resolve('next Friday', '2026-10-16T09:00', 'next_occurrence') == '2026-10-23'
+
+
+def test_runtime_prelude_resolves_dates_and_is_idempotent(spec, contracts):
+    from builder import runtime
+    from builder.validation import code_errors
+    from builder.contracts import compile_tools
+    w = spec['workflow']
+    w['nodes']['verify']['extraction_schema'] = [{'name': 'pay_day', 'type': 'date', 'description': 'Day offered.', 'min_confidence': 0.7}]
+    w['nodes']['calc'] = {'name': 'calc', 'node_type': 'code', 'passthrough': True, 'passthrough_default_transition': 'close',
+                          'transitions': [{'target_node': 'close', 'condition': {'operator': 'always'}}],
+                          'pre_actions': [{'type': 'function', 'function': {'name': 'code', 'handler': '__function__:code_exec', 'parameters': {'type': 'object', 'properties': {
+                              'code': {'type': 'string', 'default': "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n"}}}}}]}
+    once = compile_tools(w, contracts)
+    assert compile_tools(once, contracts) == once
+    item = once['nodes']['verify']['extraction_schema'][0]
+    assert item['type'] == 'string' and runtime.SAID in item['description']
+    code = once['nodes']['calc']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
+    assert code_errors(code) == [] and code.count(runtime.START) == 1
+    scope = {'vars': {'now': '2026-10-14T11:00', 'pay_day': 'tomorrow'}}
+    exec(code, scope, scope)
+    assert scope['vars']['seen'] == '2026-10-15' and scope['vars']['pay_day_said'] == 'tomorrow'
+    exec(code, scope, scope)
+    assert scope['vars']['pay_day'] == '2026-10-15'
+    scope = {'vars': {'now': '2026-10-14T11:00', 'pay_day': 'sometime next week'}}
+    exec(code, scope, scope)
+    assert scope['vars']['seen'] == '' and scope['vars']['pay_day_said'] == 'sometime next week'
+
+
+def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contracts, requirements):
+    from builder import runtime
+    from builder.contracts import compile_tools
+    once = compile_tools(spec['workflow'], contracts)
+    guard = once['nodes']['verify']['transitions'][0]
+    assert guard['description'] == runtime.GUARD and guard['target_node'] == 'close'
+    assert guard['condition'] == {'variable': 'verify.total_turns', 'operator': 'greater_than', 'operand': 20}
+    assert compile_tools(once, contracts) == once
+    assert validate({**spec, 'workflow': once}, contracts, requirements)['valid']

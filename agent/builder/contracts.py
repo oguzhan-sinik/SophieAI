@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 from urllib.parse import urlparse
 
+from . import runtime
 from .artifacts import digest
 from .schemas import RequirementsBundle
 
@@ -220,4 +221,4 @@ def compile_tools(workflow, contracts):
                     if key in tool:
                         compiled[key] = tool[key]
                 node[placement][i] = compiled
-    return workflow
+    return runtime.apply(workflow, contracts)
