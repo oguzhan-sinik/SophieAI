@@ -23,6 +23,10 @@ def load_env():
     load_dotenv(KIT / ".env", override=False)
     # env.sh uses `export KEY=value`, which python-dotenv reads directly.
     load_dotenv(KIT / "env.sh", override=False)
+    # `KEY=   # note` is read by python-dotenv as the value "# note"; an empty setting must stay empty.
+    for key, value in list(os.environ.items()):
+        if value.lstrip().startswith("#") and key.isupper():
+            os.environ[key] = ""
 
 
 def boolean(name, default):
@@ -35,9 +39,9 @@ def boolean(name, default):
 @dataclass(frozen=True)
 class Config:
     mode: str = "scoring_with_diagnostics"
-    builder_model: str = "modal/zai-org/GLM-5.3"
-    mutator_model: str = "modal/zai-org/GLM-5.3"
-    referee_model: str = "modal/zai-org/GLM-5.3"
+    builder_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
+    mutator_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
+    referee_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
     max_wall_seconds: int = 1800
     reserve: int = 180
     max_candidates: int = 10
@@ -48,7 +52,7 @@ class Config:
     repetitions: int = 1
     final_repetitions: int = 3
     max_simulations: int = 2
-    llm_timeout: int = 300
+    llm_timeout: int = 480
     request_timeout: int = 90
     official: bool = True
     tracing: bool = True
