@@ -245,7 +245,7 @@ function renderHeader(){
   const s=S.summary||{};
   const st=$("#hdrStatus");
   st.textContent=s.status||"unknown";
-  st.className="badge "+(s.status==="succeeded"||s.status==="completed"?"b-ok":s.status==="failed"?"b-bad":s.status==="interrupted"?"b-warn":"b-unk");
+  st.className="badge "+(s.status==="succeeded"||s.status==="completed"?"b-ok":s.status==="failed"?"b-bad":s.status==="interrupted"||s.status==="running"?"b-warn":"b-unk");
   $("#hdrMeta").textContent=[s.mode,s.duration_seconds!=null?Math.round(s.duration_seconds)+"s":null,
     s.candidate_count!=null?s.candidate_count+" candidates":null,
     (s.builder_model||"").split("/").pop()].filter(Boolean).join(" · ");

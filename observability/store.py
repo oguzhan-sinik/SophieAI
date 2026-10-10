@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,9 @@ _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+LIVE_SECONDS = 600
 
 
 class ArtifactForbidden(Exception):
@@ -123,8 +127,16 @@ class Store:
         trace = self.trace_events(run_id)
         started = manifest.get("start") or report.get("start")
         ended = report.get("end")
-        status = report.get("status") or ("completed" if ended else "interrupted")
         last_ev = trace[-1]["at"] if trace else started
+        status = report.get("status") or ("completed" if ended else "interrupted")
+        if not report and last_ev:
+            # No report yet. A build writes a trace line at least every model-call timeout, so recent
+            # activity means it is still going; only a silent run was interrupted.
+            try:
+                idle = (datetime.now(timezone.utc) - datetime.fromisoformat(last_ev)).total_seconds()
+                status = "running" if idle < LIVE_SECONDS else "interrupted"
+            except (TypeError, ValueError):
+                pass
         warnings = []
         if not manifest:
             warnings.append("manifest.json missing or unreadable")

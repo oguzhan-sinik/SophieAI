@@ -191,3 +191,16 @@ if __name__ == "__main__":
                     fails += 1
                     print(f"FAIL {name}: {type(e).__name__}: {e}")
     raise SystemExit(1 if fails else 0)
+
+
+def test_run_without_report_is_running_until_it_goes_quiet(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    for name, age in (("live", 30), ("dead", 3600)):
+        d = tmp_path / name
+        d.mkdir()
+        at = (datetime.now(timezone.utc) - timedelta(seconds=age)).isoformat()
+        (d / "manifest.json").write_text(json.dumps({"run_id": name, "start": at}))
+        (d / "build_trace.log").write_text(json.dumps({"at": at, "event": "run_start"}) + "\n")
+    s = Store(tmp_path)
+    assert s.run_summary("live")["status"] == "running"
+    assert s.run_summary("dead")["status"] == "interrupted"
