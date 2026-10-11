@@ -1,0 +1,20 @@
+{
+  "team": "SophieAI",
+  "members": [
+    {
+      "name": "Burak Alican Kılınç",
+      "email": "burakalicankilinc@gmail.com"
+    },
+    {
+      "name": "Oğuzhan Şinik",
+      "email": "ogzdlk06@gmail.com"
+    }
+  ],
+  "repo": "https://github.com/oguzhan-sinik/build-the-builder",
+  "commit": "550ffd5b9355e2881a2757a0fa03f361327b46e4",
+  "run_command": "LLM_CALL_TIMEOUT_SECONDS=1800 MAX_WALL_SECONDS=10800 EVAL_MAX_SIMULATIONS=5 python3 agent/builder/build.py {case_folder} https://freya-bank-mock.ogzdlk06.workers.dev --no-rule-list",
+  "workflow": "submission/final.workflow.json",
+  "trace": "traces/final.log",
+  "mock_url": "https://freya-bank-mock.ogzdlk06.workers.dev",
+  "notes": "The workflow is the export of builder run 20261011T201104_dce82ad1, made on this commit: it took the design of our earlier builder run 20261011T193801_4ba43214 on the same folder (--resume-run, with that run's derived contract), recompiled it, tested it with 14 simulated callers the builder wrote itself (the 6 example scenarios of the case and 8 of its own from the documents) and repaired it over four rounds: 13 of 14 passed. traces/final.log holds both runs in order. No workflow was edited by hand. The earlier run was made before this commit, while we were fixing builder bugs the case exposed."
+}
