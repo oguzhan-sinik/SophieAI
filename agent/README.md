@@ -20,16 +20,17 @@ A brief that is not one of the kit's own needs its tool API file, given after th
 `--openapi`; without it the builder stops at once instead of building for the kit's bank.
 
 Keys go in the kit-root `env.sh` (template `env.example`, git-ignored): `FREYA_API_KEY`,
-`FREYA_BANK_TEAM_KEY` and the builder model settings. The default builder model is Qwen 3.8 on
-Modal (`MODAL_BASE_URL`, `MODAL_KEY`, `MODAL_SECRET`); any LiteLLM model name works through
-`BUILDER_MODEL`. The builder names any missing key and exits with code 2 before doing any work.
+`FREYA_BANK_TEAM_KEY` and the model settings. The kit-root `env.example` shows the three
+OpenRouter tiers: `MODEL_TIER_HARD`, `MODEL_TIER_MEDIUM`, and `MODEL_TIER_EASY`. Change those
+lines in `env.sh` to select models for each tier; `BUILDER_MODEL` is the hard-tier fallback.
+The builder names any missing key and exits with code 2 before doing any work.
 Settings resolve as process environment > `agent/.env` > root `.env` > root `env.sh` > defaults.
 
-QwenCloud is selected in the environment templates and the local `env.sh`. Add
-`DASHSCOPE_API_KEY` to `env.sh`; `BUILDER_MODEL=qwencloud/qwen3.8-max-0902` routes the
+QwenCloud is also available. Add `DASHSCOPE_API_KEY` to `env.sh` and select
+`qwencloud/qwen3.8-max-0902` for a tier; this routes the
 exact model ID to `https://maas.qwencloudapi.com/compatible-mode/v1` (override with
 `QWENCLOUD_BASE_URL`). Requests stream with `enable_thinking=true` and the provider's
-default reasoning budget for every role. Each QwenCloud call allows at least 65,536 total
+default reasoning budget for QwenCloud roles. Each QwenCloud call allows at least 65,536 total
 completion tokens, including reasoning, within the existing call/build timeouts.
 Only the final answer enters JSON validation;
 dashboard observations publish progress and token usage. QwenCloud documents its

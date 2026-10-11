@@ -10,23 +10,23 @@ Ticket 2's implementation includes synthetic debt-collection briefs/APIs, adapti
 
 ## Run
 
-Local model roles reuse `BUILDER_MODEL` and its existing credentials. Configuration loads `generalisation_agent/.env`, then the existing builder configuration, with process environment taking precedence. Flags are read once per invocation and accept only `true` or `false`.
+Local model roles use the three tiers set in the kit-root `env.sh`; `BUILDER_MODEL` is the hard-tier fallback. Configuration loads `generalisation_agent/.env`, then the existing builder configuration, with process environment taking precedence. Flags are read once per invocation and accept only `true` or `false`.
 
-To select QwenCloud, set `BUILDER_MODEL=qwencloud/qwen3.8-max-0902` and
+To select QwenCloud for a tier, set its `MODEL_TIER_*` variable to `qwencloud/qwen3.8-max-0902` and
 `DASHSCOPE_API_KEY` in `env.sh`. Its default endpoint is
 `https://maas.qwencloudapi.com/compatible-mode/v1`, overridable with `QWENCLOUD_BASE_URL`.
-All model roles stream with thinking enabled and QwenCloud's default reasoning budget.
+QwenCloud roles stream with thinking enabled and its default reasoning budget.
 Calls allow at least 65,536 completion tokens (reasoning plus answer); the eight-minute
 call timeout and 30-minute build deadline remain in force.
 The [QwenCloud API](https://docs.qwencloud.com/api-reference/chat/openai-chat) supports
 the existing structured-output path; final answers still undergo local schema and semantic
 checks. Modal and Doubleword credentials/configurations remain available.
 
-For Doubleword testing, fill `DOUBLEWORD_API_KEY` in the kit-root `env.sh`, then prefix a command
-with `BUILDER_MODEL=doubleword/zai-org/GLM-5.3-Flash`. Its default endpoint is
+For Doubleword testing, fill `DOUBLEWORD_API_KEY` in the kit-root `env.sh`, then select
+`doubleword/zai-org/GLM-5.3-Flash` for a tier. Its default endpoint is
 `https://api.doubleword.ai/v1`; existing provider configuration is preserved. The exact model
 and compatible request format are documented by [Doubleword](https://doubleword.ai/models/glm-5-3-flash).
-All builder, actor, proxy and judge roles use the selected model. Changing it invalidates prior
+Roles in the selected tier use that model. Changing it invalidates prior
 calibration; connectivity and credit eligibility must be checked for the selected endpoint.
 
 ### Tiered models (Ticket 05)

@@ -21,6 +21,9 @@ def clean_env(monkeypatch):
     for name in ("BUILDER_MODEL", "MODEL_TIER_HARD", "MODEL_TIER_MEDIUM", "MODEL_TIER_EASY", "ROLE_MODELS",
                  "OPENROUTER_API_KEY", "OPENAI_API_KEY", "DASHSCOPE_API_KEY", "DOUBLEWORD_API_KEY"):
         monkeypatch.delenv(name, raising=False)
+    # A developer's ignored env.sh must not override the test's tier defaults.
+    for name in ("MODEL_TIER_HARD", "MODEL_TIER_MEDIUM", "MODEL_TIER_EASY", "ROLE_MODELS"):
+        monkeypatch.setenv(name, "")
     monkeypatch.setenv("MODAL_BASE_URL", "https://modal-fixture.invalid/v1")
     monkeypatch.setenv("MODAL_KEY", "modal-key-fixture")
     monkeypatch.setenv("MODAL_SECRET", "modal-secret-fixture")
