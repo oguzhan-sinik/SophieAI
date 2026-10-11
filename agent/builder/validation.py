@@ -604,9 +604,11 @@ def apply_fix(source, fix):
     workflow = result.get("workflow")
     if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), dict):
         raise ValueError("the workflow has no nodes object to edit")
-    nodes = workflow["nodes"]
+    everywhere = workflow.get("global_nodes") if isinstance(workflow.get("global_nodes"), dict) else {}
     for edit in fix.edits:
         label = f"{edit.op} {edit.stage}{'.' + edit.field if edit.field else ''}"
+        # A stage that can be entered from anywhere (an interrupt) is edited where it is, like any other.
+        nodes = everywhere if edit.stage in everywhere and edit.stage not in workflow["nodes"] else workflow["nodes"]
         if edit.op == "set_workflow_field":
             if edit.field not in ("system_prompt", "initial_node") or not isinstance(edit.value, str):
                 raise ValueError(f"{label}: only system_prompt and initial_node can be set, to a text value")

@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sys
 import threading
@@ -111,6 +112,9 @@ def compact_call(call):
             result = event.get("result") or {}
             turns.append({"t": at, "role": "tool_result", "node": message.get("nodeId"), "tool": event.get("function"),
                           "status_code": result.get("status_code"), "data": result.get("data")})
+        elif kind == "function_call_error":
+            # A call that failed (an HTTP error status, no answer): it has no result, and that is what happened.
+            turns.append({"t": at, "role": "tool_result", "node": message.get("nodeId"), "tool": event.get("function"), "status_code": None, "error": str(event.get("error"))[:300]})
         elif kind == "variable_extracted":
             turns.append({"t": at, "role": "extracted", "node": event.get("source_node"), "name": event.get("name"), "value": event.get("value")})
     return {"call_id": call.get("id"), "ended": call.get("endedReason"), "duration": call.get("duration"),
@@ -217,6 +221,56 @@ class FreyaAdapter:
         finally:
             if call_id:
                 self.api("POST", "/api/v2/chat/end", {"callId": call_id})
+
+    def evaluate_scenarios(self, cases, suite, folder):
+        """Run the test callers written from a case's example calls. Each call is judged against the example's
+        expected behaviour; no bank ledger is read, what the agent did is in the call's own record."""
+        if not self.deployment:
+            raise ValueError("No candidate deployed")
+        folder = writable(folder)
+        folder.mkdir(parents=True, exist_ok=True)
+        specs = [{"name": (case["id"] + " " + case["title"])[:90], "prompt": case["persona"], "successCriteria": "All of these are true:\n- " + "\n- ".join(case["checks"]),
+                  "tags": ["builder-scenario"]} for case in cases]
+        made = self.client.create_personas(specs)["personas"]
+        if len(made) != len(cases):
+            raise ValueError("Persona response length mismatch")
+        raw = {"all_rows": [], "simulations": [], "version": self.deployment["version"], "suite": suite.key}
+        try:
+            for repetition in range(suite.repetitions):
+                self.deadline.require(20)
+                started = time.monotonic()
+                with self.trace.span("ScenarioBenchmark", repetition=repetition, suite_key=suite.key, evaluation_folder=folder.name):
+                    sim_id, iteration_id, status = self.client.run_simulation(self.deployment["agent_id"], "scenarios " + time.strftime("%H:%M:%S"),
+                                                                              {persona["id"]: case["variables"] for case, persona in zip(cases, made)})
+                    iteration = self.client.get_iteration(sim_id, iteration_id)
+                runs = {run.get("personaId"): run for run in iteration.get("runs", [])}
+                rows, calls = [], {}
+                for case, persona in zip(cases, made):
+                    run = runs.get(persona["id"]) or {}
+                    stale = run.get("agentVersionNumber") not in (None, self.deployment["version"])
+                    passed = run.get("outcome") == "pass" and not stale
+                    record = None
+                    if run.get("callId"):
+                        try:
+                            record = compact_call(self.client.get_call(run["callId"]))
+                        except Exception:
+                            record = None
+                    if record:
+                        calls[case["id"]] = record
+                    reason = "the call ran on another version of the agent" if stale else " ".join(str(run.get("reason") or "no verdict").split())
+                    rows.append({"id": case["id"], "level": case["level"], "family": case["family"], "pass": passed, "failed": [] if passed else ["conversation: " + reason[:900]],
+                                 "call_id": run.get("callId"), "customer_id": "", **({} if run else {"unknown": True}),
+                                 "tools": [str(turn.get("url") or "").rstrip("/").rsplit("/", 1)[-1] for turn in (record or {}).get("turns", []) if turn.get("role") == "tool_call" and turn.get("url")]})
+                raw["all_rows"].append(rows)
+                raw["simulations"].append({"id": sim_id, "iteration_id": iteration_id, "status": status, "seconds": time.monotonic() - started})
+                write_json(folder / "raw_runner.json", self.trace.redact(raw))
+                write_json(folder / f"iteration_{repetition}.json", self.trace.redact(iteration))
+                write_json(folder / f"calls_{repetition}.json", self.trace.redact(calls))
+                self.trace.event("scenario_result", suite_key=suite.key, repetition=repetition, passed=sum(r["pass"] for r in rows), total=len(rows), status=status,
+                                 failed=[r["id"] for r in rows if not r["pass"]])
+            return raw
+        finally:
+            write_json(folder / "raw_runner.json", self.trace.redact(raw))
 
     def watch(self, stop, folder, repetition, cases, persona_ids, customers, scorer, ledger_http):
         """Publish per-customer progress while the simulation runs. Read-only and best effort:
@@ -361,6 +415,16 @@ class FreyaAdapter:
             self.client.get_call = original_call
             runner.http = original_http
             write_json(folder / "raw_runner.json", self.trace.redact(raw))
+
+
+def scenario_suite(scenarios, repetitions=1):
+    """Test callers the builder wrote from a case's own example calls. Never an official result: the evidence is generated."""
+    cases = [{"id": re.sub(r"[^A-Za-z0-9-]+", "-", str(s["id"])).strip("-") or f"example-{n + 1}", "title": str(s.get("title") or ""), "family": str(s.get("kind") or "example"), "level": "",
+              "variables": {str(k): str(v) for k, v in (s.get("variables") or {}).items()}, "persona": str(s["persona"]), "checks": [str(c) for c in s.get("checks") or [] if str(c).strip()]}
+             for n, s in enumerate(scenarios) if str(s.get("persona") or "").strip() and s.get("checks")]
+    if not cases or len({c["id"] for c in cases}) != len(cases):
+        return None, []
+    return Suite(tuple(c["id"] for c in cases), digest({"scenarios": cases}), "generated", repetitions), cases
 
 
 def practice_suite(path, documents, brief=None, only=None, style="", repetitions=1):

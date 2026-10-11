@@ -72,11 +72,11 @@ def tier_models(builder_model):
 @dataclass(frozen=True)
 class Config:
     builder_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
-    max_wall_seconds: int = 1800
+    max_wall_seconds: int = 10800      # no build has needed three hours; a limit below what a case needs builds nothing
     reserve: int = 180
     repetitions: int = 1
     max_simulations: int = 4
-    llm_timeout: int = 480
+    llm_timeout: int = 1800           # one model call; a large case is read slowly, and a cut-off call is a lost one
     request_timeout: int = 90
     official: bool = True
     tracing: bool = True
@@ -85,8 +85,8 @@ class Config:
     role_models: dict = field(default=None)
 
     def __post_init__(self):
-        if not 30 <= self.max_wall_seconds <= 1800:
-            raise ValueError("MAX_WALL_SECONDS must be between 30 and 1800")
+        if self.max_wall_seconds < 30:
+            raise ValueError("MAX_WALL_SECONDS must be at least 30")
         if not 1 <= self.reserve < self.max_wall_seconds:
             raise ValueError("Export reserve must be positive and below build budget")
         for key in ("repetitions", "llm_timeout", "request_timeout"):

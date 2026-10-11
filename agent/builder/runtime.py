@@ -1134,13 +1134,30 @@ def ctl_records(values):
         return {}
 
 
+def ctl_item(value, money):
+    """One value of a proposal in one spelling. A number is money in cents and has to be a valid amount; a
+    YYYY-MM-DD date has to be a real day. Anything else that is not empty (a week, a currency, a date the
+    bank writes its own way, an address) is its own text: what a caller agrees to is not always an amount on a day."""
+    text = str(value if value is not None else '').strip()
+    if money:
+        if re.fullmatch(r'[-+]?[0-9]+(?:[.,][0-9]*)?', text):
+            return ctl_cents(text)
+        return text
+    if re.fullmatch(r'[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}.*', text):
+        try:
+            return datetime.date.fromisoformat(text).isoformat()
+        except Exception:
+            return ''
+    return text
+
+
 def ctl_proposal(values, product, amount, day):
     """Each changed tuple creates a revision and invalidates only its own consent."""
     try:
         records = ctl_records(values)
-        cents = ctl_cents(amount)
-        parsed = datetime.date.fromisoformat(str(day)).isoformat()
-        if not cents or not product:
+        cents = ctl_item(amount, True)
+        parsed = ctl_item(day, False)
+        if not cents or not parsed or not product:
             ctl_invalidate(values, product)
             return ''
         old = records.get(product, {})
@@ -1181,7 +1198,7 @@ def ctl_write_ready(values, product, amount, day):
     try:
         proposal = ctl_records(values).get(product, {})
         return bool(proposal.get('revision') and proposal.get('agreed') == proposal.get('revision')
-                    and proposal.get('cents') == ctl_cents(amount) and proposal.get('date') == str(day))
+                    and proposal.get('cents') == ctl_item(amount, True) and proposal.get('date') == ctl_item(day, False))
     except Exception:
         return False
 '''
@@ -1231,6 +1248,7 @@ try:
             vars[ctlv_name] = ctlv_saved
             continue
         ctlv_rows = {}
+        ctlv_one = {}
         ctlv_mark = "_response.data." + ctlv_field + "."
         for ctlv_key in list(vars.keys()):
             ctlv_text = str(ctlv_key)
@@ -1239,8 +1257,12 @@ try:
             ctlv_rest = ctlv_text.split(ctlv_mark, 1)[1].split(".")
             if len(ctlv_rest) == 2 and ctlv_rest[0].isdigit():
                 ctlv_rows.setdefault(int(ctlv_rest[0]), {})[ctlv_rest[1]] = vars[ctlv_key]
+            elif len(ctlv_rest) == 1 and not ctlv_rest[0].isdigit():
+                ctlv_one[ctlv_rest[0]] = vars[ctlv_key]
         if ctlv_rows:
             vars[ctlv_name] = json.dumps([ctlv_rows[ctlv_i] for ctlv_i in sorted(ctlv_rows)])
+        elif ctlv_one:
+            vars[ctlv_name] = json.dumps(ctlv_one)
 except Exception:
     pass
 '''
@@ -1424,12 +1446,23 @@ def apply(workflow, contracts):
                     continue
                 schema = contract["responses"].get("200", {}).get("content", {}).get("application/json", {}).get("schema", {})
 
+                def parts(at):
+                    # A schema with what it is combined from: a field is often written as allOf a shared schema.
+                    found = [at] if isinstance(at, dict) else []
+                    for key in ("allOf", "anyOf", "oneOf"):
+                        for part in (at.get(key) or []) if isinstance(at, dict) else []:
+                            found += parts(part)
+                    return found
+
                 def kind(field):
                     # The type of a result field, also of one inside an object of the result (data.cards).
                     at = schema
-                    for part in field.split("."):
-                        at = (at.get("properties") or {}).get(part, {}) if isinstance(at, dict) else {}
-                    return at.get("type") if isinstance(at, dict) else None
+                    for name in field.split("."):
+                        at = next((p["properties"][name] for p in parts(at) if isinstance(p.get("properties"), dict) and name in p["properties"]), {})
+                    for part in parts(at):
+                        if part.get("type") in ("array", "object") or isinstance(part.get("properties"), dict) or "items" in part:
+                            return "array" if part.get("type") == "array" or "items" in part else "object"
+                    return None
                 mappings = tool.get("response_mapping") if placement == "tools" else node.get("response_mapping")
                 pairs = []
                 for mapping in rows(mappings):

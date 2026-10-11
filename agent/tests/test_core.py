@@ -24,8 +24,9 @@ def fix(*edits, problem='fixture', cases=()):
 
 def test_scope_and_config(work, monkeypatch):
     with pytest.raises(ValueError): writable(work.parent.parent.parent / 'outside.json')
-    with pytest.raises(ValueError): Config(max_wall_seconds=1801)
-    with pytest.raises(ValueError): Config(reserve=1800)
+    with pytest.raises(ValueError): Config(max_wall_seconds=29)
+    assert Config(max_wall_seconds=7200).max_wall_seconds == 7200   # a long build is allowed: a limit below what a case needs builds nothing
+    with pytest.raises(ValueError): Config(max_wall_seconds=1800, reserve=1800)
     with pytest.raises(ValueError): Config(repetitions=0)
     monkeypatch.setenv('LANGSMITH_TRACING', 'maybe')
     with pytest.raises(ValueError): Config.from_env()

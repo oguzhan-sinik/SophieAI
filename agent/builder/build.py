@@ -1,5 +1,6 @@
 """Unattended build: design a phone agent from a brief, fix it, measure it, improve it, export it."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import hashlib
 import json
@@ -17,11 +18,11 @@ from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
 from .config import AGENT, BUILDER_ROLES, KIT, Config, Deadline, missing_credentials, writable
 from .contracts import compile_openapi, compile_workflow, source_documents, validate_requirements
-from .freya_adapter import FreyaAdapter, contains_definition, practice_suite, public_suite
+from .freya_adapter import FreyaAdapter, contains_definition, practice_suite, public_suite, scenario_suite
 from . import prompts
-from .schemas import ContractSpec, Patch, RequirementsBundle, WorkflowSpec
+from .schemas import ContractSpec, Patch, RequirementsBundle, RuleDigest, ScenarioSet, WorkflowSpec
 from .scoring import score, verdicts
-from .sources import case_files, is_api, load_api, read_document
+from .sources import DATA, case_files, is_api, load_api, read_document
 from .validation import apply_fix, edited_stages, is_wording, validate
 
 FIX_SECONDS = 150        # time a fix call may need; a round is not started with less
@@ -29,6 +30,8 @@ COMPILE_FIXES = 3        # fix calls a design gets for what the static checks an
 FIRST_SIMULATION = 240   # assumed length of a simulation until one has been observed
 BROKEN = (ValueError, KeyError, TypeError, AttributeError)
 BIG_CASE = 120_000       # characters of source text above which the designer gets each document once, not twice
+RULES_PART = 20_000      # characters of documents one rule-listing call reads when a case is read in parts: a short answer is a quick one
+SPAN_KEPT = 240          # characters of a cited passage kept in a large case's rule list; the designer has the documents
 
 
 def source_manifest(documents, api_path):
@@ -59,8 +62,9 @@ def call_records(folder, raw, limit=80):
 
 class Builder:
     def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None, evaluation_provider=None, deadline=None, submission_dir=None,
-                 mock_url=None, name=None, notes=(), observer=None, cases=None):
+                 mock_url=None, name=None, notes=(), observer=None, cases=None, rule_list=True):
         self.cfg = cfg
+        self.rule_list = rule_list
         self.deadline = deadline or Deadline(cfg.max_wall_seconds, cfg.reserve)
         self.run_id = time.strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
         self.root = writable(cfg.artifacts / self.run_id)
@@ -96,6 +100,11 @@ class Builder:
         self.evaluation_provider = evaluation_provider
         if evaluation_provider:
             self.suite, self.cases = evaluation_provider.bind(self.suite, self.cases)
+        # A case that brings no practice customers but describes example calls is tested with those.
+        self.scenarios = False
+        if not self.suite and mock_url and not evaluation_provider and cfg.official:
+            self.suite, self.cases = self.write_scenarios()
+            self.scenarios = bool(self.suite)
         # One Freya workflow per brief, updated in place on every run. A case folder gives its name to the build.
         self.name = re.sub(r'[^A-Za-z0-9._-]+', '-', name or Path(self.documents[-1]['path']).stem).strip('-.') or 'case'
         self.slot = 'builder-' + self.name
@@ -148,13 +157,30 @@ class Builder:
             return contracts
         raise ValueError('No usable tool contract could be written from the documents: ' + errors[0])
 
+    def write_scenarios(self):
+        """Test callers from the example calls a case's documents describe: (suite, cases), or (None, []) when there are none."""
+        try:
+            answer = self.roles.ask('ScenarioAgent', 'Write test callers from the example calls in the documents', prompts.SCENARIOS,
+                                    {'documents': [{'path': d['path'], 'text': d['text']} for d in self.documents if Path(d['path']).suffix.lower() not in DATA | {'.toml', '.ini'}]},
+                                    ScenarioSet, max_tokens=20000)
+            suite, cases = scenario_suite(answer.get('scenarios', []), self.cfg.repetitions)
+        except (ValueError, TimeoutError) as exc:
+            self.trace.event('scenarios_unavailable', message=self.trace.redact(str(exc))[:300])
+            return None, []
+        if not suite:
+            self.trace.event('scenarios_unavailable', message='the documents describe no example call')
+            return None, []
+        write_json(self.root / 'scenarios.json', cases, immutable=True)
+        self.trace.event('scenarios_written', cases=[c['id'] for c in cases], evidence='generated')
+        return suite, cases
+
     def extract_rules(self):
         """A checklist for the designer. Useful, never required: raw bank material may not compile cleanly."""
-        if sum(len(d['text']) for d in self.documents) > BIG_CASE:
-            # Seen on a folder of 175,000 characters: the list was not ready after eight minutes, a quarter of
-            # the build, and the designer then read the documents without it anyway.
-            self.trace.event('requirements_unavailable', reason='a case this large goes to the designer directly; listing its rules first takes the time the design needs')
+        if not self.rule_list:
+            self.trace.event('requirements_unavailable', reason='built without a rule list, as asked on the command line: the designer reads the documents')
             return None
+        if sum(len(d['text']) for d in self.documents) > BIG_CASE:
+            return self.extract_rules_in_parts()
         errors = []
         for attempt in range(2):
             try:
@@ -170,6 +196,89 @@ class Builder:
                     break   # a second try would take the time the designer needs
         self.trace.event('requirements_unavailable', reason='the designer reads the brief without an extracted rule list')
         return None
+
+    def extract_rules_in_parts(self):
+        """The rule list of a large case: its documents are read a few at a time, all parts at once.
+
+        One call over a folder of 175,000 characters was not finished after eight minutes and its answer
+        has no room in one output. A part's answer is short, the parts run side by side, and a rule
+        with a wrong citation is dropped alone, never the list with it."""
+        policy = [d for d in self.documents if Path(d['path']).suffix.lower() not in DATA | {'.toml', '.ini'}]   # records and settings hold no rules
+        parts = [[]]
+        for document in policy:
+            if parts[-1] and sum(len(d['text']) for d in parts[-1]) + len(document['text']) > RULES_PART:
+                parts.append([])
+            parts[-1].append(document)
+        others = lambda part: [d['path'] for d in policy if d not in part]
+
+        def read(numbered):
+            index, part = numbered
+            try:
+                return self.roles.ask('BriefAnalystAgent', f"Extract the rules of part {index + 1} of {len(parts)} of the documents", prompts.ANALYST,
+                                      {'documents': part, 'contracts': self.contracts, 'compiler_errors': [],
+                                       'part': f'{index + 1} of {len(parts)}', 'other_documents': others(part)}, RequirementsBundle, max_tokens=30000)
+            except (ValueError, TimeoutError) as exc:
+                self.trace.event('requirements_rejected', attempt=index + 1, message=self.trace.redact(str(exc))[:400])
+                return None
+
+        with ThreadPoolExecutor(max_workers=len(parts)) as pool:
+            answers = list(pool.map(read, enumerate(parts)))
+        rules, variables, unresolved, dropped = [], [], [], 0
+        for index, answer in enumerate(answers):
+            kept = {}
+            for rule in (answer or {}).get('requirements', []):
+                alone = {**rule, 'dependencies': [], 'precedence': {'supersedes': [], 'superseded_by': []}}
+                try:
+                    checked = validate_requirements({'requirements': [alone], 'input_variables': [], 'unresolved': []}, self.documents, complete=False)['requirements'][0]
+                except (ValueError, KeyError, TypeError):
+                    dropped += 1
+                    continue
+                checked['source']['span'] = checked['source']['span'][:SPAN_KEPT]
+                kept[rule['rule_id']] = {**checked, 'dependencies': rule.get('dependencies', []), 'precedence': rule.get('precedence') or {}}
+            name = lambda key: f'P{index + 1}.{key}'
+            for key, rule in kept.items():
+                refs = lambda keys: [name(k) for k in keys or [] if k in kept and k != key]
+                rules.append({**rule, 'rule_id': name(key), 'dependencies': refs(rule['dependencies']),
+                              'precedence': {'supersedes': refs(rule['precedence'].get('supersedes')), 'superseded_by': refs(rule['precedence'].get('superseded_by'))}})
+            variables += [v for v in (answer or {}).get('input_variables', []) if v not in variables]
+            unresolved += [u for u in (answer or {}).get('unresolved', []) if u not in unresolved]
+        self.trace.event('requirements_in_parts', parts=len(parts), answered=sum(a is not None for a in answers), rules=len(rules), dropped=dropped)
+        if not rules:
+            self.trace.event('requirements_unavailable', reason='the designer reads the documents without an extracted rule list')
+            return None
+        try:
+            requirements = validate_requirements({'requirements': rules, 'input_variables': variables, 'unresolved': unresolved[:60]}, self.documents, complete=False)
+        except ValueError as exc:
+            self.trace.event('requirements_unavailable', reason='the parts did not make one list: ' + self.trace.redact(str(exc))[:300])
+            return None
+        write_json(self.root / 'requirements.json', requirements, immutable=True)
+        return self.digest_rules(requirements)
+
+    def digest_rules(self, requirements):
+        """The rule list of a large case as the designer gets it: one line a rule, and only the rules that hold now.
+
+        Listed in parts, 550 rules of one case took 150,000 characters, half of it citations, and repeated across
+        documents what a later mail had changed. The designer has the documents with their line numbers."""
+        def line(rule):
+            source = rule['source']
+            text = [f"{rule['rule_id']} [{Path(source['path']).name}:{source['start_line']}-{source['end_line']}] {rule['condition'].strip()}"]
+            text += ['MUST ' + '; '.join(rule['must'])] if rule['must'] else []
+            text += ['MUST NOT ' + '; '.join(rule['must_not'])] if rule['must_not'] else []
+            text += ['WITH ' + json.dumps(rule['parameters'], ensure_ascii=False)] if rule.get('parameters') else []
+            return ' | '.join(text)
+
+        lines = [line(rule) for rule in requirements['requirements']]
+        digest_ = {'rules': lines, 'unresolved': requirements.get('unresolved', [])[:40]}
+        try:
+            answer = self.roles.ask('BriefAnalystAgent', 'Write the rules that hold now, one line each', prompts.DIGEST,
+                                    {'rules': lines, 'documents_in_reading_order': [Path(d['path']).name for d in self.documents]}, RuleDigest, max_tokens=30000)
+            if answer.get('rules'):
+                digest_ = {'rules': [str(r) for r in answer['rules']][:200], 'unresolved': [str(u) for u in answer.get('unresolved', [])][:40]}
+        except (ValueError, TimeoutError) as exc:
+            self.trace.event('requirements_rejected', attempt=0, message='the rules stay as listed: ' + self.trace.redact(str(exc))[:300])
+        write_json(self.root / 'requirements.digest.json', digest_, immutable=True)
+        self.trace.event('requirements_digest', listed=len(lines), kept=len(digest_['rules']), characters=sum(len(r) for r in digest_['rules']))
+        return digest_
 
     def design(self):
         if self.resume:
@@ -323,6 +432,7 @@ class Builder:
             self.deploy(cid)
             self.simulations += getattr(self.evaluation_provider, 'simulations_per_measure', 1) * self.suite.repetitions
             raw = self.evaluation_provider.evaluate(self.archive.workflow(cid), self.adapter, folder, self.roles, self.deadline) if self.evaluation_provider else \
+                self.adapter.evaluate_scenarios(self.cases, self.suite, folder) if self.scenarios else \
                 self.adapter.evaluate(self.cases, self.suite, folder, **({'bank_host': self.bank_host} if self.bank_host else {}))
         except Exception as exc:
             self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
@@ -596,6 +706,7 @@ def main(argv=None):
     parser.add_argument('--mock-url', help='The https address of your own mock of the bank: every tool of the agent calls it')
     parser.add_argument('--name', help='A name for the build (Freya slot and export file); default: the case folder, or the last brief')
     parser.add_argument('--cases', help='Practice cases of your own (written by mock/make_fixtures.py), run against your mock in place of the kit\'s thirteen')
+    parser.add_argument('--no-rule-list', action='store_true', help='Skip listing the rules first: the designer reads the documents directly (faster on a large folder)')
     parser.add_argument('--resume-run', help='Reuse the rules and root design of an earlier run on the same brief and tool API')
     parser.add_argument('--public-brief', choices=['A', 'B'])
     parser.add_argument('--only', help='Comma-separated public case IDs; defines a distinct suite')
@@ -608,7 +719,7 @@ def main(argv=None):
             raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
         given = case(args.briefs, args.openapi, args.mock_url)
         builder = Builder(cfg, given['briefs'], given['openapi'], resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief,
-                          mock_url=given['mock_url'], name=args.name or given['name'], notes=given['notes'], observer=echo, cases=args.cases)
+                          mock_url=given['mock_url'], name=args.name or given['name'], notes=given['notes'], observer=echo, cases=args.cases, rule_list=not args.no_rule_list)
         result = builder.run()
     except (ValueError, OSError, KeyError, TimeoutError) as exc:
         print(json.dumps({'status': 'invalid_input', 'error': str(exc)}))

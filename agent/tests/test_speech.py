@@ -310,8 +310,13 @@ def test_the_compiled_practice_design_is_smaller_and_its_code_still_runs(contrac
     runs = sorted(AGENT.glob('artifacts/2026*/pinned_root.json'))
     if not runs:
         pytest.skip('no saved design on this machine')
-    for path in runs[-3:]:
-        saved = json.loads(Path(path).read_text())
+    # Only designs of the practice contract: another case's design calls other services.
+    saved_designs = [json.loads(Path(path).read_text()) for path in runs[-8:]]
+    practice = [s for s in saved_designs if s.get('openapi_hash') == contracts['sha256']]
+    if not practice:
+        pytest.skip('no saved design of the practice contract on this machine')
+    for saved in practice[-3:]:
+        path = saved.get('brief_hash')
         compiled = compile_workflow(saved['spec']['workflow'], contracts)[0]
         size = len(json.dumps(compiled, separators=(',', ':')))
         every = sum(len(runtime.DATE_HELPERS) for node in compiled['nodes'].values() if node.get('node_type') == 'code')

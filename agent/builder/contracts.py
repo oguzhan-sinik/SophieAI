@@ -29,7 +29,9 @@ def source_documents(paths):
     return documents
 
 
-def validate_requirements(bundle, documents):
+def validate_requirements(bundle, documents, complete=True):
+    """`complete` also asks that every numbered line of a cited document is covered: right for a brief of
+    numbered rules, wrong for one rule looked at alone or for a folder of mails, minutes and analyses."""
     bundle = RequirementsBundle.model_validate(bundle)
     sources = {d["path"]: d["text"].splitlines() for d in documents}
     ids = {r.rule_id for r in bundle.requirements}
@@ -83,7 +85,7 @@ def validate_requirements(bundle, documents):
     # An unresolved or ambiguous rule is passed on to the designer as it stands; raw bank material
     # is allowed to be unclear, and refusing to build would leave no phone agent at all.
     # Detect silently omitted numbered rules independently of the analyst.
-    for path, lines in sources.items():
+    for path, lines in sources.items() if complete else ():
         covered = {n for r in bundle.requirements if r.source.path == path for n in range(r.source.start_line, r.source.end_line + 1)}
         if not covered and len(sources) > 2:
             # A case folder also holds documents that state no rule (example conversations, a list of customers):
@@ -128,7 +130,7 @@ def compile_openapi(path, server=None):
         for method, op in path_item.items():
             if method not in {"get", "post", "put", "patch", "delete"}:
                 continue
-            # A tool is called by a plain name: a service named cards.list is the tool cards_list, on its documented path.
+            # A tool is called by a plain name: a service named orders.list is the tool orders_list, on its documented path.
             name = re.sub(r"\W+", "_", str(op.get("operationId") or path_name.rstrip("/").rsplit("/", 1)[-1])).strip("_")
             if not re.fullmatch(r"[A-Za-z_]\w*", name) or name in operations:
                 raise ValueError(f"Operation {op.get('operationId') or path_name!r} has no usable, unique name: give each operation its own operationId made of letters, digits and underscores")
@@ -162,7 +164,7 @@ def compile_openapi(path, server=None):
             flat, nest = flatten_body(body)
             if nest:
                 # The designer binds each field by its own name; the request is sent in the documented shape.
-                operations[name].update(body=flat, nest=nest)
+                operations[name].update(body=flat, nest=nest, documented_body=body)
             if server is not None:
                 operations[name]["call_header"] = True
     if not operations:
@@ -172,7 +174,7 @@ def compile_openapi(path, server=None):
 
 
 def flatten_body(body):
-    """A request body with objects inside objects ({"data": {"customerNo": ...}}) as one level of fields, and
+    """A request body with objects inside objects ({"order": {"number": ...}}) as one level of fields, and
     where each field belongs: ({leaf schema}, {field: [path]}). ({}, {}) for a body that is one level already."""
     leaves = []
 
@@ -251,6 +253,8 @@ def compile_workflow(source, contracts):
             if node.get("node_type") in ("code", "api_request"):
                 node.setdefault("passthrough", True)
                 node.setdefault("on_enter", {"type": "silent"})
+            if node.get("passthrough") is True:
+                # Any stage that moves on by itself, also one that only speaks a line: its last, always, route is where it goes.
                 last = node["transitions"][-1] if isinstance(node.get("transitions"), list) and node["transitions"] else None
                 if "passthrough_default_transition" not in node and isinstance(last, dict) and isinstance(last.get("condition"), dict) and last["condition"].get("operator") == "always":
                     node["passthrough_default_transition"] = last.get("target_node")

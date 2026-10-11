@@ -7,7 +7,13 @@ Resolve explicit overlay/replacement language with precedence.supersedes edges; 
 unrelated inherited constraints. Where the documents contradict each other without saying which
 one holds, mark the rules conflicting and list the question in unresolved; never invent a rule or
 settle a contradiction merely because one paragraph is later. Input variables come from the brief.
-Keep fields concise.
+Keep fields concise. In source.span quote the first words of the cited lines, twelve at most, then
+"..." : the line numbers say where the passage ends, and a list that quotes whole paragraphs does
+not fit in one answer. A document of example conversations, test data or instructions for another
+piece of work (how to deploy something) yields rules only where it states what the agent must do.
+When the payload has part, the documents given are some of the case's documents; other_documents
+names the rest, which are read separately. Cite only the documents given, and put in unresolved what
+depends on a document that is not shown.
 """
 
 CONTRACT = """Write the OpenAPI 3.0 document of the bank services a phone agent calls during a call, from the
@@ -24,6 +30,43 @@ parameters: a documented value passed in the path or the query is written as a b
 same name. Invent nothing: no operation, field, value or default the documents do not state.
 compiler_errors lists what was wrong with your previous answer; correct exactly that.
 List in notes what the documents leave unclear about a service.
+"""
+
+DIGEST = """The supplied rules were listed from a case's documents a few documents at a time. So the
+list repeats itself, and it still holds what a later document changed. Write the rules that hold now
+for the phone agent, one rule per line.
+Merge rules that say the same thing. Where two disagree, keep the one from the later document: a
+dated mail or meeting decision wins over the document it corrects, a newer version of a document
+over the older one; file names and the rules' own words show the dates. Leave out every rule that is
+not about what the phone agent says or does during a call: how a mock or test environment is built
+or deployed, test data, who does what in the project. Keep every number, limit, exception, order of
+steps and every sentence the agent must say word for word, in its own language. Do not add a rule
+the list does not hold. Each line is the rule in plain words, then its source in brackets as
+[file name:lines]; a merged rule names the later source. At most 150 lines. unresolved: what the
+documents leave open and a designer has to decide.
+"""
+
+SCENARIOS = """Write test callers for a phone agent from the example calls the supplied documents
+describe (example scenarios, sample conversations with their expected behaviour). First one scenario
+for each example; when the documents hold no example call, return an empty list and nothing else.
+Then add scenarios of your own, eight at most, so that the agent is not tested on the published
+examples alone: one for each kind of ending, refusal, service failure and special customer that the
+documents describe and no example covers. A scenario of your own uses only a customer, card and
+values that the documents' own test data lists, with the call variables that data gives, and its id
+starts with derived-. Its checks state what the documents require in that situation, with the
+documents' own sentence where they fix one; where the documents leave a behaviour open or disagree
+without a later decision, write no check about it.
+id: a short name made of letters, digits and hyphens. variables: the values the example's call
+starts with, named exactly as the documents name the call's variables. persona: complete
+instructions for a simulated caller, addressed to the caller as "you" and written in the language
+the calls are held in. It says: write only the words you say on the phone, one or two short
+sentences per turn, then wait, no stage directions; who the caller is and why they call; what
+happens in this call in order, with the caller's own sentences where the example gives them; answer
+what is asked and volunteer nothing; never invent a date, an amount or a fact; when the assistant
+says goodbye or hands the call over, say one short goodbye and nothing more. The persona never
+contains what the agent should say. checks: the example's expected behaviour, one statement for
+each expectation, in English, each one something a reader of the conversation and its tool calls
+can decide, with the example's own values.
 """
 
 # How to write a workflow or any part of one. Shared by the designer and by every fix.
@@ -207,7 +250,11 @@ ctl_write_ready(vars,product,amount,day). Use these in code stages. Money passed
 already unambiguous numeric cents; spoken ambiguity must be clarified first. Before read-back save
 the proposal revision; explicit agreement is scoped to that exact revision. Every correction,
 including "yes, but...", invalidates old consent. Require ctl_write_ready plus source policy checks
-before each write. These helpers do not enforce the bank's policy. For grouped consent check every
+before each write. These helpers do not enforce the bank's policy. They keep one agreement for
+each thing: ctl_proposal(vars, thing, value, value) takes the two values that were read back, an
+amount and a day for a promise, or for another kind of write whatever was read back (a week and
+its date, a currency and an address); an empty value is never agreed. ctl_write_ready is true only
+for exactly the two values the caller said a clear yes to. For grouped consent check every
 named member's current revision and source permission; no blanket yes for other products.
 
 DATES AND AMOUNTS. The controller provides these functions inside every code stage; use them and
@@ -271,6 +318,11 @@ system_prompt also says that the agent never says goodbye, never offers more hel
 else?") and never sums the call up by itself: a call ends only in its closing stages, and a stage
 that waits for an answer asks its question again instead. A caller who is told goodbye too early
 answers goodbye, and the stage then waits for an answer that never comes.
+A text that code prepared and that must be heard as it is (a reading of amounts and dates, a
+read-back, a sentence the sources fix) is spoken as fixed speech, on_enter {"type": "tts", "text":
+"{{the_prepared_text}}"}, with the stage's task_message only for what comes after it. The agent's
+model is never asked to repeat a prepared text: it shortens it, rewords the numbers and stops in the
+middle of a long line, and every call says it differently.
 A stage that needs no answer does not wait for one: after a line that asks nothing (a confirmation,
 a goodbye) its last transition is always and leads on, so any reply moves the call. Every value in
 enum_values either has a transition or is meant to keep the caller in the stage.

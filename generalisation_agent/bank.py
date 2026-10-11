@@ -71,7 +71,7 @@ class Bank:
         self.counts[operation] = self.counts.get(operation, 0) + 1
         try:
             if self.closed: raise ValueError("call closed")
-            schema = self.operations[operation]["body"]
+            schema = self.operations[operation].get("documented_body") or self.operations[operation]["body"]
             check_schema(body, schema)
             args = {key: read_path(body, path) for key, path in self.mapping.requests[operation].items()}
             event["args"] = args
@@ -201,7 +201,7 @@ def validate_mapping(policy, mapping, operations):
     for name, operation in operations.items():
         if operation["method"] != "POST":
             raise ValueError("Local bank supports only explicit POST operations")
-        body = operation["body"]
+        body = operation.get("documented_body") or operation["body"]   # the request as the contract documents it
         supported_schema(body)
         fields = mapping.requests[name]
         for semantic, path in fields.items():

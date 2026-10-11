@@ -52,6 +52,26 @@ class ContractSpec(Record):
     notes: list[str] = Field(default_factory=list, description="What the documents leave unclear about a service.")
 
 
+class RuleDigest(Record):
+    """The rules of a large case that hold now, one line each."""
+    rules: list[str]
+    unresolved: list[str] = Field(default_factory=list)
+
+
+class Scenario(Record):
+    """One test caller, written from an example call the case's documents describe."""
+    id: str
+    title: str
+    kind: str = Field(default="", description="The example's own type, if the documents give one (ordinary, edge, adversarial).")
+    variables: dict[str, str] = Field(description="The values this call starts with, named exactly as the documents name them.")
+    persona: str = Field(description="Complete instructions for the simulated caller, in the language of the call.")
+    checks: list[str] = Field(description="What the example expects of the agent, one checkable statement each.")
+
+
+class ScenarioSet(Record):
+    scenarios: list[Scenario] = Field(default_factory=list)
+
+
 class Edit(Record):
     op: Literal["set_field", "set_stage", "remove_stage", "set_workflow_field"]
     stage: str = Field(default="", description="The stage the edit is for. Empty for set_workflow_field.")

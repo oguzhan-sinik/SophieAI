@@ -126,7 +126,7 @@ def test_with_a_mock_address_every_tool_calls_the_mock(spec, folder):
     with pytest.raises(ValueError): compile_openapi(folder / 'secured.json')
 
 
-def build(work, spec, requirements, given, seen, contract_answers=()):
+def build(work, spec, requirements, given, seen, contract_answers=(), scenarios=None):
     answers = list(contract_answers)
     base = roles(spec, requirements, [], seen)
     class Roles(base):
@@ -135,6 +135,8 @@ def build(work, spec, requirements, given, seen, contract_answers=()):
                 self.calls += 1
                 seen.append((role, deepcopy(payload)))
                 return deepcopy(answers.pop(0))
+            if role == 'ScenarioAgent':
+                return {'scenarios': scenarios or []}     # these documents describe no example call unless a test gives some
             return super().ask(role, purpose, instruction, payload, schema, max_tokens)
     builder = Builder(Config(artifacts=work, tracing=False), given['briefs'], given['openapi'], roles_factory=Roles, adapter_factory=FakeFreya,
                       mock_url=given['mock_url'], name=given['name'], notes=given['notes'], observer=echo)
@@ -211,3 +213,105 @@ def test_the_command_reports_bad_input_as_one_line(folder, capsys, monkeypatch):
         monkeypatch.setenv(name, 'fixture-value-0123456789')
     assert main([str(folder), MOCK, MOCK + '/second']) == 2
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1]) == {'status': 'invalid_input', 'error': 'More than one mock address given'}
+
+
+# ------------------------------------------------------------------ a contract with objects inside objects, and a large case
+
+NESTED = {"openapi": "3.0.0", "info": {"title": "t", "version": "1"}, "servers": [{"url": "https://bank.example"}], "paths": {
+    "/shop/v1/orders.list": {"post": {"operationId": "orders.list", "description": "the customer's orders", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {
+        "data": {"type": "object", "required": ["orderNo"], "properties": {"orderNo": {"type": "string"}, "aiFlow": {"type": "string", "enum": ["Shop"]}}},
+        "call": {"type": "object", "properties": {"ani": {"type": "string"}, "lang": {"type": "string"}}}}}}}},
+        "responses": {"200": {"content": {"application/json": {"schema": {"type": "object", "properties": {
+            "data": {"type": "object", "properties": {"orders": {"type": "array", "items": {"type": "object"}}, "exitState": {"type": "string"},
+                                                       "debt": {"description": "one block", "allOf": [{"type": "object", "properties": {"amount": {"type": "number"}}}]}}},
+            "result": {"type": "object", "properties": {"returnCode": {"type": "string"}}}}}}}}}}}}}
+
+
+def test_a_nested_request_is_bound_by_field_and_sent_in_its_documented_shape(tmp_path):
+    import json
+    from builder.contracts import compile_openapi, compile_workflow
+    from builder.validation import validate
+    path = tmp_path / 'api.json'
+    path.write_text(json.dumps(NESTED))
+    contracts = compile_openapi(path, server='https://mock.example.workers.dev')
+    operation = contracts['operations']['orders_list']          # a service named orders.list is the tool orders_list
+    assert operation['url'] == 'https://mock.example.workers.dev/shop/v1/orders.list'
+    assert list(operation['body']['properties']) == ['orderNo', 'aiFlow', 'ani', 'lang'] and operation['body']['required'] == ['orderNo']
+    assert operation['nest']['orderNo'] == ['data', 'orderNo'] and operation['documented_body']['properties']['data']['type'] == 'object'
+    end = {"name": "bye", "node_type": "end_call", "terminal": {"function": {"handler": "__function__:end_call", "parameters": {"properties": {"message_mode": {"default": "none"}}}}}}
+    source = {"initial_node": "hello", "system_prompt": "x", "global_nodes": {}, "nodes": {
+        "hello": {"name": "hello", "node_type": "conversation", "task_message": "Say hello.", "max_node_turns": 3, "max_turn_transition": "bye",
+                  "extraction_schema": [{"name": "r", "type": "string", "enum_values": ["a"], "description": "d", "min_confidence": 0.6}], "transitions": [{"target_node": "list_orders", "condition": {"operator": "always"}}]},
+        "list_orders": {"name": "list_orders", "node_type": "api_request", "transitions": [{"target_node": "bye", "condition": {"operator": "always"}}], "pre_actions": [
+            {"bank_operation": "orders_list", "description": "CALL when the call starts", "bindings": {"orderNo": "{{orderNumber}}", "aiFlow": "Shop", "lang": "tr"},
+             "response_mapping": [{"path": "data.data.orders", "variable": "orders"}, {"path": "data.data.exitState", "variable": "exit_state"}, {"path": "data.data.debt", "variable": "debt"}]}]},
+        "bye": end}}
+    compiled = compile_workflow(source, contracts)[0]
+    tool = compiled['nodes']['list_orders']['pre_actions'][0]
+    assert tool['function']['parameters']['properties']['body'] == {"type": "object", "default": {"data": {"orderNo": "{{orderNumber}}", "aiFlow": "Shop"}, "call": {"lang": "tr"}}}
+    assert tool['config'] == {"timeoutMs": 30000, "maxRetries": 0}
+    assert 'data.orders' in tool['post_process_code']           # the list inside the answer's data reaches code stages
+    assert '["debt", "data.debt"]' in tool['post_process_code'] and 'exit_state' not in tool['post_process_code']   # so does an object written as allOf; a text does not
+    scope = {'vars': {}, 'result': {'data': {'data': {'orders': [{'a': 1}], 'debt': {'amount': 5.5}, 'exitState': 'x'}}}}
+    exec(tool['post_process_code'], scope, scope)
+    assert json.loads(scope['vars']['debt']) == {'amount': 5.5} and json.loads(scope['vars']['orders']) == [{'a': 1}]
+    assert validate(compiled, contracts)['errors'] == []
+    source['nodes']['list_orders']['pre_actions'][0]['bindings'] = {"aiFlow": "Shop"}
+    assert any('orderNo' in e for e in validate(compile_workflow(source, contracts)[0], contracts)['errors'])   # a required field without a binding
+
+
+def test_a_data_file_is_shown_by_its_first_records(tmp_path):
+    import json
+    from builder.sources import MAX_DATA_CHARS, read_document
+    path = tmp_path / 'customers.json'
+    path.write_text(json.dumps([{"customer": n, "answer": "x" * 200} for n in range(2000)]))
+    text, why = read_document(path)
+    assert why is None and len(text) < MAX_DATA_CHARS + 300 and 'more records of the same shape' in text
+
+
+def test_example_calls_become_test_callers_and_are_scored_from_the_judges_verdict(work):
+    tmp_path = work
+    from builder.freya_adapter import FreyaAdapter, scenario_suite
+    from builder.scoring import score
+    suite, cases = scenario_suite([{'id': 'Example 1: one card', 'title': 'One card', 'kind': 'Happy', 'variables': {'orderNumber': 90000001, 'now': '2026-10-12T10:30:00+03:00'},
+                                    'persona': 'Yalnızca söylediklerini yaz.', 'checks': ['the debt is read', 'the caller is sent to the main menu']},
+                                   {'id': 'no-persona', 'title': '', 'variables': {}, 'persona': ' ', 'checks': ['x']}])
+    assert suite.case_ids == ('Example-1-one-card',) and suite.evidence_type == 'generated' and cases[0]['variables']['orderNumber'] == '90000001'
+    assert scenario_suite([]) == (None, [])
+    messages = [{'role': 'assistant', 'message': 'Borcunuz 5 lira.', 'nodeId': 'read'},
+                {'role': 'system', 'nodeId': 'orders', 'message': json.dumps({'event': 'function_call_start', 'function': 'api_call', 'args': {'url': 'https://mock.example/shop/v1/orders.list', 'body': {}}})},
+                {'role': 'system', 'nodeId': 'orders', 'message': json.dumps({'event': 'function_call_error', 'function': 'api_call', 'error': 'API request failed: 404'})}]
+
+    class Client:
+        def create_personas(self, specs):
+            assert specs[0]['prompt'] == 'Yalnızca söylediklerini yaz.' and 'the debt is read' in specs[0]['successCriteria']
+            return {'personas': [{'id': 'p1'}]}
+        def run_simulation(self, agent, name, variables):
+            assert agent == 'agent-1' and variables == {'p1': {'orderNumber': '90000001', 'now': '2026-10-12T10:30:00+03:00'}}
+            return 'sim', 'it', 'completed'
+        def get_iteration(self, sim, iteration):
+            return {'runs': [{'personaId': 'p1', 'outcome': 'fail', 'reason': 'the offer was not made', 'callId': 'c1', 'agentVersionNumber': 3}]}
+        def get_call(self, call):
+            return {'id': call, 'messages': messages}
+
+    class Quiet:
+        redact = staticmethod(lambda value: value)
+        def event(self, *a, **k): pass
+        def span(self, *a, **k):
+            from contextlib import nullcontext
+            return nullcontext()
+    adapter = FreyaAdapter.__new__(FreyaAdapter)
+    adapter.client, adapter.trace, adapter.deployment = Client(), Quiet(), {'agent_id': 'agent-1', 'version': 3}
+    adapter.deadline = type('D', (), {'require': lambda self, seconds=0: None})()
+    import builder.freya_adapter as module
+    kept = module.writable
+    module.writable = lambda path: path
+    try:
+        raw = adapter.evaluate_scenarios(cases, suite, tmp_path / 'evaluation')
+    finally:
+        module.writable = kept
+    row = raw['all_rows'][0][0]
+    assert row['pass'] is False and row['failed'] == ['conversation: the offer was not made'] and row['tools'] == ['orders.list']
+    record = json.loads((tmp_path / 'evaluation' / 'calls_0.json').read_text())['Example-1-one-card']
+    assert record['turns'][-1]['error'] == 'API request failed: 404'       # a failed call is part of what happened
+    assert score(raw, suite).passed == 0 and score(raw, suite).complete

@@ -6,6 +6,8 @@ import re
 import time
 import uuid
 
+OUTPUT_CEILING = 120000   # tokens one answer may be given on a second try
+
 from .artifacts import digest, write_json
 
 
@@ -158,9 +160,13 @@ class ADKRoles:
                         raise
                     raise ValueError(f"{role} model call failed twice: {type(exc).__name__}: {self.trace.redact(str(exc))[:300]}") from exc
                 afford = re.search(r"can only afford (\d+)", str(exc))
+                cut = "cut off at its output limit" in str(exc)
                 if afford and int(afford.group(1)) >= 4000:
                     max_tokens = min(max_tokens, int(afford.group(1)) - 500)
-                self.trace.event("structured_output_retry", role=role, error=type(exc).__name__, **({"max_tokens": max_tokens} if afford else {}))
+                elif cut:
+                    # An answer that ran into the limit is no JSON at all: the second try gets twice the room.
+                    max_tokens = min(max_tokens * 2, OUTPUT_CEILING)
+                self.trace.event("structured_output_retry", role=role, error=type(exc).__name__, **({"max_tokens": max_tokens} if afford or cut else {}))
                 if "RateLimit" in type(exc).__name__ or "Retry shortly" in str(exc):
                     # The provider asks for ten seconds; a second try at once is refused the same way.
                     time.sleep(12)
@@ -183,7 +189,13 @@ class ADKRoles:
             self.trace.redact.assert_no_secrets(text)
             write_json(self.root / "model_calls" / (call_id + ".raw_response.json"), {"text": text, "usage": usage}, immutable=True)
             self.trace.event("model_usage", call_id=call_id, model=model, tokens=usage, estimated_cost=None)
-            result = schema.model_validate_json(text).model_dump()
+            try:
+                result = schema.model_validate_json(text).model_dump()
+            except ValueError as exc:
+                written = sum(int(u.get(key) or 0) for u in (usage if isinstance(usage, list) else [usage]) if isinstance(u, dict) for key in ("candidates_token_count", "thoughts_token_count"))
+                if written >= 0.9 * max_tokens:
+                    raise ValueError(f"{role} answer was cut off at its output limit of {max_tokens} tokens ({written} written)") from exc
+                raise
             write_json(self.root / "model_calls" / (call_id + ".response.json"), result, immutable=True)
             return result
 
