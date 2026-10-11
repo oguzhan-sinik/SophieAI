@@ -124,7 +124,7 @@ built from values that may be empty. An engine-run call
 flattens its result under <stage name>_response.data.*, a model-called tool under
 <tool name>_response.data.*; prefer mapped variables in routes.
 
-HUMAN SPEECH. Callers talk like people, and the customers this agent is tested with do all five of
+HUMAN SPEECH. Callers talk like people, and the customers this agent is tested with do all of
 the things below. Spread what follows over stages, one question per conversation stage and one
 decision per code stage; never build one stage that handles every kind of reply.
 1. A number in two parts ("463", then "51"). The stage that asks for a number extracts only what
@@ -154,6 +154,23 @@ are none of answer, refusal or consent, and they use up no attempt of any kind.
 Never let the extraction model do arithmetic on spoken words or turn words into a calendar date.
 Declare a day as extraction type date and an amount as extraction type amount: the controller
 captures the caller's words and converts them before any code runs (DATES AND AMOUNTS below).
+6. One of several ("all three", "the card", "not the car loan"). When the call is about several
+things of one kind (products, accounts), callers name them their own way, and one reply can answer
+for several at once: "I can pay all three on Friday", "the card tomorrow, but not the loans". Code
+never compares the caller's words with fixed text (==, a list of phrases, a substring test): "the
+credit card" is not "credit card", and the controller rejects such a comparison. The stage extracts
+the caller's whole reply as their own words, and a code stage calls ctl_choice(said, names). names
+has one entry for each thing, in the order of the account data; an entry is a list of what the
+thing is called (its type, the label the agent says, its card ending). It returns a dict: chosen,
+declined and unclear are lists of positions in names, and kind is one, several, all, declined,
+unclear or none. Every chosen thing takes the day and the amount of that reply and is then checked
+against its own rules; a reply about all of them is about every thing still open. A thing declined
+in a reply to a question about all of them has used up nothing of its own: it is then handled the
+way the source handles each thing by itself, and what the caller already agreed for another thing
+in that reply is kept, not asked again. Ask "which one?" only when kind is unclear, naming the
+choices, and read that answer with ctl_choice too. When kind is none, the reply is about what the
+stage asked (the one thing it named, or all of them). The agent never says that it can only take
+one thing at a time.
 A reply cut off mid-sentence gives what it completes: keep that, ask only for what is missing.
 A value that holds the caller's own words (not one of a list) gets min_confidence 0.4 at most: a
 long string of copied words scores low, a discarded capture looks to the stage like silence, and the
@@ -163,6 +180,7 @@ The runtime provides ctl_digits(said, count=0) (digits in order however they wer
 in groups, as numerals; zeros kept; '' when another word is among them),
 ctl_collect(vars, name, said, count) (above),
 ctl_amount(said) (an amount in words or digits as text like 1250.50, '' when there is no single amount),
+ctl_choice(said, names) (which of several known things the words name; item 6 above),
 ctl_identity_date(said) (complete identity date only, never substitutes a year),
 ctl_slot(vars,name,value,raw,complete,turn,correction=False) (an incomplete value becomes '' and
 <name>_complete becomes no: route on <name>_complete equals yes, never on is_set),
@@ -212,7 +230,10 @@ alternative, the accepting route first passes a code stage that copies the offer
 variable the check reads; routing an acceptance straight back into the check changes nothing and
 loops. Only an accepted value reaches the read-back and the write. An acceptance that repeats the
 offered values ("I accept 540 on the 27th") is an acceptance when the values equal the offer:
-compare them in code, do not treat it as a new proposal. A read-back states exactly the
+compare them in code, do not treat it as a new proposal. The same holds at the read-back, also when
+several things are read back together: a yes that repeats a day or an amount the read-back stated
+changes nothing and is the confirmation. A reply is a change only when code finds a value in it
+that differs from what the stage stated. A read-back states exactly the
 variables the write tool is bound to. A stage that speaks after a check receives the outcome through
 variables in its task_message and never confirms what the check rejected. Say that something is
 recorded, booked or transferred only in the stage after the tool that did it succeeded; in every
@@ -225,7 +246,14 @@ only where the source permits it and the failure is known. A caller may ask or a
 something was recorded ("you have noted it, haven't you?"): the answer comes from the tool's result
 variable only. system_prompt says, in the language of the call, that the agent never states that
 something was recorded, booked, sent or transferred unless the instructions of the current stage
-say the tool confirmed it.
+say the tool confirmed it. The agent's model likes to thank a caller who agrees with "I have
+recorded that". Where an agreement is written only later (after a read-back, after the other
+things), the task_message of the stage that follows gives the agent its acknowledgement in true
+words without the reserved word ("Thank you.") and says that nothing is written yet.
+system_prompt also says that the agent never says goodbye, never offers more help ("anything
+else?") and never sums the call up by itself: a call ends only in its closing stages, and a stage
+that waits for an answer asks its question again instead. A caller who is told goodbye too early
+answers goodbye, and the stage then waits for an answer that never comes.
 A stage that needs no answer does not wait for one: after a line that asks nothing (a confirmation,
 a goodbye) its last transition is always and leads on, so any reply moves the call. Every value in
 enum_values either has a transition or is meant to keep the caller in the stage.

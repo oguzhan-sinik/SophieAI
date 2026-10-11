@@ -320,3 +320,69 @@ def test_the_compiled_practice_design_is_smaller_and_its_code_still_runs(contrac
             if node.get('node_type') == 'code':
                 compile(code_of(compiled, key), key, 'exec')
         assert not [e for e in validate(compiled, contracts)['errors'] if 'is not defined' in e]
+
+
+# ------------------------------------------------------------------ H6: one of several things
+
+ENGLISH = ['credit card ending 9015', 'personal loan', 'car loan']
+TURKISH = ['9015 ile biten kredi kartı', 'ihtiyaç kredisi', 'taşıt kredisi']
+TWO_CARDS = ['credit card ending 1111', 'credit card ending 2222', 'car loan']
+
+
+@pytest.mark.parametrize('names,said,kind,chosen,declined,unclear', [
+    (ENGLISH, 'I cannot pay today. I can pay all three this Friday.', 'all', [0, 1, 2], [], []),
+    (ENGLISH, 'I mean all three of them.', 'all', [0, 1, 2], [], []),
+    (ENGLISH, 'The credit card.', 'one', [0], [], []),
+    (ENGLISH, 'I will pay the credit card tomorrow, but I am not paying the personal loan or the car loan.', 'one', [0], [1, 2], []),
+    (ENGLISH, 'the loan', 'unclear', [], [], [1, 2]),
+    (ENGLISH, 'both loans on Friday', 'several', [1, 2], [], []),
+    (ENGLISH, 'everything except the car loan', 'several', [0, 1], [2], []),
+    (ENGLISH, 'all but the car loan', 'several', [0, 1], [2], []),
+    (ENGLISH, 'the card yes, the rest no', 'one', [0], [1, 2], []),
+    (ENGLISH, "I'll pay the credit card tomorrow, I can't do the others", 'one', [0], [1, 2], []),
+    (ENGLISH, "I can't pay the car loan I will pay the credit card", 'one', [0], [2], []),
+    (ENGLISH, 'the one ending nine zero one five', 'one', [0], [], []),
+    (ENGLISH, 'the first one', 'one', [0], [], []), (ENGLISH, 'the last one', 'one', [2], [], []),
+    # A correction: the last thing named is the thing.
+    (ENGLISH, 'the car loan, no, the personal loan', 'one', [1], [], []),
+    (ENGLISH, 'the car loan, sorry, the personal loan', 'one', [1], [], []),
+    (ENGLISH, 'not the credit card, the car loan', 'one', [2], [0], []),
+    (ENGLISH, 'No I will pay the credit card on Friday', 'one', [0], [], []),
+    # Nothing named: the reply is about what the stage asked.
+    (ENGLISH, 'I want to talk to a person', 'none', [], [], []), (ENGLISH, 'Yes, I will pay that this Friday.', 'none', [], [], []),
+    (ENGLISH, 'I can pay it all on Friday', 'none', [], [], []), (ENGLISH, 'No, that is all.', 'none', [], [], []),
+    (ENGLISH, 'can I pay any amount', 'none', [], [], []), (ENGLISH, '', 'none', [], [], []), ([], 'the card', 'none', [], [], []),
+    (ENGLISH, "I can't pay any of them", 'declined', [], [0, 1, 2], []), (ENGLISH, 'none of them', 'declined', [], [0, 1, 2], []),
+    (ENGLISH, 'I am not paying any of the loans', 'declined', [], [1, 2], []),
+    (TWO_CARDS, 'the credit card', 'unclear', [], [], [0, 1]), (TWO_CARDS, 'the one ending 2222', 'one', [1], [], []),
+    (TWO_CARDS, 'two two two two', 'one', [1], [], []), (TWO_CARDS, 'both cards', 'several', [0, 1], [], []),
+    ([['credit_card', 'credit card ending 9015'], ['personal_loan'], ['car_loan']], 'the personal one', 'one', [1], [], []),
+    (['credit card ending 9015'], 'yes the card', 'one', [0], [], []),
+    (TURKISH, 'üçünü de cuma günü öderim', 'all', [0, 1, 2], [], []), (TURKISH, 'hepsini öderim', 'all', [0, 1, 2], [], []),
+    (TURKISH, 'kredi kartımı yarın öderim', 'one', [0], [], []),
+    (TURKISH, 'kredi kartını yarın öderim ama ihtiyaç kredisini ödemeyeceğim', 'one', [0], [1], []),
+    (TURKISH, 'taşıt kredisi değil, ihtiyaç kredisi', 'one', [1], [2], []),
+    (TURKISH, 'taşıt kredisi hariç hepsi', 'several', [0, 1], [2], []),
+    (TURKISH, 'hiçbirini ödeyemem', 'declined', [], [0, 1, 2], []), (TURKISH, 'ilkini öderim', 'one', [0], [], []),
+    (TURKISH, 'tamam yarın öderim', 'none', [], [], []),
+    (TURKISH, 'kredi kartini oderim digerlerini odeyemem', 'one', [0], [1, 2], []),
+    (TURKISH, 'kartı ödeyeceğim taşıt kredisini ödemeyeceğim', 'one', [0], [2], []),
+])
+def test_which_of_several_things_the_caller_names(names, said, kind, chosen, declined, unclear):
+    result = H['ctl_choice'](said, names)
+    assert (result['kind'], result['chosen'], result['declined'], result['unclear']) == (kind, chosen, declined, unclear)
+
+
+def test_code_that_compares_the_callers_words_with_fixed_text_is_rejected():
+    from builder.validation import review_code
+    words = {'pending_reference', 'reply_words'}
+    flagged = lambda code: [e for e in review_code(code, words, words) if 'compared with fixed text' in e]
+    assert len(flagged("ref = str(vars.get('pending_reference') or '').strip().lower()\nif ref in ['all', 'everything']:\n    vars['s'] = 'a'\nelif ref == 'loan':\n    vars['s'] = 'b'")) == 2
+    assert len(flagged("if 'full' in str(vars.get('reply_words') or '').lower():\n    vars['s'] = 'a'")) == 1
+    # Not flagged: an emptiness test, an enum, a helper's result, a name from the account data.
+    assert not flagged("ref = str(vars.get('pending_reference') or '')\nif ref == '' or not ref:\n    vars['s'] = 'a'")
+    assert not flagged("if vars.get('payment_reply') == 'accept':\n    vars['s'] = 'a'")
+    assert not flagged("r = ctl_choice(vars.get('reply_words'), ['a', 'b'])\nif r['kind'] == 'all':\n    vars['s'] = 'a'")
+    assert not flagged("p = dict()\nlabel = str(p.get('label') or '').lower()\nif label == 'credit card':\n    vars['s'] = 'a'")
+    stage = runtime.wrap(runtime.helpers_for({'ctl_choice'}), "vars['kind'] = ctl_choice(vars.get('reply_words'), ['a', 'b'])['kind']")
+    assert code_errors(stage, True) == [] and review_code(stage, words, words) == []

@@ -124,11 +124,14 @@ right on its own. The runtime reads the caller's words, in Turkish and in Englis
 | `ctl_digits` | Digits however they were said: one by one, in groups, as numerals; zeros kept |
 | `ctl_collect` | A number given in parts: keeps the parts, joins them, says when it is whole |
 | `ctl_amount` | An amount in words or digits as `1250.50`; `''` for a reference or two amounts |
+| `ctl_choice` | Which of several known things the words name: "all three", "the card", "not the car loan", üçünü de, taşıt kredisi hariç hepsi. Gives what was chosen, what was declined and what is unclear |
 
 What follows a correction word (pardon, yani, sorry, I mean) is read first. Extraction types `date`
 and `amount` are the controller's own: the caller's words are captured as said and converted in the
 first code stage after them, with `<name>_said` keeping the words. A code stage carries only the
 helpers it calls; with the whole block in every stage the compiled agent was a megabyte.
+Code that compares the caller's own words with fixed text (`==`, a list of phrases, a substring
+test) is a static error: "the credit card" is not "credit card".
 `agent/tests/test_speech.py` is the table of phrases. `docs/tickets/ticket-06.md` has the reasons.
 
 ## What the static checks cover

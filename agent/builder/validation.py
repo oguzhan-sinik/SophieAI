@@ -49,7 +49,37 @@ def _spoken_read(node):
     return None
 
 
-def review_code(compiled, spoken=()):
+SHAPING = {"strip", "lstrip", "rstrip", "lower", "upper", "casefold", "replace", "title"}
+
+
+def _words_read(node, words, held):
+    """The free-words variable an expression is: vars.get('x') under str(), .strip(), .lower() and `or ''`, or a
+    local name that was assigned exactly that."""
+    while True:
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            node = node.values[0]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str" and node.args:
+            node = node.args[0]
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in SHAPING:
+            node = node.func.value
+        else:
+            break
+    if isinstance(node, ast.Name):
+        return held.get(node.id)
+    variable = _spoken_read(node)
+    return variable if variable in words else None
+
+
+def _phrases(node):
+    """The fixed phrases an expression is: a text, or a list of texts."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value] if node.value.strip() else []
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return [e.value for e in node.elts if isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.strip()]
+    return []
+
+
+def review_code(compiled, spoken=(), words=()):
     """What is certain to go wrong in a code stage or hook, read from the code itself.
 
     `compiled` is the code as deployed: the model's own part is reviewed, and the controller helpers
@@ -61,7 +91,21 @@ def review_code(compiled, spoken=()):
     found = []
     present = {f.name for f in ast.walk(whole) if isinstance(f, ast.FunctionDef)}
     parents = {id(child): parent for parent in ast.walk(own) for child in ast.iter_child_nodes(parent)}
+    held = {}
     for node in ast.walk(own):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name) and _words_read(node.value, words, {}):
+            held[node.targets[0].id] = _words_read(node.value, words, {})
+    for node in ast.walk(own):
+        if isinstance(node, ast.Compare) and words:
+            sides = [node.left] + list(node.comparators)
+            for op, left, right in zip(node.ops, sides, sides[1:]):
+                for said, fixed in ((left, right), (right, left)):
+                    variable, phrases = _words_read(said, words, held), _phrases(fixed)
+                    whole = isinstance(op, (ast.Eq, ast.NotEq)) or (isinstance(op, (ast.In, ast.NotIn)) and (said is left) == isinstance(fixed, (ast.List, ast.Tuple, ast.Set)))
+                    if variable and phrases and whole:
+                        found.append(f"{variable} holds the caller's own words and is compared with fixed text ({', '.join(repr(p) for p in phrases[:3])}). Callers say it their "
+                                     f"own way ('the credit card', 'all three', 'both of them') and the comparison then fails. If {variable} is one of a list, give it "
+                                     f"enum_values and route on them; if it names one of several things, pass the words to ctl_choice(said, names) and use its result")
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id in HELPERS \
                 and any(isinstance(target, (ast.Tuple, ast.List)) for target in node.targets):
             names = max(len(target.elts) for target in node.targets if isinstance(target, (ast.Tuple, ast.List)))
@@ -247,6 +291,10 @@ def validate(workflow, contracts):
     edges = {key: [] for key in nodes}
     calls = {key: [] for key in nodes}
     spoken = {item.get("name") for node in nodes.values() for item in node.get("extraction_schema", [])}
+    # Variables that hold the caller's own words: text with no list of values, and not a day or an amount the controller converts.
+    listed = {item.get("name") for node in nodes.values() for item in node.get("extraction_schema", [])
+              if item.get("enum_values") or item.get("type") not in (None, "string") or runtime.SAID in str(item.get("description")) or runtime.SAID_AMOUNT in str(item.get("description"))}
+    words = spoken - listed
     for key, node in nodes.items():
         def bad(message):
             errors.append(f"{key}: {message}")
@@ -346,7 +394,7 @@ def validate(workflow, contracts):
                     if kind != "code":
                         bad("Code execution is supported only in code nodes")
                     errors.extend(f"{key}: {e}" for e in code_errors(props.get("code", {}).get("default", "")))
-                    errors.extend(f"{key}: {e}" for e in review_code(props.get("code", {}).get("default", ""), spoken))
+                    errors.extend(f"{key}: {e}" for e in review_code(props.get("code", {}).get("default", ""), spoken, words))
                     lines = len(runtime.strip(props.get("code", {}).get("default", "")).splitlines())
                     if lines > MAX_CODE_LINES:
                         warnings.append(f"{key}: this code stage has {lines} lines and decides several things behind one except, so one mistake closes the call for every case it handles. "
@@ -399,7 +447,7 @@ def validate(workflow, contracts):
                 for hook in ("pre_process_code", "post_process_code"):
                     if tool.get(hook):
                         errors.extend(f"{key}/{hook}: {e}" for e in code_errors(tool[hook], True))
-                        errors.extend(f"{key}/{hook}: {e}" for e in review_code(tool[hook], spoken))
+                        errors.extend(f"{key}/{hook}: {e}" for e in review_code(tool[hook], spoken, words))
     # Interrupts are routes too; a global handler must not slip past a check.
     for key in normal:
         for target, node in global_nodes.items():

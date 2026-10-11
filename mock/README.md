@@ -45,6 +45,13 @@ Check it once it is up:
 curl https://freya-bank-mock.<your-subdomain>.workers.dev/health
 ```
 
+```bash
+python3 mock/smoke.py https://freya-bank-mock.<your-subdomain>.workers.dev
+```
+
+The second runs a whole call, two calls at once, a service fault and all 53 practice customers
+against the deployed mock.
+
 ## Practice cases of your own
 
 The organisers' practice bank knows its own thirteen customers and answers "unknown practice case"

@@ -1,6 +1,6 @@
 # Ticket 06 — The caller speaks like a person, in Turkish
 
-Status: built and run live twice, 11 October 2026, 16:40 UTC; section 12 lists what is open. First written
+Status: built and run live three times, 11 October 2026, 17:10 UTC; section 12 lists what is open. First written
 14:40 UTC; rewritten 15:00 UTC around what the organisers said about how callers talk.
 
 Sources: the official page as it reads today (`freyavoice.ai/hackathon`, tabs Overview, Evaluation,
@@ -41,6 +41,7 @@ model call has to get it right:
 | H2 | Corrections | "yirmi bir, pardon, yirmi"; "the 21st, sorry, I mean the 20th"; "evet ama cumaya" after a read-back | The corrected value wins. A correction after a read-back voids the earlier yes: new read-back, new yes | Every helper reads what follows the last correction word first; `ctl_proposal` gives each changed tuple a new revision; the read-back rule |
 | H3 | Talk about other things | "geçen hafta on yedi lira kırk kuruş ödedim"; "kuzenimin düğünü ayın otuzunda" | A number or a day in a story is not a proposal. The pending question is asked again | Controller-written extraction text for days and amounts ("only the value the caller proposes here"); `ctl_amount` takes the number that carries the currency; the resume rule |
 | H4 | A question back | "bunu neden soruyorsunuz?"; "hangi hesap için?"; "robot musunuz?" | One safe line of answer, then the same question again. It is no answer, no refusal and no consent, and it costs no attempt | Reply categories with their own value for a question; `ctl_collect` leaves the kept part untouched when a reply holds no digits |
+| H6 | One of several things (seen live on Brief B, not in what we were told) | "I can pay all three this Friday"; "the credit card tomorrow, but not the personal loan or the car loan"; "üçünü de öderim"; "taşıt kredisi hariç hepsi" | Every thing the reply names gets the reply's day and amount. What it declines is not lost and not asked as if nothing was said. "Which one?" only when one mention fits two things | `ctl_choice` gives chosen, declined and unclear positions; a static check rejects code that compares the caller's words with fixed text; design rule 6 |
 | H5 | Amounts and dates in words | "bin iki yüz elli lira elli kuruş"; "1.250,50 TL"; "ayın yirmi altısında"; "haftaya salı"; "four hundred and fifty-five" | The same value as in digits, to the cent and to the day, against the call's `now` | `ctl_amount`, `ctl_date`; extraction types `amount` and `date` are captured as the caller's words and converted in code, never by the extraction model |
 
 More behaviours, seen in the kit's styles, the stress personas and live failures:
@@ -186,7 +187,7 @@ account: `npx wrangler login`, `npx wrangler deploy`.
 - Tool contracts with path or query parameters stop the build with a named error.
 - Times of day in words ("öğleden sonra üçte").
 
-## 12. Status (11 October 2026, 16:40 UTC)
+## 12. Status (11 October 2026, 17:10 UTC)
 
 Built and checked here:
 
@@ -239,7 +240,33 @@ with Turkish-speaking callers):
   answers. `mock/make_fixtures.py` writes fixtures and `mock/practice-cases.json`; the mock serves the
   kit runner's session and ledger routes; `build.py ... <mock_url> --cases mock/practice-cases.json`
   runs the cases tagged for the brief (31 for A, 22 for B) against the mock, labelled `generated`.
-- Not run yet: it needs the mock deployed.
+- The mock is deployed at `https://freya-bank-mock.ogzdlk06.workers.dev` (17:15 UTC). `mock/smoke.py` passes
+  25 of 25 checks against it: a whole call, two calls at once kept apart by the call id, a service
+  fault, and session, identity and account for all 53 customers. The slowest service call took 1.1 s.
+
+After that run, 16:45 to 16:57 UTC. The transcripts of PUB-11 and PUB-12 showed one cause behind both
+failures: the design's own code compared the caller's words with fixed strings. "All three" was not in
+its list and "the credit card" was not "credit card", so both replies went to a "which product?"
+stage. There the agent's model improvised (asked for an amount, said "I have recorded your promise"
+with nothing written, said goodbye about twenty times) until the loop guard left through the refusal
+route and three `refused` notes were written. Changed:
+
+- `ctl_choice(said, names)`: which of several known things a reply names, in English and Turkish,
+  with what was declined in the same reply and what is unclear (H6 in section 2).
+- A static check: code that compares a free-words extraction variable with fixed text is an error.
+  It flags exactly the two comparisons of that design and nothing in the 10 of 10 Brief A design.
+- Design rules: item 6 of HUMAN SPEECH; a yes at the read-back that repeats a stated value is the
+  confirmation; the stage after an agreement that is written later gives the agent a true
+  acknowledgement.
+
+Third live test, 16:57 to 17:09 UTC, Briefs A and B again, run `20261011T175718_1bb1aae6`:
+
+- **3 of 3 on the first design**, in 11.5 minutes with one simulation. The design calls `ctl_choice`
+  in two code stages (choosing products from a reply, reading the confirmation). Its only static
+  errors were four stages without a default route, repaired by one fix call.
+- PUB-11 wrote three promises, PUB-12 one promise and two `refused` notes, PUB-13 two promises.
+- One rule was added after this build started and has not been in a build: the agent never says
+  goodbye outside a closing stage.
 
 Open:
 

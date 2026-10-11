@@ -761,6 +761,212 @@ def ctl_amount(said):
         return str(cents // 100) + "." + ("0" + str(cents % 100))[-2:]
     except Exception:
         return ""
+
+
+# One of several things. Words for every one of them, for the ones not named, and for a no.
+CTL_ALL = (r"\b(?:all|both|everything|every one|each|hepsi(?:n[ie]|nin|nde)?|tumu(?:n[ue]|nun)?|ikisi(?:n[ie]|nin)?"
+           r"|ucu(?:n[ue]|nun)?|her biri(?:n[ie])?)\b")
+CTL_REST = (r"\b(?:the rest|the others?|other (?:two|three|ones?)|remaining ones?|digerleri(?:n[ie])?|digerini|gerisi(?:n[ie])?"
+            r"|kalanlar[iu]?|geri kalan\w*)\b")
+# English says no before the thing ("not the loan"), Turkish after it ("krediyi odemeyecegim", "kredi degil").
+CTL_NOT_AFTER = r"\b(?:not|no|never|neither|nor|without|except)\b"
+CTL_NOT_BEFORE = (r"\b(?:degil|haric|disinda|haricinde|\w+m[ae]y[ae]c[ae]\w*|\w+m[iu]yor\w*|\w{2,}[ae]m[ae]m|\w+m[ae]y[iu]z"
+                  r"|istemem|vermem|yapmam|yatirmam)\b")
+CTL_LEAVE_OUT = r"\b(?:except|haric|disinda|haricinde)\b"
+CTL_NONE = r"\b(?:none|neither|hicbiri\w*)\b"
+# A yes said with a verb ends the reach of a no in a reply without punctuation.
+CTL_WILL = (r"\b(?:i will|i can|i would|i could|i am going to|i want to|i pay|let me|\w+[ae]c[ae]g[iu]m|\w+[iu]yorum"
+            r"|\w+[ae]bilirim|\w{2,}[aeiu]rim|\w+[ae]c[ae]g[iu]z)\b")
+# "all" that is about an amount or about nothing: no choice of things.
+CTL_NO_CHOICE = (r"\b(?:it all|all of (?:it|that)|at all|all right|after all|that is all|that all|thats all|is all|first of all"
+                 r"|above all|all the time|all day)\b")
+CTL_TAKE_BACK = (r"\b(?:no wait|wait no|i mean|i meant|scratch that|make that|ozur dilerim|daha dogrusu|sorry|correction|pardon"
+                 r"|duzeltiyorum|duzelteyim|yanlis|affedersiniz)\b")
+CTL_NAME_FILL = ["the", "a", "an", "my", "your", "our", "this", "that", "of", "for", "ending", "in", "with", "number", "one",
+                 "and", "or", "ile", "biten", "sonu", "son", "hane", "haneli", "numarali", "nolu", "olan", "ve", "veya"]
+CTL_ORDER = [r"first one|ilki\w*|birincisi\w*", r"second one|ikincisi\w*", r"third one|ucuncusu\w*",
+             r"fourth one|dorduncusu\w*", r"fifth one|besincisi\w*"]
+CTL_LAST = r"last one|sonuncu\w*"
+
+
+def ctl_name_tokens(name):
+    """The words of a name that tell it apart: plain lower-case words and numbers, without the filler words."""
+    found = re.findall(r"[a-z]+|[0-9]+", ctl_fold(name).replace("_", " "))
+    return [tok for tok in found if tok not in CTL_NAME_FILL]
+
+
+def ctl_same_word(said, name, turkish):
+    """True when a word the caller said is the word of a name: the same word, an English plural, or in Turkish
+    the same stem under another ending (karti, kartimi, kartin)."""
+    if said == name:
+        return True
+    if said.isdigit() or name.isdigit():
+        return False
+    if said in (name + "s", name + "es") or name == said + "s":
+        return True
+    short = min(len(said), len(name))
+    if not turkish or short < 4:
+        return False
+    same = 0
+    while same < short and said[same] == name[same]:
+        same += 1
+    return same >= max(4, short - 2) and max(len(said), len(name)) - same <= 5
+
+
+def ctl_said_no(at, after, before, will):
+    """True when the word at this place in a clause is said with a no: an English no before it, or a Turkish
+    one after it, with no new yes in between."""
+    for start in after:
+        if start < at and not [w for w in will if start < w < at]:
+            return True
+    later = [start for start in before if start > at]
+    if later and not [w for w in will if at < w < min(later)]:
+        return True
+    return False
+
+
+def ctl_choice_read(text, names, turkish):
+    """Which of the names the words choose, decline or leave unclear: three lists of positions."""
+    count = len(names)
+    text = re.sub(CTL_NO_CHOICE, " ", text)
+    text = re.sub(r"\b(all|everything|both)\s+but\b", r"\1 except", text)
+    text = re.sub(r"^\s*(?:(?:no|hayir|yok|yes|yeah|evet|ok|okay|tamam|well|peki)\b[\s,.!]*)+", "", text)
+    state = dict()
+    unclear = []
+    rest = 0
+    for clause in re.split(r"[.;,!?]|\b(?:but|however|though|ama|fakat|ancak|yalniz)\b", text):
+        words = re.findall(r"[a-z]+|[0-9]+", clause)
+        if not words:
+            continue
+        if words in (["no"], ["hayir"], ["yok"]):
+            # A bare no after something was named takes it back: "the card, no, the loan".
+            for key in list(state):
+                if state[key] == 1:
+                    del state[key]
+            continue
+        joined = " " + " ".join(words) + " "
+        offsets = []
+        at = 1
+        for word in words:
+            offsets.append(at)
+            at += len(word) + 1
+        after = [found.start() for found in re.finditer(CTL_NOT_AFTER, joined)]
+        before = [found.start() for found in re.finditer(CTL_NOT_BEFORE, joined)]
+        will = [found.start() for found in re.finditer(CTL_WILL, joined) if found.start() not in before]
+        if words[-1] in ("no", "not") and len(words) > 1:
+            # "the rest no": a no at the end is about the whole clause.
+            after = [0]
+            will = []
+        named = dict()
+        loose = []
+        used = []
+        for index in range(len(words)):
+            word = words[index]
+            holders = [i for i in range(count) if word in names[i]]
+            if not holders:
+                holders = [i for i in range(count) if [tok for tok in names[i] if ctl_same_word(word, tok, turkish)]]
+            if not holders:
+                continue
+            used.append(index)
+            if len(holders) == 1:
+                if holders[0] not in named:
+                    named[holders[0]] = offsets[index]
+            else:
+                loose.append([offsets[index], holders])
+        for rank in range(len(CTL_ORDER) + 1):
+            place = rank if rank < len(CTL_ORDER) else count - 1
+            found = re.search(r"\b(?:" + (CTL_ORDER[rank] if rank < len(CTL_ORDER) else CTL_LAST) + r")\b", joined)
+            if found and place < count and place not in named:
+                named[place] = found.start()
+        if not named:
+            # A number of a name said in words: "the one ending nine zero one five".
+            left = " ".join([words[i] for i in range(len(words)) if i not in used and (words[i] == "one" or words[i] not in CTL_NAME_FILL)])
+            digits = ctl_digit_words(left, turkish) if left else ""
+            if len(digits) >= 2:
+                holders = [i for i in range(count) if [tok for tok in names[i] if tok.isdigit() and (tok.endswith(digits) or digits.endswith(tok))]]
+                if len(holders) == 1:
+                    named[holders[0]] = offsets[0]
+        every = re.search(CTL_ALL, joined)
+        nothing = re.search(CTL_NONE, joined)
+        some = re.search(r"\bany\b", joined)
+        if not every and nothing:
+            every = nothing
+        elif not every and some and ctl_said_no(some.start(), after, before, will):
+            every = some
+        grouped = False
+        for item in loose:
+            if [i for i in item[1] if i in named]:
+                continue
+            if every:
+                # "both loans": every one that has this word.
+                grouped = True
+                for i in item[1]:
+                    state[i] = -1 if nothing or ctl_said_no(item[0], after, before, will) else 1
+            else:
+                for i in item[1]:
+                    if i not in unclear:
+                        unclear.append(i)
+        for i in named:
+            state[i] = -1 if ctl_said_no(named[i], after, before, will) else 1
+        if every and not grouped and (not named or re.search(CTL_LEAVE_OUT, joined)):
+            value = -1 if nothing or ctl_said_no(every.start(), after, before, will) else 1
+            for i in range(count):
+                if i not in named:
+                    state[i] = value
+        others = re.search(CTL_REST, joined)
+        if others:
+            rest = -1 if ctl_said_no(others.start(), after, before, will) else 1
+    for i in range(count):
+        if rest and i not in state and i not in unclear:
+            state[i] = rest
+    return [[i for i in range(count) if state.get(i) == 1], [i for i in range(count) if state.get(i) == -1],
+            [i for i in range(count) if i in unclear and i not in state]]
+
+
+def ctl_choice(said, options):
+    """Which of several known things the caller's words name. options has one entry for each thing, in a fixed
+    order: its name as the agent says it, or a list of its names (its type, its label, its card ending).
+    Returns a dict. chosen, declined and unclear are lists of positions in options: what the caller picks,
+    what the caller says no to in the same reply, and what one unclear mention could mean ("the loan" with two
+    loans). kind is one, several, all, declined (only a no), unclear or none (nothing named).
+    Reads "all three", "both", "both loans", "the first one", "the card ending 9015", "everything except the
+    car loan", "the card yes, the rest no", and the Turkish forms. What follows a correction is read first."""
+    result = dict(kind="none", chosen=[], declined=[], unclear=[])
+    try:
+        names = []
+        labels = []
+        for option in list(options or []):
+            tokens = []
+            for alias in (option if isinstance(option, (list, tuple)) else [option]):
+                labels.append(str(alias))
+                for tok in ctl_name_tokens(alias):
+                    if tok not in tokens:
+                        tokens.append(tok)
+            names.append(tokens)
+        if not names:
+            return result
+        whole = str(said or "")
+        turkish = ctl_turkish(whole) or ctl_turkish(" ".join(labels))
+        text = ctl_fold(whole).replace("n't", " not").replace("cannot", "can not")
+        text = re.sub(r"'\w*", " ", text)
+        cut = -1
+        for found in re.finditer(CTL_TAKE_BACK, text):
+            cut = found.end()
+        read = ctl_choice_read(text[cut:], names, turkish) if cut >= 0 else [[], [], []]
+        if not (read[0] or read[1] or read[2]):
+            read = ctl_choice_read(text, names, turkish)
+        result["chosen"] = read[0]
+        result["declined"] = read[1]
+        result["unclear"] = read[2]
+        if read[2]:
+            result["kind"] = "unclear"
+        elif read[0]:
+            result["kind"] = "all" if len(read[0]) == len(names) and len(names) > 1 else ("one" if len(read[0]) == 1 else "several")
+        elif read[1]:
+            result["kind"] = "declined"
+    except Exception:
+        pass
+    return result
 '''
 
 DATE_HELPERS += SPEECH_HELPERS
