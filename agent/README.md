@@ -68,9 +68,13 @@ configuration, 3 no workflow Freya accepts, 4 export failure.
    it expands the tools from the tool API file, wraps the code, and injects the runtime support
    (spoken-date resolution against the call's `now`, business-day helpers, a loop guard).
    Models only ever see and edit the source.
-3. **Compiler fixes.** Static checks and a Freya dry run produce errors that each name the stage
-   to change. Up to two fix calls answer them. If no candidate is clean, the least-flawed one
-   Freya accepts is exported as best effort.
+3. **Compiler fixes and design review.** Static checks and a Freya dry run produce errors that
+   each name the stage to change. The same pass reviews the design for what would otherwise only
+   show in a call: a conversion of a value the caller may not have given and a controller helper
+   called wrongly are errors. A stage that extracts more than five values from one reply and a
+   code stage of more than 120 lines are hints only: forcing a rewrite of a working design lost
+   customers when tried. Up to three fix calls answer the errors. If no candidate is clean, the
+   least-flawed one Freya accepts is exported as best effort.
 4. **Measure.** Where practice customers exist (the kit's Brief A and B), the agent is deployed
    and simulated once; the kit's own runner and scorer give the verdicts.
 5. **Improve.** A chain of rounds. One fix call reads the failed calls step by step and returns

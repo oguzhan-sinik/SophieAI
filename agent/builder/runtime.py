@@ -72,29 +72,44 @@ def ctl_numbers(tokens):
     return found
 
 
-def ctl_years(tokens, numbers, after):
-    """Years the phrase states: in digits anywhere, or in words after position `after`
-    (nineteen eighty eight, one nine eight eight, two thousand and five)."""
-    found = [n[0] for n in numbers if 1900 <= n[0] <= 2100]
+def ctl_year_spans(tokens, numbers, after):
+    """[year, first token, token after its last] for each year the phrase states: in digits anywhere,
+    or in words after position `after` (nineteen eighty eight, one nine eight eight, two thousand and five)."""
+    found = [[n[0], n[2], n[3]] for n in numbers if 1900 <= n[0] <= 2100]
     plain = [n for n in numbers if not n[1] and n[2] > after]
     for pos in range(len(plain) - 1):
         first = plain[pos]
         second = plain[pos + 1]
         gap = tokens[first[3]:second[2]]
+        year = None
         if first[0] in (19, 20) and not gap and 10 <= second[0] <= 99:
-            found.append(first[0] * 100 + second[0])
+            year = first[0] * 100 + second[0]
         elif first[0] in (19, 20) and gap in (["oh"], ["o"]) and 1 <= second[0] <= 9:
-            found.append(first[0] * 100 + second[0])
+            year = first[0] * 100 + second[0]
         elif first[0] in (1, 2) and gap in (["thousand"], ["thousand", "and"]) and second[0] <= 99:
-            found.append(first[0] * 1000 + second[0])
+            year = first[0] * 1000 + second[0]
+        if year is not None:
+            found.append([year, first[2], second[3]])
     digits = [CTL_UNITS.index(tok) if tok in CTL_UNITS[:10] else (0 if tok in ("oh", "o") else None) for tok in tokens]
     for pos in range(max(after + 1, 0), len(tokens) - 3):
         run = digits[pos:pos + 4]
         if None not in run:
-            found.append(run[0] * 1000 + run[1] * 100 + run[2] * 10 + run[3])
+            found.append([run[0] * 1000 + run[1] * 100 + run[2] * 10 + run[3], pos, pos + 4])
     if not found and "thousand" in tokens[max(after + 1, 1):] and tokens[tokens.index("thousand") - 1] == "two":
-        found.append(2000)
-    return [year for year in found if 1900 <= year <= 2100]
+        found.append([2000, tokens.index("thousand") - 1, tokens.index("thousand") + 1])
+    return [span for span in found if 1900 <= span[0] <= 2100]
+
+
+def ctl_years(tokens, numbers, after):
+    return [span[0] for span in ctl_year_spans(tokens, numbers, after)]
+
+
+def ctl_month(tok):
+    """1-12 for a month name or its three- or four-letter short form, else 0."""
+    for index, name in enumerate(CTL_MONTHS):
+        if tok == name or (len(tok) >= 3 and tok != "may" and name.startswith(tok) and tok in (name[:3], name[:4])):
+            return index + 1
+    return 0
 
 
 def ctl_build(year, month, day):
@@ -119,9 +134,8 @@ def ctl_date(said, call_now, next_weekday="following_week"):
         numbers = ctl_numbers(tokens)
         month = None
         for pos, tok in enumerate(tokens):
-            for index, name in enumerate(CTL_MONTHS):
-                if tok == name or (len(tok) >= 3 and tok != "may" and name.startswith(tok) and tok in (name[:3], name[:4])):
-                    month = [index + 1, pos]
+            if ctl_month(tok):
+                month = [ctl_month(tok), pos]
         days = [n for n in numbers if 1 <= n[0] <= 31]
         near = []
         if month:
@@ -251,40 +265,70 @@ HUMAN_HELPERS = r'''
 import json
 
 
-def ctl_digits(said):
+def ctl_digits(said, count=0):
+    """Digits said one by one, in order, zeros kept ('zero three five eight', 'double four seven one').
+    '' when any other word is among them: a wrong security answer costs an attempt, asking again does not.
+    With count, the last count digits when more were said: a whole number given for 'the last four',
+    or a second answer that follows a first one in the same words."""
     tokens = re.findall(r'[a-z]+|[0-9]+', str(said or '').lower())
     parts = []
+    repeat = 1
     for token in tokens:
+        if token in ('double', 'triple') and repeat == 1:
+            repeat = 2 if token == 'double' else 3
+            continue
         if token.isdigit():
-            parts.append(token)
+            digit = token
         elif token in CTL_UNITS[:10]:
-            parts.append(str(CTL_UNITS.index(token)))
+            digit = str(CTL_UNITS.index(token))
         elif token in ('oh', 'o'):
-            parts.append('0')
-        elif token not in ('and',):
+            digit = '0'
+        elif token == 'and' and repeat == 1:
+            continue
+        else:
             return ''
-    return ''.join(parts)
+        parts.append(digit * repeat)
+        repeat = 1
+    digits = ''.join(parts) if repeat == 1 else ''
+    try:
+        wanted = int(count or 0)
+    except Exception:
+        wanted = 0
+    return digits[-wanted:] if 0 < wanted < len(digits) else digits
 
 
 def ctl_identity_date(said):
-    """Identity has no default year: require one explicitly spoken birth/security year."""
-    text = str(said or '').lower()
-    exact = re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', text.strip())
-    if exact:
-        try:
-            return datetime.date.fromisoformat(text.strip()).isoformat()
-        except Exception:
-            return ''
-    tokens = re.findall(r'[a-z]+|[0-9]+', text)
-    numbers = ctl_numbers(tokens)
-    months = [i for i,t in enumerate(tokens) if t in CTL_MONTHS]
-    if len(months) != 1:
+    """Identity has no default: the words must state one day, one month and one year, or the result is ''.
+    When an earlier answer is still in front of a later one (a wrong date, then another; a correction),
+    the latest complete date is the answer."""
+    try:
+        text = str(said or '').lower()
+        exact = re.findall(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', text)
+        if exact:
+            return datetime.date.fromisoformat(exact[-1]).isoformat()
+        tokens = re.findall(r'[a-z]+|[0-9]+', text)[-60:]
+        for start in range(len(tokens)):
+            part = tokens[start:]
+            months = [i for i, t in enumerate(part) if ctl_month(t)]
+            if len(months) != 1:
+                continue
+            spans = ctl_year_spans(part, ctl_numbers(part), months[0])
+            if len(set(span[0] for span in spans)) != 1:
+                continue
+            # Words cut off at the front may leave the year of the earlier answer standing before a
+            # later day and month: only a year said after the month belongs to this date.
+            late = [span for span in spans if span[1] > months[0]]
+            if start and not late:
+                continue
+            span = late[0] if late else spans[0]
+            # The day is read from the words outside the year: "March nineteen eighty eight" names none.
+            rest = part[:span[1]] + part[span[2]:]
+            found = ctl_date(' '.join(rest) + ' ' + str(span[0]), str(span[0]) + '-01-01')
+            if found:
+                return found
         return ''
-    years = set(ctl_years(tokens, numbers, months[0]))
-    if len(years) != 1:
+    except Exception:
         return ''
-    year = next(iter(years))
-    return ctl_date(text, str(year) + '-01-01')
 
 
 def ctl_slot(values, name, value, raw, complete, turn, correction=False):
@@ -294,10 +338,9 @@ def ctl_slot(values, name, value, raw, complete, turn, correction=False):
     values[name + '_complete'] = 'yes' if complete and value not in (None, '') else 'no'
     if correction:
         values[name + '_revision'] = str(int(values.get(name + '_revision', '0')) + 1)
-    if values[name + '_complete'] == 'yes':
-        values[name] = str(value)
-    else:
-        values.pop(name, None)
+    # Assigned, never removed: only what a snippet assigns reaches the platform, so a removed key
+    # would leave the earlier complete value routable. '' is "not given" throughout these rules.
+    values[name] = str(value) if values[name + '_complete'] == 'yes' else ''
     return values[name + '_complete'] == 'yes'
 
 
@@ -311,10 +354,19 @@ def ctl_cents(amount):
     return str(cents) if cents > 0 else ''
 
 
+def ctl_records(values):
+    """The saved proposals; {} when the state is missing or damaged, so damage never counts as consent."""
+    try:
+        records = json.loads(values.get('ctl_proposals') or '{}')
+        return dict((key, record) for key, record in records.items() if isinstance(record, dict))
+    except Exception:
+        return {}
+
+
 def ctl_proposal(values, product, amount, day):
     """Each changed tuple creates a revision and invalidates only its own consent."""
     try:
-        records = json.loads(values.get('ctl_proposals', '{}'))
+        records = ctl_records(values)
         cents = ctl_cents(amount)
         parsed = datetime.date.fromisoformat(str(day)).isoformat()
         if not cents or not product:
@@ -332,26 +384,35 @@ def ctl_proposal(values, product, amount, day):
 
 
 def ctl_invalidate(values, product):
-    records = json.loads(values.get('ctl_proposals', '{}'))
-    if product in records:
-        records[product]['agreed'] = 0
-    values['ctl_proposals'] = json.dumps(records)
+    try:
+        records = ctl_records(values)
+        if isinstance(records.get(product), dict):
+            records[product]['agreed'] = 0
+        values['ctl_proposals'] = json.dumps(records)
+    except Exception:
+        values['ctl_proposals'] = '{}'
 
 
 def ctl_consent(values, product, revision, explicit):
-    records = json.loads(values.get('ctl_proposals', '{}'))
-    proposal = records.get(product, {})
-    matched = explicit is True and str(proposal.get('revision', '')) == str(revision)
-    if matched:
-        proposal['agreed'] = proposal['revision']
-        values['ctl_proposals'] = json.dumps(records)
-    return matched
+    try:
+        records = ctl_records(values)
+        proposal = records.get(product, {})
+        matched = explicit is True and bool(proposal.get('revision')) and str(proposal['revision']) == str(revision)
+        if matched:
+            proposal['agreed'] = proposal['revision']
+            values['ctl_proposals'] = json.dumps(records)
+        return matched
+    except Exception:
+        return False
 
 
 def ctl_write_ready(values, product, amount, day):
-    proposal = json.loads(values.get('ctl_proposals', '{}')).get(product, {})
-    return bool(proposal.get('revision') and proposal.get('agreed') == proposal.get('revision')
-                and proposal.get('cents') == ctl_cents(amount) and proposal.get('date') == str(day))
+    try:
+        proposal = ctl_records(values).get(product, {})
+        return bool(proposal.get('revision') and proposal.get('agreed') == proposal.get('revision')
+                    and proposal.get('cents') == ctl_cents(amount) and proposal.get('date') == str(day))
+    except Exception:
+        return False
 '''
 
 DATE_HELPERS += HUMAN_HELPERS

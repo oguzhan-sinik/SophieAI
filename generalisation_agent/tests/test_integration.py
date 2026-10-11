@@ -86,17 +86,20 @@ def test_official_ranking_is_separate_and_only_calibrated_exact_hash_can_veto():
     assert provider.bind(None, []) == (None, [])
 
 
-def test_lock_failure_never_enters_mutation_body(monkeypatch, work):
+def test_lock_failure_leaves_only_the_export_reserve(monkeypatch, work):
     @contextmanager
     def no_lock(*args): yield False
     monkeypatch.setattr("agent.builder.freya_adapter.file_lock", no_lock)
     adapter = FreyaAdapter.__new__(FreyaAdapter)
-    adapter.deadline = Deadline(60)
+    adapter.deadline = Deadline(60, 10)
     adapter.runtime = work
     adapter.trace = SimpleNamespace(event=lambda *a, **k: None)
-    with pytest.raises(TimeoutError, match="Workspace lock"):
-        with adapter.workspace():
-            raise AssertionError("Must not deploy or simulate without lock")
+    with adapter.workspace():
+        # Nothing may be deployed for testing or simulated without the lock ...
+        assert adapter.deadline.remaining() == 0
+        with pytest.raises(TimeoutError): adapter.deadline.require()
+        # ... but a finished design keeps its reserve for one verified export.
+        assert adapter.deadline.remaining(export=True) > 5
 
 
 class FakeAdapter:
@@ -135,12 +138,13 @@ def fixture_builder(work, provider):
     return builder
 
 
-def test_all_vetoed_build_retains_tested_export_without_submission(work):
+def test_all_vetoed_build_still_exports_and_says_so(work):
     builder = fixture_builder(work, FixtureProvider(veto=True))
     result = builder.run()
-    assert result["status"] == "failed" and result["export_path"] is None
-    assert "No eligible candidate" in result["error"]
-    assert builder.exports and not (work / "out").exists()
+    # An agent with a known flaw can pass customers; no agent passes none.
+    assert result["status"] == "exported_vetoed" and result["export_path"] and result["candidate_id"] == result["root_candidate_id"]
+    assert builder.exports and list((work / "out").glob("*.workflow.json"))
+    assert "vetoed_export" in (builder.root / "build_trace.log").read_text()
 
 
 def test_tested_candidate_exports_at_its_own_hash(work):
@@ -172,7 +176,8 @@ def test_higher_official_score_can_be_vetoed_without_score_merging():
     builder.evaluation_provider = SimpleNamespace(vetoed=lambda workflow_hash: workflow_hash in rejected)
     assert builder.champion("a") == "b"
     rejected.add(digest({"candidate": "b"}))
-    assert builder.champion("a") is None
+    # With every candidate vetoed the best of them is still the export; run() reports it as vetoed.
+    assert builder.champion("a") == "a"
 
 
 def test_local_adapter_exports_compiled_json_without_platform_claims(work):

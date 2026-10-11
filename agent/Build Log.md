@@ -121,3 +121,47 @@ All implementation, test outputs, dependencies and runtime artifacts stay in `ag
   calls; a fix that only stood on a blamed one was reported as kept; a year said in words was
   replaced by the call's year; and a brief from outside the kit was silently built against the
   kit's tool API when none was given.
+
+## Batch 12 — Review of the merged extension branch
+
+- The branch with the generalisation extension changed the plain builder too. Replaying the saved
+  designs showed the stricter identity check rejecting designs that had passed and, in one case,
+  scored 10 of 10: it accepted four words only, while the rules still allowed any derived status.
+  The check now accepts `equals` against any value that does not mean failure, and the rules and
+  the error message state exactly that.
+- The design's output allowance is back at the default; 32,000 was below designs already seen.
+  Every provider route now asks for JSON: a strict schema where one can be expressed, JSON mode
+  otherwise. Before, the three builder schemas got no enforcement at all on OpenRouter.
+- One rule for dates of birth: captured as words, converted with `ctl_identity_date`, bound from
+  there. The helper reads short month names and never takes the words of a year for a day.
+  `ctl_slot` assigns `''` instead of removing a key, and the consent helpers no longer raise on
+  damaged state.
+- A held lock ends the working budget but keeps the export; a plain build checks only the keys of
+  its own roles; a build whose candidates are all vetoed exports the best one as `exported_vetoed`.
+
+## Batch 13 — A design review before any customer is called
+
+- A 31-stage design scored 7 of 10. Replaying its three failed calls through its own code showed
+  why: one 243-line code stage converted an amount the caller had named as "the full amount"
+  (no number, so the conversion failed and the stage's except closed two calls as a service
+  error), and one conversation stage read nine values from every reply, with reply categories
+  that overlapped. Every slow agent turn of the run, 20 to 42 seconds, was in that stage.
+- The static pass now reviews each design for these before deployment: an untested conversion of
+  a caller-filled value, a controller helper called with the wrong arguments or unpacked, more
+  than five extracted values in a stage, more than 120 lines in a code stage. Findings go to the
+  fix call as compiler problems, which now gets three attempts.
+- The design rules say the same up front: one decision per code stage, at most five extracted
+  values per reply, a referenced amount or day is taken from what the stage offered, every enum
+  value is described and the specific reading wins over the general one.
+- Tried live on the 7-of-10 design, the review got all six findings fixed in one patch (32 to 39
+  stages, longest code stage 243 to 87 lines), and the rewritten agent then lost customers it had
+  passed: an accepted offer closed as refused, a promise dated today instead of the named Friday,
+  and longer chains of silent stages that kept callers waiting. The two shape findings are hints
+  now; the conversion and helper findings stay errors, since their fix is one local edit.
+- The judge failed a customer for the greeting's "this call is recorded" against a check that
+  forbids "recorded" before a successful write. The rules now reserve such a word and reword the
+  earlier sentence.
+- Persona diagnostics were invisible in the dashboard: their results stayed in a private folder,
+  only model-call counts were published, and in a live build the persona pass reported the
+  official folder's name, so the official results were shown twice. Tests that replay the public
+  practice scripts are now mirrored for the dashboard and shown as their own "Persona test".

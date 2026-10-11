@@ -47,6 +47,8 @@ TIER_ROLES = {
     "easy": ("synthetic_customer_listener", "synthetic_customer",
              "proxy_router", "proxy_dialogue", "proxy_extractor"),
 }
+# The roles of a plain build. Everything else belongs to the generalisation extension.
+BUILDER_ROLES = ("BriefAnalystAgent", "ADASDesignerAgent", "FixAgent")
 TIER_DEFAULTS = {"medium": "openrouter/openai/gpt-6-luna-pro",
                  "easy": "openrouter/deepseek/deepseek-v4.1-flash"}
 
@@ -121,11 +123,15 @@ PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "dou
                  "gemini/": ("GOOGLE_API_KEY",), "gemini-": ("GOOGLE_API_KEY",), "openai/": ("OPENAI_API_KEY",)}
 
 
-def missing_credentials(cfg):
-    """Names (never values) of required keys that are unset for this configuration."""
+def missing_credentials(cfg, roles=None):
+    """Names (never values) of required keys that are unset for this configuration.
+
+    Every tier's provider is covered unless `roles` names the only roles that will run: a plain
+    build calls three, and must not be refused for the key of a model it never uses."""
     need = {"FREYA_API_KEY", "FREYA_BANK_TEAM_KEY"}
+    models = {cfg.role_model(role) for role in roles} if roles else set(cfg.models.values())
     for prefix, keys in PROVIDER_KEYS.items():
-        if any(model.startswith(prefix) for model in set(cfg.models.values())):
+        if any(model.startswith(prefix) for model in models):
             need |= set(keys)
     return sorted(key for key in need if not os.getenv(key, "").strip())
 

@@ -38,7 +38,8 @@ classification and the generated workflow's `proxy_router`/`proxy_dialogue`/`pro
 nodes use `openrouter/deepseek/deepseek-v4.1-flash`. `MODEL_TIER_HARD/MEDIUM/EASY` replace a
 tier; `ROLE_MODELS=role=model,...` pins single roles. The defaults require `OPENROUTER_API_KEY`
 even when `BUILDER_MODEL` points at another provider — the credential check fails closed before
-any run. Calibration, suite identity and frozen manifests fingerprint the whole tier map, so
+any run of this extension. A plain build (`agent/agent_builder.py`, or `build` with the extension
+off) calls only the three builder roles and checks only their keys. Calibration, suite identity and frozen manifests fingerprint the whole tier map, so
 changing one tier's model invalidates prior admission exactly as changing the single model did.
 Each `model_usage` event records the serving model, so per-tier token totals are visible in the
 trace and dashboard.
@@ -100,7 +101,7 @@ The mock resolves operation URLs/methods/references through the existing contrac
 
 Calibration runs twelve positive/negative controls, including compliant and incorrect compiled identity controllers with the configured extractor and scripted control utterances. Each negative must detect its intended critical rule. Two blind transcript readings must agree; quotes must be real. Triggered obligations cannot be waived as inapplicable. Read-back/agreement proofs must match the actual product, amount and date and precede its write. Zero false passes, false failures and abstentions are required. Model settings, source, policy, API, mapping and Docker fingerprints bind admission to that version. These finite controls do not establish Freya equivalence or model perfection.
 
-When official public tests apply, official scores rank candidates; calibrated synthetic critical failures can veto them. Generated scores remain separate. Without official tests, only admitted, complete generated measurements rank candidates. Calibrated development failures can reach the fixer; unknowns cannot be treated as actionable failures. Wording changes are measured at their own workflow hash. If every tested candidate is vetoed, the build fails and retains its tested artifacts for inspection. Otherwise an interrupted test/export preserves the eligible cached export when available.
+When official public tests apply, official scores rank candidates; calibrated synthetic critical failures can veto them. Generated scores remain separate. Without official tests, only admitted, complete generated measurements rank candidates. Calibrated development failures can reach the fixer; unknowns cannot be treated as actionable failures. Wording changes are measured at their own workflow hash. If every tested candidate is vetoed, the best of them is still exported and the build reports `exported_vetoed`: an agent with a known flaw can pass customers, no agent passes none. Otherwise an interrupted test/export preserves the eligible cached export when available.
 
 A case passes only if every requested repetition passes. Incomplete evidence has no strict pass rate. One repetition is the existing development default (`EVAL_REPETITIONS`); use three for a three-run result. Standalone `evaluate` is diagnostic and carries no selection authority.
 
@@ -118,12 +119,17 @@ Code containers have no network or host mounts, a read-only root, an unprivilege
 
 The proxy supports basic conversation/API/code/end nodes, extraction, ordered routes, pre-actions, mappings and Python hooks. Unsupported audio, custom extraction prompts, lifecycle tools, history summaries, silent conversation waits, previous-node routing, suppressed tool results and automatic tool retries abstain. `CAPABILITIES` in `runner.py` publishes the limits. Local extraction uncertainty differs from Freya token confidence; the user approved calibrated proxy feedback with this limitation recorded.
 
-Brief/API inputs and released aggregate reports go under `artifacts/`. Customer facts, expectations, calibration transcripts, prompts and detailed builder evidence stay under `private/`, outside the dashboard's served root. Production exports go under `out/`; offline compiled exports go under `local_out/`. Runtime state uses `.runtime/`; the real adapter shares the original `agent/.runtime/workspace.lock` across entry points and fails closed without the lock. Generated outputs/secrets are ignored locally.
+Brief/API inputs and released aggregate reports go under `artifacts/`. Customer facts, expectations, calibration transcripts, prompts and detailed builder evidence stay under `private/`, outside the dashboard's served root. Production exports go under `out/`; offline compiled exports go under `local_out/`. Runtime state uses `.runtime/`; the real adapter shares the original `agent/.runtime/workspace.lock` across entry points. Without the lock nothing is deployed for testing or simulated: the working budget is ended, and a finished design keeps only its reserve for one verified export. Generated outputs/secrets are ignored locally.
 
 The regular dashboard at `http://127.0.0.1:8765/` discovers synthetic progress under
 `agent/artifacts/synthetic_<run>/`. These entries publish only model-call starts, ends,
 exception types, retries and numeric token counts. They never copy prompts, responses,
 customer cases, private paths or holdout findings. The private trace remains authoritative.
+
+Diagnostics that replay the supplied practice scripts are the exception, because those scripts
+are public: `live`, and the persona pass of `live-build`, appear in the dashboard as a
+"Persona test" with one row per customer, live while it runs, with the conversations. The copy
+holds only what the dashboard reads; generated customers and holdout packs are never mirrored.
 
 ## Verification
 

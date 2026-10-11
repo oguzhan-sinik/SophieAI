@@ -14,7 +14,7 @@ if __package__ in {None, ''}:
 
 from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
-from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
+from .config import AGENT, BUILDER_ROLES, KIT, Config, Deadline, missing_credentials, writable
 from .contracts import compile_openapi, compile_workflow, source_documents, validate_requirements
 from .freya_adapter import FreyaAdapter, contains_definition, public_suite
 from . import prompts
@@ -23,6 +23,7 @@ from .scoring import score, verdicts
 from .validation import apply_fix, edited_stages, is_wording, validate
 
 FIX_SECONDS = 150        # time a fix call may need; a round is not started with less
+COMPILE_FIXES = 3        # fix calls a design gets for what the static checks and the design review reject
 FIRST_SIMULATION = 240   # assumed length of a simulation until one has been observed
 BROKEN = (ValueError, KeyError, TypeError, AttributeError)
 
@@ -108,8 +109,7 @@ class Builder:
         for attempt in range(2):
             try:
                 proposal = self.roles.ask('BriefAnalystAgent', "Extract the brief's rules with their source lines", prompts.ANALYST,
-                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle,
-                                          max_tokens=24000)
+                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle)
                 requirements = validate_requirements(proposal, self.documents)
                 write_json(self.root / 'requirements.json', requirements, immutable=True)
                 return requirements
@@ -136,8 +136,9 @@ class Builder:
         payload = {'documents': self.documents, 'contracts': self.contracts, 'runtime_docs': self.docs()}
         if self.requirements:
             payload['requirements'] = self.requirements
-        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec,
-                              max_tokens=32000)
+        # The default allowance (60000): designs of this brief have run to 34000 tokens before any
+        # thinking, and an answer cut off at a lower cap is not JSON, which leaves no agent at all.
+        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec)
 
     def fix(self, purpose, source, problems, hints=(), calls=None, wording_only=False, docs=False):
         """The one way a workflow is changed after its design: a patch of small edits to its source."""
@@ -210,7 +211,7 @@ class Builder:
         workflow, result = self.check(source)
         cid = self.record(source, workflow, result)
         tried, carried = [(cid, workflow, result)], []
-        for attempt in range(2):
+        for attempt in range(COMPILE_FIXES):
             if result['valid']:
                 break
             try:
@@ -289,11 +290,16 @@ class Builder:
         return frozen.complete
 
     def champion(self, root_id):
-        """The best measured candidate, later one on a tie, with its wording-only child when it has one."""
-        complete = [cid for cid, result in self.measured.items() if result['score'].complete and not self.vetoed(cid)]
-        if not complete:
-            return None if self.vetoed(root_id) else root_id
-        best = max(complete, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
+        """The best measured candidate, later one on a tie, with its wording-only child when it has one.
+
+        A vetoed candidate is passed over while another exists. When every tested candidate is vetoed
+        the best of them is still exported, and reported as vetoed: an agent with a known flaw can
+        pass customers, no agent passes none."""
+        complete = [cid for cid, result in self.measured.items() if result['score'].complete]
+        eligible = [cid for cid in complete if not self.vetoed(cid)] or ([] if not self.vetoed(root_id) else complete)
+        if not eligible:
+            return root_id
+        best = max(eligible, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
         return self.wording.get(best, best)
 
     def vetoed(self, cid):
@@ -413,8 +419,6 @@ class Builder:
                     self.trace.event('improvement_stopped', error=type(exc).__name__, message=error)
                 finally:
                     champion = self.champion(root_id)
-                    if champion is None:
-                        raise ValueError('No eligible candidate: calibrated critical failures vetoed all tested candidates; exports retained for inspection')
                     self.adapter.exporting = True
                     workflow = self.archive.workflow(champion)
                     try:
@@ -437,6 +441,9 @@ class Builder:
                         self.trace.event('cached_export_fallback', candidate_id=champion, remote_restored=False, source=self.exports[champion], error=error)
                     if status == 'exported' and self.best_effort and not self.static[champion]['valid']:
                         status = 'exported_best_effort'
+                    if status.startswith('exported') and self.vetoed(champion):
+                        status = 'exported_vetoed'
+                        self.trace.event('vetoed_export', candidate_id=champion, reason='every tested candidate has a calibrated critical failure; the best of them is exported')
                     write_json(writable(self.submission_dir / (Path(self.documents[-1]['path']).stem + '.workflow.json')), json.loads(Path(exported).read_text()))
                     self.checkpoint(root_id)
         except (Exception, KeyboardInterrupt) as exc:
@@ -499,7 +506,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         cfg = Config.from_env()
-        missing = missing_credentials(cfg)
+        missing = missing_credentials(cfg, roles=BUILDER_ROLES)
         if missing:
             raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
         briefs, openapi = inputs(args.briefs, args.openapi)

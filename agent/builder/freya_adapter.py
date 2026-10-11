@@ -159,8 +159,12 @@ class FreyaAdapter:
         waits at the moment it starts one, and a build that starts none must not wait at all."""
         with file_lock(AGENT / ".runtime" / "workspace.lock", self.deadline) as held:
             if not held:
-                self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out")
-                raise TimeoutError("Workspace lock unavailable; no deployment or simulation permitted")
+                # No lock, so nothing may be deployed for testing or simulated: the working budget is
+                # ended here, and every such call then refuses. What stays is the export reserve, for
+                # one deployment whose export is compared with the workflow before it is accepted.
+                # Raising instead would throw away a finished design.
+                self.deadline.end = min(self.deadline.end, time.monotonic() + self.deadline.reserve)
+                self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out; only the verified export remains")
             yield self
 
     def validate_remote(self, workflow):

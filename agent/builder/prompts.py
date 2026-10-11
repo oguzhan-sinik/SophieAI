@@ -33,8 +33,9 @@ normalised. A bank tool is always written in this shape, with only these keys:
 Omit unused keys. Never write URLs, headers, request schemas, type or config: the controller takes
 them from the contract and sets zero retries. customer_id is bound automatically. Product ids come
 only from account data. Every other required field needs a binding to a variable that an extraction
-or a code stage has set; an answer the customer gives as a date is bound to its date-typed
-extraction variable, never to free text. Post hooks may add a truthful
+or a code stage has set; a payment or callback day is bound to its date-typed extraction
+variable and a security date to the variable a code stage set with ctl_identity_date, never to
+free text. Post hooks may add a truthful
 what_to_do_next to result['data'] and read or write vars; they never change what a tool returned.
 
 Code stage: {"name":"...","node_type":"code","code":"<Python source>","transitions":[...]}.
@@ -44,9 +45,19 @@ always, as the fallback. Code reads vars.get('name') and writes vars['name']; it
 try/except and sets a fallback status on error. Import only json, re and datetime. No adjacent
 double braces in code (put a space between nested braces). No network, files, private attributes,
 eval/exec/getattr, dynamic imports or clock calls. Hooks may read config['body'] only.
+A code stage decides one thing and sets one status that its own routes test. What would decide
+several things is several code stages of well under 120 lines each, because one mistake in a
+large stage closes the call for every case it handles. Every silent stage between the caller's
+words and the agent's next line costs the caller seconds: keep that chain to two or three stages.
+A value the caller's words fill can be unset. Test it before int() or float() and decide what a
+missing value means there; the controller rejects an untested conversion. An amount or a day the
+caller names by reference (the full amount, the minimum, the same day, that one) has no number or
+date of its own: code takes it from what the stage offered.
 
 Conversation stage: it does one thing. It asks one question or makes one offer, extracts the reply
-and routes. task_message says what this stage is for, not how routing works, and does not carry the
+and routes. It extracts at most five values: what its own routes test and what the next code stage
+needs from this reply. Every extracted value is a model call on every turn and the caller waits for
+all of them. task_message says what this stage is for, not how routing works, and does not carry the
 policy for several steps: what decides between outcomes lives in code stages and transitions. Give
 max_node_turns and a max_turn_transition that closes the call correctly. A conversation stage has no
 tools and no pre_actions. End stages use an
@@ -57,13 +68,19 @@ min_confidence on every variable. Top-level grouped conditions use OR (nest AND 
 with the strings true/True, never boolean operands. List the values of every variable a stage routes
 on in enum_values and give each value that should move the call its own transition. An agreement to
 what the stage just proposed is such a value: route it, never wait for the customer to repeat a
-number or a date the stage itself stated.
+number or a date the stage itself stated. Describe every value in enum_values by what the caller
+says for it, and where a reply could fit two values say which one it is. A reply that fits a
+specific value and a general one is the specific one: what the caller said about the amount or the
+day is decided before a general intent.
 
 IDENTITY. Protect account access with deterministic, response-based routes on EVERY path, including
 fallbacks and turn caps. get_account and create_promise may only be reached after verify_identity
-has run and a transition after it has tested its result: a mapped response variable, the flattened
-<stage>_response.data.* value, or a status that a code stage derives from that response. What the
-caller says is never proof of identity: no alternative of such a route may test an extracted value.
+has run and a transition after it has proved its result with equals against the value that means
+verified: a mapped response variable (all_verified equals true), the flattened
+<stage>_response.data.* value, or a status that a code stage derives from that response (equals
+verified). is_set, an HTTP status code, a success or failure counter, a turn count and a test for a
+failed result are not proof. What the caller says is never proof of identity: no alternative of
+such a route may test an extracted value.
 
 TOOL RESULTS. response_mapping stores scalar fields only. For a list or object field (for example
 the account's product list) still declare the mapping; the controller delivers that variable to code
@@ -76,7 +93,8 @@ flattens its result under <stage name>_response.data.*, a model-called tool unde
 <tool name>_response.data.*; prefer mapped variables in routes.
 
 HUMAN SPEECH. Callers split answers across turns, ask questions, correct themselves and mention
-unrelated numbers/dates. Keep one pending slot, its ordered fragments, raw words, completeness,
+unrelated numbers/dates. Spread what follows over stages, one question per conversation stage and
+one decision per code stage; never build one stage that handles every kind of reply. Keep one pending slot, its ordered fragments, raw words, completeness,
 source turn and revision. Never pad missing digits or guess a birth year. Security dates need an
 explicit year; capture partial security dates as strings, clarify, and assemble before verification.
 Ask only for the missing part. Answer questions safely, then resume; a question, tangent or brief
@@ -85,7 +103,8 @@ product references; never copy a loan correction onto the card. Preserve known a
 for an uncertain date. Do not extract the first date/money from an unrelated story.
 The runtime also provides ctl_digits(said) (ordered digit words, preserves zeros),
 ctl_identity_date(said) (complete identity date only, never substitutes a year),
-ctl_slot(vars,name,value,raw,complete,turn,correction=False) (clears incomplete routable values),
+ctl_slot(vars,name,value,raw,complete,turn,correction=False) (an incomplete value becomes '' and
+<name>_complete becomes no: route on <name>_complete equals yes, never on is_set),
 ctl_proposal(vars,product,amount,day) (returns tuple revision and invalidates changed consent),
 ctl_invalidate(vars,product), ctl_consent(vars,product,revision,explicit), and
 ctl_write_ready(vars,product,amount,day). Use these in code stages. Money passed to these helpers is
@@ -105,7 +124,10 @@ Monday=0 and excluded the list of non-business ISO dates, both always taken from
   ctl_date(said, call_now, next_weekday='following_week' or 'next_occurrence') -> the day a phrase names
 All return YYYY-MM-DD text, or '' when the day cannot be worked out.
 Declare payment and callback days as extraction type date. Security dates are strings: preserve
-fragments, require an explicit year, and call ctl_identity_date on the assembled complete words. A complete date with its year arrives as YYYY-MM-DD; anything else is
+fragments, require an explicit year, and call ctl_identity_date on the assembled complete words.
+It returns '' until the words hold a day, a month and a year: that code stage sets a status and
+routes on it with equals, because a variable set to '' can still count as set.
+For a payment or callback day, a complete date with its year arrives as YYYY-MM-DD; anything else is
 captured as the customer's words and, before any code stage or bound tool call, replaced by the day
 resolved against call now, with <name>_said keeping the words. The variable is filled only when the
 customer names one single day; a vague period leaves it unset or ''. So a stage that asks for a day
@@ -124,7 +146,11 @@ loops. Only an accepted value reaches the read-back and the write. A read-back s
 variables the write tool is bound to. A stage that speaks after a check receives the outcome through
 variables in its task_message and never confirms what the check rejected. Say that something is
 recorded, booked or transferred only in the stage after the tool that did it succeeded; in every
-other stage say nothing of the kind. After a failed write, apologise in neutral words. Retry a write
+other stage say nothing of the kind. A word the source allows only after an event is reserved for
+it: before that event the agent does not say that word at all, not even about something else,
+because a checker looks for the word itself. Where the source also asks for an earlier sentence
+that would use it (a notice that the call is recorded, when "recorded" is reserved for a
+successful write), keep the meaning and change the words: "we are recording this call". After a failed write, apologise in neutral words. Retry a write
 only where the source permits it and the failure is known.
 
 Keep explicit state for confirmation before writes, corrections, per-product attempts, retry limits
@@ -137,7 +163,8 @@ requires a goodbye before close, speak it in the close stage's on_enter tts; the
 use message_mode none. If the source forbids notes on transfers, defer all notes until the call can
 no longer end in a transfer.
 
-Use separate stages for tool boundaries and computations, and no more stages than the policy needs.
+Use separate stages for tool boundaries and computations. Prefer several small stages to one large
+one: a stage that asks or decides one thing can be checked and repaired on its own.
 """
 
 DESIGN = """Design a phone agent for the supplied bank policy and tool contract, as a WorkflowSpec.

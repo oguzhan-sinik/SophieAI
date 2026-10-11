@@ -7,6 +7,7 @@ from agent.builder.build import call_records
 from agent.builder.scoring import verdicts
 from .config import ROOT
 from .live import evaluate_personas, public_customer
+from .progress import mirrored
 
 
 class PublicPersonaProvider:
@@ -43,8 +44,10 @@ class PublicPersonaProvider:
 
     def evaluate(self, workflow, adapter, folder, roles, deadline):
         official = adapter.evaluate(self.cases, self.suite, folder)
-        private = ROOT / "private" / "live_builds" / folder.parent.parent.name / folder.name
-        report = evaluate_personas(adapter, self.cases, self.customers, roles, private, self.suite.repetitions)
+        # Its own name: under the official folder's name the dashboard showed the official results twice.
+        private = ROOT / "private" / "live_builds" / folder.parent.parent.name / (folder.name + "_personas")
+        with mirrored(private, folder.parent / private.name):
+            report = evaluate_personas(adapter, self.cases, self.customers, roles, private, self.suite.repetitions)
         diagnostic = json.loads((private / "raw_runner.json").read_text())
         key = digest(workflow)
         official_verdicts = verdicts(official, self.suite)
