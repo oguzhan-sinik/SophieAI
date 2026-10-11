@@ -1,16 +1,27 @@
-"""Conservative static Freya gate. This is not a proof of conversational policy."""
+"""Static checks on a compiled workflow, and the one way a workflow source is edited.
+
+Errors block deployment and each names the stage to change. Warnings are hints: observations that
+may or may not matter, passed to a fix as context and never acted on by the controller itself.
+None of this proves how the agent speaks."""
 import ast
+from collections import deque
 from copy import deepcopy
 import re
 
 from . import runtime
-from .schemas import Mutation, RepairPatch, WorkflowSpec
+from .schemas import Fix
 
 TOP = {"initial_node", "system_prompt", "nodes", "global_nodes", "test_variables", "context_variables", "nodePositions"}
 NODE = {"name", "node_type", "task_message", "role_message", "on_enter", "on_enter_first_entry_only", "transitions", "routing_prompt", "loop_condition", "loop_prompt", "extraction_schema", "tools", "pre_actions", "response_mapping", "passthrough", "passthrough_default_transition", "max_node_turns", "max_turn_transition", "terminal", "disable_inactivity_monitor", "suppress_tool_results", "truncation_strategy", "truncation_window_size", "reasoning_override", "condition", "description", "excluded_nodes", "is_tool_call"}
 OPERATORS = {"equals", "not_equals", "greater_than", "less_than", "contains", "is_set", "is_not_set", "always", "matches_intent"}
 MODULES = {"json", "re", "datetime"}
 BLOCKED_NAMES = {"open", "exec", "eval", "compile", "getattr", "setattr", "delattr", "globals", "locals", "input", "breakpoint", "__import__", "help", "memoryview"}
+SILENT = ("code", "api_request")
+# Stable operation names from the event contract; every field and value comes from the supplied API.
+IDENTITY, PROTECTED = "verify_identity", ("get_account", "create_promise")
+# What the dialogue model is told and what is spoken as written. Descriptions and routing prompts are
+# not wording: the routing model and the extractor decide by them, so changing one changes routes and values.
+WORDING = {"task_message", "role_message", "system_prompt", "text", "spoken_message", "llm_prompt"}
 
 
 def code_errors(source, hook=False):
@@ -82,23 +93,28 @@ def _condition(condition, nested=False):
     return []
 
 
-def _entails(condition, variables, values):
-    if "logic" in condition:
-        checks = [_entails(c, variables, values) for c in condition.get("conditions", [])]
-        return bool(checks) and (all(checks) if condition["logic"] == "or" else any(checks))
-    return condition.get("operator") == "equals" and condition.get("variable") in variables and str(condition.get("operand")) in values
-
-
-PROTECTED = {"get_account", "create_promise"}
-SILENT = ("code", "api_request")
-
-
-def _routed_variables(condition, found):
+def _leaves(condition):
+    """Every single test inside a route condition, however it is grouped."""
     if isinstance(condition, dict):
-        for child in condition.get("conditions") or []:
-            _routed_variables(child, found)
-        if condition.get("variable"):
-            found.add(condition["variable"])
+        if condition.get("conditions"):
+            for child in condition["conditions"]:
+                yield from _leaves(child)
+        elif condition.get("operator"):
+            yield condition
+
+
+def _is_proof(condition, spoken):
+    """A route that can only fire on something the caller cannot simply say: a tool result or a value code derived.
+
+    Every alternative of an OR has to be such a test, since one spoken alternative is a way round
+    the others; within an AND one is enough."""
+    if not isinstance(condition, dict):
+        return False
+    if condition.get("conditions"):
+        checks = [_is_proof(child, spoken) for child in condition["conditions"]]
+        return all(checks) if condition.get("logic") == "or" else any(checks)
+    variable = str(condition.get("variable") or "")
+    return bool(variable) and condition.get("operator") not in ("always", "matches_intent") and variable not in spoken and not variable.endswith("_turns")
 
 
 def _variable_use(node):
@@ -121,42 +137,30 @@ def _variable_use(node):
     return written, read
 
 
-def _tested(condition, equal, unequal):
-    """Collect the operands a stage's routes compare each variable with."""
-    if not isinstance(condition, dict):
-        return
-    for child in condition.get("conditions") or []:
-        _tested(child, equal, unequal)
-    if condition.get("operator") in ("equals", "not_equals") and condition.get("variable"):
-        (equal if condition["operator"] == "equals" else unequal).setdefault(condition["variable"], set()).add(str(condition.get("operand")))
-
-
-def validate(spec, contracts, requirements):
-    # errors block deployment; warnings are advisory form/bookkeeping findings. dead_ends are stages
-    # that can trap a call: worth one repair, but a stay can be intended, so they never block.
-    errors, warnings, dead_ends = [], [], []
-    try:
-        parsed = WorkflowSpec.model_validate(spec)
-    except Exception as exc:
-        return {"valid": False, "errors": ["Invalid WorkflowSpec: " + str(exc)], "evidence_type": "static"}
-    workflow = parsed.workflow
+def validate(workflow, contracts):
+    errors, warnings = [], []
+    result = lambda: {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "evidence_type": "static"}
+    if not isinstance(workflow, dict):
+        errors.append("workflow must be an object")
+        return result()
     if any(x is None for x in _walk(workflow)):
         errors.append("Workflow cannot contain null")
     if set(workflow) - TOP:
         errors.append("Unknown/unsupported top-level keys: " + str(sorted(set(workflow) - TOP)))
     normal, global_nodes = workflow.get("nodes", {}), workflow.get("global_nodes", {})
     if not isinstance(normal, dict) or not isinstance(global_nodes, dict):
-        return {"valid": False, "errors": ["Nodes must be maps"], "evidence_type": "static"}
+        errors.append("Nodes must be maps")
+        return result()
     nodes = {**normal, **global_nodes}
     for key, node in nodes.items():
         if not isinstance(node, dict):
-            errors.append(f'{key}: node must be an object')
+            errors.append(f"{key}: node must be an object")
             continue
-        for field in ('tools', 'pre_actions', 'transitions', 'response_mapping', 'extraction_schema'):
+        for field in ("tools", "pre_actions", "transitions", "response_mapping", "extraction_schema"):
             if field in node and (not isinstance(node[field], list) or any(not isinstance(item, dict) for item in node[field])):
-                errors.append(f'{key}: {field} must be an array of objects, never tool-name strings')
+                errors.append(f"{key}: {field} must be an array of objects, never tool-name strings")
     if errors:
-        return {'valid': False, 'errors': errors, 'evidence_type': 'static'}
+        return result()
     initial = workflow.get("initial_node")
     if initial not in normal:
         errors.append("initial_node does not resolve")
@@ -164,16 +168,12 @@ def validate(spec, contracts, requirements):
         errors.append("Global and regular node names collide")
     edges = {key: [] for key in nodes}
     calls = {key: [] for key in nodes}
-    mapped = {}
     for key, node in nodes.items():
-        if not isinstance(node, dict):
-            errors.append(f"{key}: node must be an object")
-            continue
         def bad(message):
             errors.append(f"{key}: {message}")
         kind = node.get("node_type")
-        if 'loop_prompt' in node:
-            bad('Live Freya schema rejects loop_prompt; express repeat-turn behavior in task_message')
+        if "loop_prompt" in node:
+            bad("Live Freya schema rejects loop_prompt; express repeat-turn behavior in task_message")
         if kind not in {"conversation", "api_request", "code", "end_call"}:
             bad("Unsupported node type")
         if set(node) - NODE:
@@ -182,7 +182,7 @@ def validate(spec, contracts, requirements):
             bad("Node name must match snake_case key")
         if "tools" in node and kind != "conversation":
             bad("tools belongs only on conversation")
-        if "pre_actions" in node and kind not in {"api_request", "code"}:
+        if "pre_actions" in node and kind not in SILENT:
             bad("pre_actions belongs only on action/code")
         if kind == "conversation" and "response_mapping" in node:
             bad("Conversation response_mapping belongs on its tool")
@@ -194,18 +194,14 @@ def validate(spec, contracts, requirements):
             else:
                 edges[key].append((target, transition.get("condition", {})))
             errors.extend(f"{key}: {e}" for e in _condition(transition.get("condition")))
-        for field in ("max_turn_transition", "passthrough_default_transition"):
-            if field in node:
-                if node[field] not in nodes:
-                    bad(f"{field} target does not resolve")
-                else:
-                    edges[key].append((node[field], {"operator": "always"}))
         if kind == "conversation":
             # A value the extractor may return but no route tests leaves the call in the stage with
             # nothing to do; the dialogue model then improvises until the customer hangs up.
             equal, unequal = {}, {}
             for transition in transitions:
-                _tested(transition.get("condition"), equal, unequal)
+                for leaf in _leaves(transition.get("condition")):
+                    if leaf["operator"] in ("equals", "not_equals") and leaf.get("variable"):
+                        (equal if leaf["operator"] == "equals" else unequal).setdefault(leaf["variable"], set()).add(str(leaf.get("operand")))
             fallthrough = next((t.get("target_node") for t in transitions if isinstance(t.get("condition"), dict) and t["condition"].get("operator") == "always"), key)
             # Only a stage that keeps the call when nothing matches can trap it.
             for extraction in node.get("extraction_schema", []) if fallthrough == key else []:
@@ -214,14 +210,20 @@ def validate(spec, contracts, requirements):
                     continue
                 unrouted = [str(v) for v in values if str(v) not in equal[name] and not unequal.get(name, set()) - {str(v)}]
                 if unrouted:
-                    dead_ends.append(f"{key}: {name} can be extracted as {unrouted} but no transition of this stage tests those values, so the call stays here with no way on. "
-                        "Give each value its own transition; a transition back to this stage counts where staying is intended")
+                    warnings.append(f"{key}: {name} can be extracted as {unrouted} but no transition of this stage tests those values, so the call stays here. "
+                                    "If one of them should move the call on, give it a transition")
+        for field in ("max_turn_transition", "passthrough_default_transition"):
+            if field in node:
+                if node[field] not in nodes:
+                    bad(f"{field} target does not resolve")
+                else:
+                    edges[key].append((node[field], {"operator": "always"}))
         if "max_node_turns" in node and "max_turn_transition" not in node:
             bad("Turn cap has no fallback target")
         if node.get("passthrough"):
             if not node.get("passthrough_default_transition") or not transitions or transitions[-1].get("condition", {}).get("operator") != "always":
                 bad("Passthrough requires default and last always transition")
-        if kind in {"code", "api_request"} and not node.get("pre_actions"):
+        if kind in SILENT and not node.get("pre_actions"):
             bad("Action node has no pre_actions")
         for extraction in node.get("extraction_schema", []):
             if not 0 <= extraction.get("min_confidence", -1) <= 1:
@@ -252,17 +254,20 @@ def validate(spec, contracts, requirements):
                 props = function.get("parameters", {}).get("properties", {})
                 if placement == "pre_actions" and "response_mapping" in tool:
                     bad("pre_actions mapping belongs at node level")
-                mappings = tool.get("response_mapping", []) if placement == "tools" else node.get("response_mapping", [])
-                for mapping in mappings:
+                for mapping in tool.get("response_mapping", []) if placement == "tools" else []:
                     if not mapping.get("path", "").startswith("data."):
                         bad("Mapping path must start data.")
-                    mapped[mapping.get("variable")] = (name, mapping.get("path"))
                 if handler == "__function__:code_exec":
                     if kind != "code":
                         bad("Code execution is supported only in code nodes")
                     errors.extend(f"{key}: {e}" for e in code_errors(props.get("code", {}).get("default", "")))
                 elif handler == "__function__:api_call":
                     calls[key].append(name)
+                    if placement == "tools":
+                        # Seen live: a model-called tool sent a spoken date as it was said, resent a stale
+                        # answer, was called twice, or not at all. An engine-run call does none of that.
+                        bad(f"{name} is offered to the dialogue model in a conversation stage. Bank tools run in their own api_request stage: let this stage "
+                            f"extract the values and route to an api_request stage that calls {name} with every argument bound to a variable, and route on its result from there")
                     contract = contracts["operations"].get(name)
                     if not contract:
                         bad("Unsupported bank tool: " + str(name))
@@ -278,8 +283,9 @@ def validate(spec, contracts, requirements):
                         bad("Body fields must match contract leaf schemas")
                     if set(body.get("required", [])) != set(expected.get("required", [])):
                         bad("Required body fields differ from contract")
-                    if placement == "pre_actions" and any("default" not in properties.get(field, {}) for field in expected.get("required", [])):
-                        bad("Engine-run calls require baked defaults for every required argument")
+                    missing = [field for field in expected.get("required", []) if "default" not in properties.get(field, {})]
+                    if placement == "pre_actions" and missing:
+                        bad(f"{name} is run by the engine here, so every required argument needs a binding; missing {missing}")
                     for field, schema in expected.get("properties", {}).items():
                         actual = properties.get(field, {})
                         for attribute in ("type", "enum", "format", "items", "properties", "nullable", "minimum", "maximum"):
@@ -295,23 +301,15 @@ def validate(spec, contracts, requirements):
                         if default is not None and not (isinstance(default, str) and "{{" in default):
                             from jsonschema import Draft202012Validator
                             if list(Draft202012Validator(schema).iter_errors(default)):
-                                bad(f"{field}: baked value violates contract")
+                                bad(f"{field}: bound value {default!r} is not allowed by the contract" + (f", which accepts {schema['enum']}" if schema.get("enum") else ""))
                     if "call" not in function.get("description", "").lower():
-                        bad("Tool description must state CALL trigger")
-                    if placement == "tools":
-                        # A read-back that names other variables than the request sends can confirm one value and write another.
-                        spoken = str(node.get("task_message", ""))
-                        heard = {"{{" + str(item.get("name")) + "}}" for item in node.get("extraction_schema", [])}  # the caller's own answer needs no read-back
-                        unspoken = sorted({ph for field, schema in properties.items() if field not in ("customer_id", "product_id")
-                                           for ph in re.findall(r"\{\{[A-Za-z_][\w.]*\}\}", str(schema.get("default", ""))) if ph not in spoken and ph not in heard})
-                        if unspoken:
-                            warnings.append(f"{key}: {name} sends {', '.join(unspoken)} but the stage's task_message never states them; read back the same variables the tool writes")
+                        bad(f"The description of {name} must state its trigger, starting 'CALL when ...'")
                 else:
                     bad("Unsupported handler outside terminal")
                 for hook in ("pre_process_code", "post_process_code"):
                     if tool.get(hook):
                         errors.extend(f"{key}/{hook}: {e}" for e in code_errors(tool[hook], True))
-    # Include interrupts in path analysis; a global handler must not bypass a gate.
+    # Interrupts are routes too; a global handler must not slip past a check.
     for key in normal:
         for target, node in global_nodes.items():
             if key not in node.get("excluded_nodes", []):
@@ -334,14 +332,60 @@ def validate(spec, contracts, requirements):
     if reachable - terminating:
         errors.append("Reachable nodes cannot reach end_call: " + str(sorted(reachable - terminating)))
     if set(nodes) - reachable:
-        errors.append("Unreachable nodes: " + str(sorted(set(nodes) - reachable)))
+        errors.append("Unreachable nodes: " + str(sorted(set(nodes) - reachable)) + "; give each a transition from the stage that should lead to it, or remove it")
+    # Identity before account data, read from the routes themselves. Every route to a protected tool
+    # must call the identity tool and afterwards branch on something the caller cannot simply say.
+    spoken = {item.get("name") for node in nodes.values() for item in node.get("extraction_schema", [])}
+    for operation in [op for op in PROTECTED if IDENTITY in contracts["operations"] and any(op in names for names in calls.values())]:
+        pending, seen = deque([(initial, None, False, [])] if initial in nodes else []), set()
+        while pending:
+            key, checked_at, tested, path = pending.popleft()
+            if (key, checked_at is not None, tested) in seen:
+                continue
+            seen.add((key, checked_at is not None, tested))
+            path = path + [key]
+            if operation in calls[key] and not tested:
+                route = " > ".join(path[-8:])
+                errors.append(f"{key}: {operation} can be reached without a tested identity check, by the route {route}. " + (
+                    f"No stage on that route calls {IDENTITY}." if checked_at is None else
+                    f"After {IDENTITY} in {checked_at} no transition on that route tests its result. Make the way out of {checked_at} (or of the code stage "
+                    f"that reads its response) depend on the {IDENTITY} response: a mapped response variable or a status code derives from it, never on what the caller said."))
+                break
+            if IDENTITY in calls[key]:
+                checked_at, tested = key, False
+            for target, condition in edges[key]:
+                pending.append((target, checked_at, tested or (checked_at is not None and _is_proof(condition, spoken)), path))
+    # close_call must be isolated from other bank actions and cannot lead back to one.
+    for key, names in calls.items():
+        if "close_call" not in names:
+            continue
+        if names != ["close_call"]:
+            errors.append(f"{key}: close_call must be the only tool at its stage")
+        pending, seen = [target for target, _ in edges[key]], set()
+        while pending:
+            target = pending.pop()
+            if target in seen:
+                continue
+            seen.add(target)
+            if calls[target]:
+                errors.append(f"{key}: bank tool reachable after close_call")
+            pending += [n for n, _ in edges[target]]
+    if "close_call" in contracts["operations"]:
+        pending = [(initial, False)] if initial in nodes else []
+        seen = set()
+        while pending:
+            key, closed = pending.pop()
+            if (key, closed) in seen:
+                continue
+            seen.add((key, closed))
+            # Only an engine-run close guarantees the call; a tool the dialogue model may skip does not.
+            closed = closed or ("close_call" in calls[key] and nodes[key].get("node_type") == "api_request")
+            if key in ends and not closed:
+                errors.append(f"{key}: this end stage can be reached without close_call; route to it only from an api_request stage that runs close_call")
+            pending += [(target, closed) for target, _ in edges[key]]
     # A stage that offers a value some check computed, and whose route runs straight back into that
-    # check, only makes progress if the check reads the offer. Otherwise an accepted offer changes
-    # nothing: the check rejects the original value again and the call goes round until it is cut off.
-    statuses = set()
-    for node in nodes.values():
-        for transition in node.get("transitions", []):
-            _routed_variables(transition.get("condition"), statuses)
+    # check, only makes progress if the check reads the offer.
+    statuses = {leaf["variable"] for node in nodes.values() for transition in node.get("transitions", []) for leaf in _leaves(transition.get("condition")) if leaf.get("variable")}
     for key, node in normal.items():
         shown = set(re.findall(r"\{\{\s*([A-Za-z_]\w*)\s*\}\}", str(node.get("task_message", "")))) - statuses
         if node.get("node_type") != "conversation" or not shown:
@@ -370,149 +414,65 @@ def validate(spec, contracts, requirements):
                 read |= r
             offered = shown & written
             if offered and not offered & read:
-                dead_ends.append(f"{key}: offers {sorted(offered)}, computed by {sorted(chain)}, and its route to {first} runs straight back into that check, which never reads "
-                                 f"{sorted(offered)}. If that route is ever taken because the customer accepted the offer, nothing is applied: the check rejects the "
-                                 "original value again and the call loops. Give acceptance its own route through a code stage that copies the offered value into "
-                                 "the variable the check reads. A route taken only with a new value from the customer needs no change")
-    rule_ids = {r["rule_id"] for r in requirements["requirements"]}
-    active_ids = {r["rule_id"] for r in requirements["requirements"] if not r["precedence"]["superseded_by"]}
-    if not active_ids <= set(parsed.coverage):
-        warnings.append("Missing active requirement coverage: " + str(sorted(active_ids - set(parsed.coverage))[:20]))
-    for rule_id, coverage in parsed.coverage.items():
-        if rule_id not in rule_ids or not coverage.nodes or not coverage.tests or not set(coverage.nodes) <= set(nodes):
-            warnings.append("Invalid coverage mapping: " + rule_id)
-    # Stable operation names come from the event contract; all fields and values are source supplied.
-    used = {name for names in calls.values() for name in names}
-    for operation in used & PROTECTED:
-        if not any(g.operation == operation for g in parsed.tool_gates):
-            errors.append(f"{operation}: missing source-backed deterministic tool gate")
-    for gate in parsed.tool_gates:
-        if gate.operation not in contracts["operations"] or not gate.rule_ids or not set(gate.rule_ids) <= rule_ids:
-            warnings.append(f"gate[{gate.operation}]: unproven tool gate source")
-            continue
-        expected_var = gate.producer_operation + "_response." + gate.response_path
-        producer_contract = contracts["operations"].get(gate.producer_operation, {})
-        response_schema = producer_contract.get("responses", {}).get("200", {}).get("content", {}).get("application/json", {}).get("schema", {})
-        for field in gate.response_path.removeprefix("data.").split("."):
-            response_schema = response_schema.get("properties", {}).get(field, {})
-        label = f"gate[{gate.operation}]: "
-        if not response_schema or not gate.response_path.startswith("data."):
-            warnings.append(label + "response path does not exist in the supplied contract")
-        direct = gate.variable == expected_var or mapped.get(gate.variable) == (gate.producer_operation, gate.response_path)
-        if direct and response_schema.get("type") == "boolean" and set(gate.allowed_values) != {"true", "True"}:
-            warnings.append(label + "boolean safety gate should require both true spellings")
-        if not direct:
-            warnings.append(label + "gate variable is derived state, not the declared tool response")
-        gate_variables = {gate.variable, expected_var}
-        if expected_var in mapped and mapped[expected_var] != (gate.producer_operation, gate.response_path):
-            warnings.append(label + "canonical tool response cannot be mapped from another field")
-        if gate_variables & set(workflow.get("test_variables", {})):
-            errors.append(label + "tool gate cannot be initialized by test variables")
-        if any(e.get("name") in gate_variables for n in nodes.values() for e in n.get("extraction_schema", [])):
-            errors.append(label + f"the gate variable {gate.variable} is filled by speech extraction. A tool gate must be the identity check's own result: "
-                          f"declare the variable that response_mapping fills from {gate.producer_operation} {gate.response_path}, and route on what the caller says separately")
-        for node in nodes.values():
-            for tool in node.get("tools", []) + node.get("pre_actions", []):
-                function = tool.get("function", {})
-                if not isinstance(function, dict):
-                    continue
-                snippets = [tool.get("pre_process_code", ""), tool.get("post_process_code", "")]
-                if function.get("handler") == "__function__:code_exec":
-                    snippets.append(function.get("parameters", {}).get("properties", {}).get("code", {}).get("default", ""))
-                for snippet in snippets:
-                    try:
-                        tree = ast.parse(snippet)
-                    except (SyntaxError, TypeError):
-                        continue
-                    for item in ast.walk(tree):
-                        if isinstance(item, ast.Subscript) and isinstance(item.ctx, ast.Store) and isinstance(item.slice, ast.Constant):
-                            if item.slice.value == expected_var or (direct and item.slice.value == gate.variable):
-                                errors.append(label + "generated code cannot forge a tool gate variable")
-                            if function.get("name") == gate.producer_operation and item.slice.value == gate.response_path.rsplit(".", 1)[-1]:
-                                errors.append("Producer hook cannot overwrite its gate response field")
-        stack = [(initial, False, False)] if initial in nodes else []
-        seen = set()
-        while stack:
-            key, guarded, producer_seen = stack.pop()
-            if (key, guarded, producer_seen) in seen:
-                continue
-            seen.add((key, guarded, producer_seen))
-            if gate.operation in calls[key] and not guarded:
-                (errors if gate.operation in PROTECTED else warnings).append(f"{key}: {gate.operation} reachable without its declared gate ({gate.variable} in {gate.allowed_values} after {gate.producer_operation})")
-            producer_seen = producer_seen or gate.producer_operation in calls[key]
-            for target, condition in edges[key]:
-                stack.append((target, guarded or (producer_seen and _entails(condition, gate_variables, gate.allowed_values)), producer_seen))
-    # close_call must be isolated from other bank actions and cannot lead back to one.
-    for key, names in calls.items():
-        if "close_call" not in names:
-            continue
-        if names != ["close_call"]:
-            errors.append(f"{key}: close_call must be the only tool at its stage")
-        pending, seen = [target for target, _ in edges[key]], set()
-        while pending:
-            target = pending.pop()
-            if target in seen:
-                continue
-            seen.add(target)
-            if calls[target]:
-                errors.append(f"{key}: bank tool reachable after close_call")
-            pending += [n for n, _ in edges[target]]
-    if "close_call" in contracts["operations"]:
-        pending = [(initial, False)] if initial in nodes else []
-        seen = set()
-        while pending:
-            key, closed = pending.pop()
-            if (key, closed) in seen:
-                continue
-            seen.add((key, closed))
-            # Only engine-run close guarantees a call; discretionary dialogue does not.
-            closed = closed or ("close_call" in calls[key] and nodes[key].get("node_type") == "api_request")
-            if key in ends and not closed:
-                errors.append(f"{key}: terminal can bypass deterministic close_call")
-            pending += [(target, closed) for target, _ in edges[key]]
-    return {"valid": not errors, "errors": sorted(set(errors)), "warnings": sorted(set(warnings)), "dead_ends": sorted(set(dead_ends)), "evidence_type": "static", "reachable_nodes": len(reachable), "covered_rules": len(parsed.coverage), "policy_proven": False}
+                warnings.append(f"{key}: offers {sorted(offered)}, computed by {sorted(chain)}, and its route to {first} runs straight back into that check, which never reads "
+                                f"{sorted(offered)}. If that route is taken when the customer accepts the offer, nothing is applied and the call loops; "
+                                "acceptance then needs its own route through a code stage that copies the offered value into the variable the check reads")
+    return result()
 
 
-def _edit(spec, operations):
-    workflow = spec.get("workflow")
+def _wording_free(value, names=False):
+    """The value without its wording. `names`: the keys of this object are stage or field names, never wording keys."""
+    if isinstance(value, dict):
+        return {k: _wording_free(v, k in ("nodes", "global_nodes", "bindings")) for k, v in value.items() if names or k not in WORDING}
+    if isinstance(value, list):
+        return [_wording_free(v) for v in value]
+    return value
+
+
+def is_wording(before, after):
+    """True when two sources differ only in what the dialogue model is told or says: no route, extraction, value, code or stage changed."""
+    return before != after and _wording_free(before.get("workflow")) == _wording_free(after.get("workflow"))
+
+
+def edited_stages(fix):
+    """The stages a fix touches; None when it can affect every call (a workflow-level edit or a removed stage)."""
+    edits = fix["edits"]
+    return None if any(e["op"] in ("set_workflow_field", "remove_stage") for e in edits) else {e["stage"] for e in edits}
+
+
+def apply_fix(source, fix):
+    """Apply one fix to a workflow source. Everything the fix does not name is kept as it is."""
+    fix = Fix.model_validate(fix)
+    result = deepcopy(source)
+    workflow = result.get("workflow")
     if not isinstance(workflow, dict) or not isinstance(workflow.get("nodes"), dict):
-        raise ValueError("The proposal has no workflow.nodes object to edit")
-    for edit in operations:
-        if edit.op == "set_node":
-            if not isinstance(edit.value, dict) or edit.value.get("name") != edit.target:
-                raise ValueError(f"set_node {edit.target}: value must be the complete stage object with name {edit.target}")
-            workflow["nodes"][edit.target] = deepcopy(edit.value)
-        elif edit.op == "remove_node":
-            if edit.target not in workflow["nodes"]:
-                raise ValueError(f"remove_node {edit.target}: no such stage")
-            del workflow["nodes"][edit.target]
-        elif edit.op == "set_system_prompt":
-            workflow["system_prompt"] = edit.value
-        elif edit.op == "set_initial_node":
-            workflow["initial_node"] = edit.value
-        elif edit.op == "set_global_nodes":
-            workflow["global_nodes"] = deepcopy(edit.value)
-
-
-def apply_patch(spec, patch):
-    """Apply a repair to the proposal it was written for; everything the patch does not name is kept."""
-    patch = RepairPatch.model_validate(patch)
-    repaired = deepcopy(spec)
-    _edit(repaired, patch.operations)
-    if patch.tool_gates:
-        repaired["tool_gates"] = [gate.model_dump() for gate in patch.tool_gates]
-    if repaired.get("workflow") == spec.get("workflow") and repaired.get("tool_gates") == spec.get("tool_gates"):
-        raise ValueError("The patch changes nothing")
-    return repaired
-
-
-def apply_mutation(parent, mutation, parent_id):
-    mutation = Mutation.model_validate(mutation)
-    if mutation.parent_id != parent_id or not mutation.operations or not mutation.hypothesis:
-        raise ValueError("Mutation needs correct parent, edits and rationale")
-    child = deepcopy(parent)
-    _edit(child, mutation.operations)
-    child["coverage"] = {k: v.model_dump() for k, v in mutation.coverage.items()}
-    if child["workflow"] == parent["workflow"]:
-        raise ValueError("Mutation did not change workflow")
-    return child
+        raise ValueError("the workflow has no nodes object to edit")
+    nodes = workflow["nodes"]
+    for edit in fix.edits:
+        label = f"{edit.op} {edit.stage}{'.' + edit.field if edit.field else ''}"
+        if edit.op == "set_workflow_field":
+            if edit.field not in ("system_prompt", "initial_node") or not isinstance(edit.value, str):
+                raise ValueError(f"{label}: only system_prompt and initial_node can be set, to a text value")
+            workflow[edit.field] = edit.value
+        elif edit.op == "remove_stage":
+            if edit.stage not in nodes:
+                raise ValueError(f"{label}: no such stage")
+            del nodes[edit.stage]
+        elif edit.op == "set_stage":
+            if not edit.stage or not isinstance(edit.value, dict):
+                raise ValueError(f"{label}: value must be the complete stage object")
+            nodes[edit.stage] = {**deepcopy(edit.value), "name": edit.stage}
+        else:
+            if not isinstance(nodes.get(edit.stage), dict):
+                raise ValueError(f"{label}: no such stage; add a new stage with set_stage")
+            if not edit.field or edit.field == "name":
+                raise ValueError(f"{label}: name the field to replace")
+            if edit.value is None:
+                nodes[edit.stage].pop(edit.field, None)
+            else:
+                nodes[edit.stage][edit.field] = deepcopy(edit.value)
+            if edit.field == "code":
+                nodes[edit.stage].pop("pre_actions", None)
+    if result == source:
+        raise ValueError("it changes nothing")
+    return result

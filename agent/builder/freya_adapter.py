@@ -36,20 +36,23 @@ def time_limit(seconds):
 
 @contextmanager
 def file_lock(path, deadline):
+    """Hold the lock while the block runs. Yields False, without the lock, when the budget ran out
+    waiting for it: the caller still owns its export reserve and must be able to use it."""
     path = writable(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as stream:
-        while True:
-            deadline.require()
+        held = False
+        while not held and deadline.remaining() > 0:
             try:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
+                held = True
             except BlockingIOError:
                 time.sleep(min(0.2, deadline.remaining()))
         try:
-            yield
+            yield held
         finally:
-            fcntl.flock(stream, fcntl.LOCK_UN)
+            if held:
+                fcntl.flock(stream, fcntl.LOCK_UN)
 
 
 def load_module(name, path):
@@ -125,7 +128,6 @@ class FreyaAdapter:
         self.original_api = self.client.api
         self.client.api = self.api
         self.exporting = False
-        self.lease = self.runtime / "simulation.json"
         self.deployment = None
         self.current_simulation = None
 
@@ -146,24 +148,18 @@ class FreyaAdapter:
                 time.sleep(min(5 * (attempt + 1), 20))
         self.trace.event("freya_api", method=method, path=path)
         if method == "POST" and path == "/api/v2/simulations":
-            sim_id = (result.get("simulation") or result)["id"]
-            self.current_simulation = sim_id
-            write_json(self.lease, {"simulation_id": sim_id})
+            self.current_simulation = (result.get("simulation") or result)["id"]
         return result
 
     @contextmanager
     def workspace(self):
-        # All builds use this common lock, including distinct feedback arms.
-        with file_lock(self.runtime / "workspace.lock", self.deadline):
-            if self.lease.exists():
-                sim_id = json.loads(self.lease.read_text())["simulation_id"]
-                while True:
-                    response = self.api("GET", f"/api/v2/simulations/{sim_id}")
-                    if (response.get("simulation") or response).get("status") in {"completed", "failed", "paused"}:
-                        self.lease.unlink()
-                        break
-                    self.deadline.require(10)
-                    time.sleep(10)
+        """One build at a time on this machine: builds share the slots file and Freya's single simulation.
+
+        Nothing here waits for a simulation an earlier build left running. The kit client already
+        waits at the moment it starts one, and a build that starts none must not wait at all."""
+        with file_lock(self.runtime / "workspace.lock", self.deadline) as held:
+            if not held:
+                self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out")
             yield self
 
     def validate_remote(self, workflow):
@@ -328,8 +324,6 @@ class FreyaAdapter:
                     row["verified_hard_failure"] = any(c.get("tool") in {"get_account", "create_promise"} and c.get("result", {}).get("error") == "identity not verified" for c in ledger.get("calls", []))
                 raw["all_rows"].append(rows)
                 raw["simulations"].append({"id": sim_id, "iteration_id": iteration_id, "status": status, "seconds": seconds, "median_slowest_turn": median})
-                if self.lease.exists():
-                    self.lease.unlink()
                 # Only supplied synthetic practice data enters local evidence; secrets redacted.
                 write_json(folder / "raw_runner.json", self.trace.redact(raw))
                 write_json(folder / f"iteration_{repetition}.json", self.trace.redact(iterations[-1]))
@@ -344,7 +338,7 @@ class FreyaAdapter:
             write_json(folder / "raw_runner.json", self.trace.redact(raw))
 
 
-def public_suite(documents, openapi_hash, brief=None, only=None, style="", repetitions=1, seed=42):
+def public_suite(documents, openapi_hash, brief=None, only=None, style="", repetitions=1):
     """Never silently run practice expectations against an unfamiliar policy/API."""
     cases_path = KIT / "public-test-set.json"
     if not cases_path.exists():
@@ -367,5 +361,5 @@ def public_suite(documents, openapi_hash, brief=None, only=None, style="", repet
         raise ValueError("Unknown or mismatched public case selector")
     if not cases:
         raise ValueError("Public suite is empty")
-    suite = Suite(tuple(c["id"] for c in cases), digest({"cases": cases, "runner": (KIT / "tools/run_cases.py").read_text(), "scorer": (KIT / "tools/score.py").read_text(), "policy": [d["text"] for d in documents], "openapi": openapi_hash}), "official_public", repetitions, style, seed)
+    suite = Suite(tuple(c["id"] for c in cases), digest({"cases": cases, "runner": (KIT / "tools/run_cases.py").read_text(), "scorer": (KIT / "tools/score.py").read_text(), "policy": [d["text"] for d in documents], "openapi": openapi_hash}), "official_public", repetitions, style)
     return suite, cases

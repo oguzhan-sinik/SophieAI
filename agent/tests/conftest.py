@@ -24,24 +24,38 @@ def contracts():
 
 @pytest.fixture
 def requirements():
-    return {'requirements': [{'rule_id': 'R1', 'source': {'path': 'fixture', 'heading': 'Policy', 'span': 'Verify first.', 'start_line': 1, 'end_line': 1}, 'kind': 'privacy', 'priority': 'hard', 'condition': 'before account access', 'must': ['Verify first'], 'must_not': [], 'parameters': {}, 'dependencies': [], 'precedence': {'supersedes': [], 'superseded_by': []}, 'interpretation_status': 'resolved', 'test_templates': ['unauthenticated']}], 'input_variables': ['customer_id'], 'unresolved': []}
+    return {'requirements': [{'rule_id': 'R1', 'source': {'path': 'fixture', 'heading': 'Policy', 'span': 'Verify first.', 'start_line': 1, 'end_line': 1}, 'kind': 'privacy', 'priority': 'hard', 'condition': 'before account access', 'must': ['Verify first'], 'must_not': [], 'parameters': {}, 'dependencies': [], 'precedence': {'supersedes': [], 'superseded_by': []}, 'interpretation_status': 'resolved'}], 'input_variables': ['customer_id'], 'unresolved': []}
+
+def route(target, condition=None):
+    return {'target_node': target, 'description': 'Continue', 'condition': condition or {'operator': 'always'}}
+
+def equals(variable, *operands):
+    return {'logic': 'or', 'conditions': [{'variable': variable, 'operator': 'equals', 'operand': o} for o in operands]}
+
+def bank(operation, mapping=None, **bindings):
+    tool = {'bank_operation': operation, 'description': 'CALL when authorized by the policy.'}
+    if bindings: tool['bindings'] = bindings
+    if mapping: tool['response_mapping'] = [{'path': 'data.' + field, 'variable': variable} for field, variable in mapping.items()]
+    return tool
+
+def action(name, tool, *routes):
+    return {'name': name, 'node_type': 'api_request', 'pre_actions': [tool], 'transitions': [route(*r) if isinstance(r, tuple) else route(r) for r in routes]}
 
 @pytest.fixture
-def spec(contracts):
-    from builder.contracts import tool_from_contract
-    def tool(name, bindings=None):
-        return tool_from_contract(contracts['operations'][name], 'CALL when authorized by the policy.', bindings)
-    def route(target, condition=None):
-        return {'target_node': target, 'description': 'Continue', 'condition': condition or {'operator': 'always'}}
-    def action(name, operation, target, bindings=None):
-        return {'name': name, 'node_type': 'api_request', 'pre_actions': [tool(operation, bindings)], 'passthrough': True,
-                'passthrough_default_transition': target, 'on_enter': {'type': 'silent'}, 'transitions': [route(target)]}
-    w = {'initial_node': 'verify', 'system_prompt': 'Follow the input policy.', 'global_nodes': {}, 'nodes': {
-        'verify': {'name': 'verify', 'node_type': 'conversation', 'task_message': 'Verify identity before disclosure.', 'tools': [tool('verify_identity')],
-                   'transitions': [route('account', {'logic': 'or', 'conditions': [{'operator': 'equals', 'variable': 'verify_identity_response.data.all_verified', 'operand': 'true'}, {'operator': 'equals', 'variable': 'verify_identity_response.data.all_verified', 'operand': 'True'}]})],
-                   'max_node_turns': 10, 'max_turn_transition': 'close'},
-        'account': action('account', 'get_account', 'close'),
-        'close': action('close', 'close_call', 'end', {'outcome': 'paid'}),
-        'end': {'name': 'end', 'node_type': 'end_call', 'transitions': [], 'terminal': {'type': 'function', 'function': {'name': 'done', 'handler': '__function__:end_call', 'parameters': {'type': 'object', 'properties': {'message_mode': {'type': 'string', 'default': 'custom'}, 'spoken_message': {'type': 'string', 'default': 'Goodbye.'}}}}}}
-    }}
-    return {'workflow': w, 'coverage': {'R1': {'nodes': ['verify', 'account'], 'tests': ['unauthenticated']}}, 'tool_gates': [{'operation': 'get_account', 'rule_ids': ['R1'], 'variable': 'verify_identity_response.data.all_verified', 'allowed_values': ['true', 'True'], 'producer_operation': 'verify_identity', 'response_path': 'data.all_verified'}], 'architecture': 'Minimal static test fixture, not a compliant bank phone agent.'}
+def spec():
+    """A minimal workflow source in the compact form models write. Not a compliant bank phone agent."""
+    return {'architecture': 'Ask, verify, read the account, close.', 'workflow': {'initial_node': 'verify', 'system_prompt': 'Follow the input policy.', 'nodes': {
+        'verify': {'name': 'verify', 'node_type': 'conversation', 'task_message': 'Ask for the date of birth.', 'max_node_turns': 10, 'max_turn_transition': 'close',
+                   'extraction_schema': [{'name': 'dob', 'type': 'date', 'description': 'The date of birth the caller gives.', 'min_confidence': 0.7}],
+                   'transitions': [route('check', {'logic': 'or', 'conditions': [{'variable': 'dob', 'operator': 'is_set'}]}), route('verify')]},
+        'check': action('check', bank('verify_identity', {'all_verified': 'all_verified'}, field='date_of_birth', answer='{{dob}}'), ('account', equals('all_verified', 'true', 'True')), 'close'),
+        'account': action('account', bank('get_account'), 'close'),
+        'close': action('close', bank('close_call', outcome='paid'), 'end'),
+        'end': {'name': 'end', 'node_type': 'end_call', 'transitions': [], 'terminal': {'type': 'function', 'function': {'name': 'done', 'handler': '__function__:end_call', 'parameters': {'type': 'object', 'properties': {'message_mode': {'type': 'string', 'default': 'custom'}, 'spoken_message': {'type': 'string', 'default': 'Goodbye.'}}}}}}}}}
+
+@pytest.fixture
+def check(contracts):
+    """Compile a source and run the static checks, as the builder does."""
+    from builder.contracts import compile_workflow
+    from builder.validation import validate
+    return lambda source: validate(compile_workflow(source['workflow'], contracts)[0], contracts)

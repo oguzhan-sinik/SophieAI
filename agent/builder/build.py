@@ -1,10 +1,9 @@
-"""Unattended brief-first build, evaluate, evolve and export CLI."""
+"""Unattended build: design a phone agent from a brief, fix it, measure it, improve it, export it."""
 import argparse
 from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
-import random
 import sys
 import time
 import uuid
@@ -16,14 +15,16 @@ if __package__ in {None, ''}:
 from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
 from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
-from .contracts import compile_openapi, compile_tools, normalize_spec, source_documents, validate_requirements
-from .freya_adapter import FreyaAdapter, public_suite
-from .diagnostics import grounded_diagnoses
-from . import prompts, runtime
-from .schemas import CodeProbes, Diagnostics, MutationGroup, RepairPatch, RequirementsBundle, WorkflowSpec
-from .scenarios import reconcile_probes, run_probes, validate_probe_targets
-from .scoring import FeedbackAdapter, Suite, choose_champion, group_advantages, score, select_beam
-from .validation import apply_mutation, apply_patch, validate
+from .contracts import compile_openapi, compile_workflow, source_documents, validate_requirements
+from .freya_adapter import FreyaAdapter, contains_definition, public_suite
+from . import prompts
+from .schemas import Patch, RequirementsBundle, WorkflowSpec
+from .scoring import score, verdicts
+from .validation import apply_fix, edited_stages, is_wording, validate
+
+FIX_SECONDS = 150        # time a fix call may need; a round is not started with less
+FIRST_SIMULATION = 240   # assumed length of a simulation until one has been observed
+BROKEN = (ValueError, KeyError, TypeError, AttributeError)
 
 
 def source_manifest(documents, api_path):
@@ -32,28 +33,26 @@ def source_manifest(documents, api_path):
     return [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]
 
 
-def call_evidence(folder, raw, limit=80):
-    """Step-by-step record of every failed call, per repetition, for the diagnosis role only."""
-    calls = []
+def call_records(folder, raw, limit=80):
+    """What happened in a measured run: each failed call step by step, and the stages every call visited."""
+    failed, visited = {}, {}
     for repetition, rows in enumerate(raw.get('all_rows', [])):
         path = Path(folder) / f'calls_{repetition}.json'
         recorded = json.loads(path.read_text()) if path.exists() else {}
-        failed = {}
         for row in rows:
             call = recorded.get(row.get('id'))
-            if row.get('pass') is True or not isinstance(call, dict):
+            if not isinstance(call, dict):
                 continue
             turns = call.get('turns', [])
-            if len(turns) > limit:
+            visited.setdefault(row['id'], set()).update(turn['node'] for turn in turns if turn.get('node'))
+            if row.get('pass') is not True and row['id'] not in failed:
                 # A stuck call repeats itself; its start and its end carry the information.
-                call = {**call, 'turns': turns[:limit // 2] + turns[-(limit // 2):], 'turns_omitted': len(turns) - limit}
-            failed[row['id']] = call
-        calls.append(failed)
-    return calls
+                failed[row['id']] = call if len(turns) <= limit else {**call, 'turns': turns[:limit // 2] + turns[-(limit // 2):], 'turns_omitted': len(turns) - limit}
+    return failed, visited
 
 
 class Builder:
-    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, pinned=None, resume=None, only=None, style='', public_brief=None):
+    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None):
         self.cfg = cfg
         self.deadline = Deadline(cfg.max_wall_seconds, cfg.reserve)
         self.run_id = time.strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
@@ -63,36 +62,24 @@ class Builder:
         self.openapi_path = Path(openapi).resolve()
         self.contracts = compile_openapi(self.openapi_path)
         self.brief_hash = digest([d['text'] for d in self.documents])
-        self.trace = Trace(self.root / 'build_trace.log', {'run_id': self.run_id, 'mode': cfg.mode, 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256']}, cfg.tracing)
+        self.trace = Trace(self.root / 'build_trace.log', {'run_id': self.run_id, 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256']}, cfg.tracing)
         self.archive = Archive(self.root)
         self.roles = roles_factory(cfg, self.deadline, self.trace, self.root)
-        self.adapter_factory = adapter_factory
-        self.pinned = Path(pinned).resolve() if pinned else None
+        self.adapter_factory, self.adapter = adapter_factory, None
         self.resume = writable(resume) if resume else None
-        if self.resume:
-            old = json.loads((self.resume / 'manifest.json').read_text())
-            if old['brief_hash'] != self.brief_hash or old['openapi_hash'] != self.contracts['sha256']:
-                raise ValueError('Resume inputs differ from original run')
-            if not self.pinned and (self.resume / 'pinned_root.json').exists():
-                self.pinned = self.resume / 'pinned_root.json'
-        self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions, cfg.seed) if cfg.official else (None, [])
-        self.scores, self.feedback, self.valid, self.kinds, self.advantages = {}, {}, {}, {}, {}
-        # usable: may be deployed and ranked. A valid candidate, or one whose only findings its shipped parent already has.
-        self.usable, self.findings = {}, {}
-        self.exports = {}
-        self.champion = self.best_official = self.best_proxy = None
-        self.simulations = 0
-        self.slowest_simulation = 0.0
-        self.baseline_raw = self.baseline_suite = None
-        self.probes = {'probes': []}
-        self.held_out_score = None
-        self.best_effort = False
-        self.feedback_adapter = FeedbackAdapter(cfg.mode)
-        self.adapter = None
+        self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions) if cfg.official else (None, [])
+        # One Freya workflow per brief, updated in place on every run.
+        self.slot = 'builder-' + Path(self.documents[-1]['path']).stem
         self.submission_dir = AGENT / 'out'
+        self.requirements = None
+        self.static = {}     # candidate -> result of the static checks
+        self.measured = {}   # candidate -> its simulation result, in the order measured
+        self.exports = {}    # candidate -> a verified real export of it
+        self.wording = {}    # measured candidate -> its wording-only child, committed without a simulation
+        self.history = []    # every fix of the improvement loop and what became of it
+        self.simulations, self.slowest, self.best_effort = 0, 0.0, False
         self.started = now()
         self.start_clock = time.monotonic()
-        self.random = random.Random(cfg.seed)
         write_json(self.root / 'manifest.json', {'run_id': self.run_id, 'start': self.started, 'config': asdict(cfg), 'sources': source_manifest(self.documents, self.openapi_path), 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'suite': asdict(self.suite) if self.suite else None, 'code_sha256': digest({str(p.relative_to(AGENT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((AGENT / 'builder').rglob('*.py'))})})
         write_json(self.root / 'sources.json', [{'path': d['path'], 'text': d['text']} for d in self.documents], immutable=True)
         write_json(self.root / 'tool_contracts.json', self.contracts, immutable=True)
@@ -104,471 +91,398 @@ class Builder:
         for name in ('requirements.txt', 'requirements.lock'):
             (self.root / 'source_code' / name).write_bytes((AGENT / name).read_bytes())
 
-    def compile(self):
-        spec = None
-        self.requirements = None
-        if self.pinned:
-            pinned = json.loads(self.pinned.read_text())
-            if pinned['brief_hash'] != self.brief_hash or pinned['openapi_hash'] != self.contracts['sha256']:
-                raise ValueError('Pinned root does not match current brief/OpenAPI')
-            self.requirements = validate_requirements(pinned['requirements'], self.documents)
-            self.probes = pinned.get('code_probes', {'probes': []})
-            spec = pinned['spec']
-        elif self.resume:
-            # Analyst outputs contain source compilation only, never benchmark feedback.
-            paths = [self.resume / 'requirements.json'] + sorted((self.resume / 'model_calls').glob('*.response.json'), reverse=True)
-            for path in paths:
-                if not path.exists():
-                    continue
-                proposal = json.loads(path.read_text())
-                if not {'requirements', 'input_variables', 'unresolved'} <= set(proposal):
-                    continue
-                try:
-                    self.requirements = validate_requirements(proposal, self.documents)
-                    self.trace.event('requirements_resumed', source=str(path), source_hash=digest(proposal))
-                    break
-                except ValueError:
-                    continue
-            if self.requirements is not None:
-                for path in sorted((self.resume / 'model_calls').glob('*.response.json'), reverse=True):
-                    try:
-                        spec = WorkflowSpec.model_validate_json(path.read_text()).model_dump()
-                    except ValueError:
-                        continue
-                    self.trace.event('proposal_resumed', source=str(path), source_hash=digest(spec))
-                    break
-                if spec is None and (self.resume / 'lineage.jsonl').exists():
-                    for line in reversed((self.resume / 'lineage.jsonl').read_text().splitlines()):
-                        record = json.loads(line)
-                        if record.get('event') != 'candidate_created' or record.get('parent_id') or record.get('mutation_kind') not in {'baseline', 'compile_repair'}:
-                            continue
-                        path = self.resume / 'candidates' / record['candidate_id'] / 'proposal.json'
-                        spec = WorkflowSpec.model_validate_json(path.read_text()).model_dump()
-                        if digest(spec['workflow']) != record['workflow_sha256']:
-                            raise ValueError('Resumed proposal snapshot was modified')
-                        self.trace.event('proposal_resumed', source=str(path), source_hash=digest(spec))
-                        break
-        if self.requirements is None:
-            errors = []
-            for attempt in range(2):
-                proposal = self.roles.ask('BriefAnalystAgent', 'Extract atomic rules with provenance and precedence', prompts.ANALYST,
-                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle)
-                try:
-                    self.requirements = validate_requirements(proposal, self.documents)
-                    break
-                except ValueError as exc:
-                    write_json(self.root / f'requirements_rejected_{attempt}.json', proposal)
-                    errors = [str(exc)]
-            if self.requirements is None:
-                raise ValueError('Policy compilation failed: ' + str(errors))
-        write_json(self.root / 'requirements.json', self.requirements, immutable=True)
-        if spec is None:
-            payload = {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
-                       'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}}
-            spec = self.roles.ask('ADASDesignerAgent', 'Design and generate source-driven Freya root', prompts.DESIGNER, payload, WorkflowSpec)
-        fallbacks, accepted, carried = [], None, []
-
-        def pin(traps, cid, spec):
-            self.champion = cid
-            self.kinds[cid] = 'baseline'
-            write_json(self.root / 'pinned_root.json', {'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'requirements': self.requirements, 'spec': spec, 'code_probes': self.probes}, immutable=True)
-            write_json(self.root / 'reports/coverage.json', spec['coverage'])
-            return cid
-
-        for attempt in range(3):
-            # The model keeps seeing its own compact proposal; only the archived copy is expanded.
-            compact, compiled_ok = spec, False
-            try:
-                compact, notes = normalize_spec(spec, self.contracts)
-                if notes:
-                    self.trace.event('proposal_normalized', count=len(notes), notes=notes[:20])
-                spec = {**compact, 'workflow': compile_tools(compact['workflow'], self.contracts)}
-                validation = validate(spec, self.contracts, self.requirements)
-                compiled_ok = True
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                validation = {'valid': False, 'errors': [f'{type(exc).__name__}: {exc}'], 'evidence_type': 'static'}
-            candidate = self.archive.add(spec, mutation_kind='baseline' if attempt == 0 else 'compile_repair', brief_sha256=self.brief_hash, openapi_sha256=self.contracts['sha256'])
-            cid = candidate['candidate_id']
-            self.record_validation(cid, validation)
-            self.trace.event('static_validation', candidate_id=cid, valid=validation['valid'], errors=validation['errors'][:40], warnings=validation.get('warnings', [])[:40])
-            if compiled_ok:
-                # Policy code is checked for every compiled candidate, not only statically clean ones:
-                # a best-effort export with wrong arithmetic fails customers just the same.
-                probe_errors = []
-                try:
-                    self.prepare_probes(spec)
-                    if self.probes['probes']:
-                        probe_result = run_probes(spec, self.probes, self.requirements, self.deadline)
-                        write_json(self.root / 'candidates' / cid / 'code_probes.json', probe_result)
-                        probe_errors = [self.probe_message(row) for row in probe_result['results'] if not row['pass'] and not row.get('skipped')]
-                        self.trace.event('code_probes', candidate_id=cid, passed=probe_result['passed'], total=probe_result['total'], failed=len(probe_errors))
-                except (ValueError, TimeoutError) as exc:
-                    self.trace.event('code_probes_unavailable', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
-                if probe_errors:
-                    # A probe's expectation is itself model-written and has been observed wrong while the
-                    # code was right, so a failed probe informs the repair but never blocks a candidate.
-                    validation = {**validation, 'warnings': validation.get('warnings', []) + ['unverified test, check against the source before changing code: ' + e for e in probe_errors]}
-                    self.archive.event('code_probe_flagged', candidate_id=cid, errors=probe_errors, evidence_type='local_code_only')
-                if not validation['valid']:
-                    fallbacks.append((len(validation['errors']), len(probe_errors), attempt, cid))
-            if validation['valid'] and self.adapter:
-                try:
-                    self.adapter.validate_remote(spec['workflow'])
-                except Exception as exc:
-                    validation = {'valid': False, 'errors': ['Freya dry-run rejected: ' + self.trace.redact(str(exc))], 'evidence_type': 'platform_schema'}
-                    self.valid[cid] = False
-                    self.archive.event('remote_validation_rejected', candidate_id=cid, **validation)
-            if validation['valid']:
-                traps = validation.get('dead_ends', [])
-                if accepted is None or len(traps) < len(accepted[0]):
-                    accepted = (traps, cid, spec)
-                if not traps or self.pinned or attempt == 2 or self.deadline.remaining() < 420:
-                    break
-                # A deployable root that can trap a call gets a repair aimed at those stages;
-                # it stays the root unless the repair is itself valid and traps fewer.
-                self.trace.event('dead_end_repair', candidate_id=cid, stages=traps[:20])
-                validation = {**validation, 'errors': traps}
-            if self.pinned:
-                raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
-            if attempt == 2:
-                break
-            try:
-                # A repair names only the stages it changes; rewriting the whole workflow has corrupted the rest.
-                patch = self.roles.ask('WorkflowCompilerAgent', 'Repair static workflow violations', prompts.REPAIR + prompts.DESIGNER,
-                                       {'documents': self.documents, 'requirements': self.requirements, 'contracts': self.contracts,
-                                        'runtime_docs': {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')},
-                                        'proposal': compact, 'compiler_errors': carried + validation['errors'],
-                                        'advisory_warnings': validation.get('warnings', []) + ([] if validation['valid'] else validation.get('dead_ends', []))}, RepairPatch)
-            except (ValueError, TimeoutError) as exc:
-                self.trace.event('repair_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
-                break
-            try:
-                spec, carried = apply_patch(compact, patch), []
-                self.trace.event('repair_patch_applied', edits=[f"{e['op']} {e['target']}" for e in patch['operations']][:40], gates_replaced=bool(patch['tool_gates']))
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                # Nothing usable came back. The proposal is unchanged and the next attempt is told why.
-                spec, carried = compact, ['Your last repair patch was rejected: ' + self.trace.redact(str(exc))[:400]]
-                self.trace.event('repair_patch_rejected', message=carried[0])
-        if accepted:
-            return pin(*accepted)
-        # No candidate passed every local gate. A phone agent the platform accepts still beats none:
-        # ship the least-flawed compiled candidate, clearly labelled, never as a validated root.
-        for count, _, _, cid in sorted(fallbacks):
-            try:
-                if self.adapter:
-                    self.adapter.validate_remote(self.archive.spec(cid)['workflow'])
-            except Exception as exc:
-                self.archive.event('remote_validation_rejected', candidate_id=cid, errors=['Freya dry-run rejected: ' + self.trace.redact(str(exc))])
-                continue
-            self.champion, self.best_effort = cid, True
-            self.kinds[cid] = 'baseline'
-            # It is the agent being shipped, so it is also the agent worth measuring and improving.
-            self.usable[cid] = True
-            self.trace.event('best_effort_root', candidate_id=cid, unresolved_local_findings=count)
-            return cid
-        raise ValueError('No valid baseline: ' + '; '.join(validation['errors']))
+    # ------------------------------------------------------------------ model calls
 
     @staticmethod
-    def probe_message(row):
-        return (f"code probe {row['id']} on {row.get('node_id')} (rules {', '.join(row.get('rule_ids', []))}): with variables "
-                f"{json.dumps(row.get('variables'))} the source requires {json.dumps(row.get('expected'))} but the code gave "
-                f"{json.dumps(row.get('observed'))}" + (f" [{row['error']}]" if row.get('error') else '') + (f". Reason: {row['rationale']}" if row.get('rationale') else ''))
+    def docs():
+        return {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}
 
-    def prepare_probes(self, spec):
-        if self.probes['probes'] or self.pinned or not any(n.get('node_type') == 'code' for n in spec['workflow']['nodes'].values()):
-            return
-        # The planner sees the model's own code; the controller prelude is not what is under test.
-        code_nodes = {}
-        for key, node in spec['workflow']['nodes'].items():
-            if node.get('node_type') == 'code':
-                code_nodes[key] = json.loads(json.dumps(node))
-                for tool in code_nodes[key].get('pre_actions', []):
-                    code = tool.get('function', {}).get('parameters', {}).get('properties', {}).get('code', {})
-                    if isinstance(code.get('default'), str):
-                        code['default'] = runtime.strip(code['default'])
+    def extract_rules(self):
+        """A checklist for the designer. Useful, never required: raw bank material may not compile cleanly."""
         errors = []
         for attempt in range(2):
-            saved_probes = self.resume / 'code_probe_suite.json' if self.resume else None
-            if attempt == 0 and saved_probes and saved_probes.exists():
-                probes = json.loads(saved_probes.read_text())
-            else:
-                probes = self.roles.ask('ScenarioPlannerAgent', 'Generate source-grounded deterministic code probes',
-                'Create at most six independent code-node probes. Give synthetic input vars and expected output vars grounded in cited rule IDs. Cover date boundaries, changed call now, amount floors and malformed inputs where present. Target only supplied code nodes. expected must contain only variables actually written by that node, never oracle descriptions or explanatory notes; put explanations in rationale. Do not test API hooks. Do not use real customer data or claim these tests prove bank behavior. Use source parameters rather than code implementation as the expectation oracle. Never count business days yourself: for every expected variable that is the Nth business day after a date, add a calendar entry (variable, anchor, weekdays with Monday=0, every excluded date the source lists, count) and the controller calculates the day. Expect no other calendar date unless it is one of the input values.',
-                {'requirements': self.requirements, 'code_nodes': code_nodes, 'probe_errors': errors}, CodeProbes)
             try:
-                validate_probe_targets(spec, probes)
-                probes = self.roles.ask('ScenarioRefereeAgent', 'Independently verify source-derived test expectations',
-                    'Audit each proposed test using ONLY source policy and its synthetic inputs. Return corrected CodeProbes. Never count business days yourself: the controller calculates each calendar entry and writes the day into expected. Check every calendar entry against the source instead: the anchor, the business weekdays, every excluded date and the count; correct them, and add an entry for any business-day expectation that lacks one. Reject or remove tests whose expected behavior is not prescribed by a source rule. Preserve node/output variable names. Do not invent fallback behavior for malformed inputs unless prescribed. You cannot see implementation outputs; do not infer expected results from them.',
-                    {'documents': self.documents, 'requirements': self.requirements, 'proposed_probes': probes}, CodeProbes, self.cfg.referee_model)
-                probes, notes = reconcile_probes(probes)
-                if notes:
-                    self.trace.event('code_probes_reconciled', notes=notes)
-                validate_probe_targets(spec, probes)
-                self.probes = probes
-                break
-            except ValueError as exc:
-                errors = [str(exc)]
-        if not self.probes['probes']:
-            raise ValueError('Invalid generated code probes: ' + str(errors))
-        write_json(self.root / 'code_probe_suite.json', self.probes)
+                proposal = self.roles.ask('BriefAnalystAgent', "Extract the brief's rules with their source lines", prompts.ANALYST,
+                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle)
+                requirements = validate_requirements(proposal, self.documents)
+                write_json(self.root / 'requirements.json', requirements, immutable=True)
+                return requirements
+            except (ValueError, TimeoutError) as exc:
+                errors = [self.trace.redact(str(exc))[:600]]
+                self.trace.event('requirements_rejected', attempt=attempt + 1, message=errors[0])
+                if isinstance(exc, TimeoutError):
+                    break   # a second try would take the time the designer needs
+        self.trace.event('requirements_unavailable', reason='the designer reads the brief without an extracted rule list')
+        return None
 
-    def record_validation(self, cid, result):
-        self.valid[cid] = self.usable[cid] = result['valid']
-        self.findings[cid] = list(result.get('errors', []))
+    def design(self):
+        if self.resume:
+            try:
+                saved = json.loads((self.resume / 'pinned_root.json').read_text())
+                if saved['brief_hash'] != self.brief_hash or saved['openapi_hash'] != self.contracts['sha256']:
+                    raise ValueError('its brief or tool API differs from this run')
+                self.requirements = saved.get('requirements')
+                self.trace.event('root_resumed', source=str(self.resume))
+                return WorkflowSpec.model_validate(saved['spec']).model_dump()
+            except (OSError, KeyError, ValueError) as exc:
+                raise ValueError(f'Cannot resume from {self.resume}: {exc}') from exc
+        self.requirements = self.extract_rules()
+        payload = {'documents': self.documents, 'contracts': self.contracts, 'runtime_docs': self.docs()}
+        if self.requirements:
+            payload['requirements'] = self.requirements
+        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec)
+
+    def fix(self, purpose, source, problems, hints=(), calls=None, wording_only=False, docs=False):
+        """The one way a workflow is changed after its design: a patch of small edits to its source."""
+        payload = {'documents': [{'path': d['path'], 'text': d['text']} for d in self.documents], 'contracts': self.contracts, 'workflow': source['workflow'],
+                   'problems': problems, 'hints': list(hints)[:20], 'history': self.history[-30:], 'wording_only': wording_only}
+        if calls:
+            payload['calls'] = calls
+        if docs:
+            payload['runtime_docs'] = self.docs()
+        return self.roles.ask('FixAgent', purpose, prompts.FIX, payload, Patch, max_tokens=20000)
+
+    # ------------------------------------------------------------------ candidates
+
+    def check(self, source, remote=True):
+        """Compile a source and run the static checks; optionally let Freya validate the result too."""
+        try:
+            workflow, notes = compile_workflow(source.get('workflow'), self.contracts)
+            if notes:
+                self.trace.event('source_normalized', notes=notes[:20])
+            result = validate(workflow, self.contracts)
+        except BROKEN as exc:
+            return None, {'valid': False, 'errors': [str(exc) if isinstance(exc, ValueError) else f'{type(exc).__name__}: {exc}'], 'warnings': [], 'evidence_type': 'static'}
+        if result['valid'] and remote and self.adapter:
+            try:
+                self.adapter.validate_remote(workflow)
+            except TimeoutError:
+                pass   # no answer is not a rejection; deploying validates it again
+            except Exception as exc:
+                result = {**result, 'valid': False, 'errors': ['Freya dry-run rejected: ' + self.trace.redact(str(exc))[:600]], 'evidence_type': 'platform_schema'}
+        return workflow, result
+
+    def record(self, source, workflow, result, parent=None, patch=None, kind='design'):
+        candidate = self.archive.add(source, workflow if workflow is not None else source.get('workflow'), parent=parent, patch=patch, mutation_kind=kind,
+                                     brief_sha256=self.brief_hash, openapi_sha256=self.contracts['sha256'])
+        cid = candidate['candidate_id']
+        self.static[cid] = result
         write_json(self.root / 'candidates' / cid / 'validation.json', result, immutable=True)
         self.archive.event('validation', candidate_id=cid, **result)
+        self.trace.event('static_validation', candidate_id=cid, candidate_kind=kind, valid=result['valid'], errors=result['errors'][:40], warnings=result['warnings'][:40])
+        return cid
 
-    def checkpoint(self):
-        self.archive.checkpoint(champion_id=self.champion, best_official_id=self.best_official, best_proxy_id=self.best_proxy,
-                                active_deployment_id=self.adapter.deployment if self.adapter else None)
+    def apply_fixes(self, source, fixes, allowed=None, wording_only=False):
+        """Apply fixes one at a time. A fix that cannot be applied is dropped alone, with the reason.
 
-    def evaluate(self, cid):
-        if not self.suite or self.simulations + self.suite.repetitions > self.cfg.max_simulations or self.deadline.remaining() < max(60, 1.2 * self.slowest_simulation * self.suite.repetitions):
-            self.trace.event('evaluation_skipped', candidate_id=cid, reason='no_authorized_suite_or_budget')
-            return
-        folder = self.root / 'evaluations' / (cid + '_' + uuid.uuid4().hex[:6])
-        spec = self.archive.spec(cid)
-        try:
-            self.adapter.deploy(self.slot, spec['workflow'])
-            self.exports[cid] = self.adapter.export(spec['workflow'], folder / 'deployed.workflow.json')
-            if self.baseline_raw is not None and self.kinds.get(cid) == 'baseline':
-                if self.baseline_suite != self.suite.key:
-                    raise ValueError('Shared baseline suite mismatch')
-                raw = self.baseline_raw
-                write_json(folder / 'raw_runner.json', self.trace.redact(raw))
-                self.trace.event('shared_baseline_measurement', suite_key=self.suite.key)
+        `allowed` is the static errors the source already has: a fix may not add to them."""
+        applied, rejected = [], []
+        for fix in fixes:
+            try:
+                candidate = apply_fix(source, fix)
+                if wording_only and not is_wording(source, candidate):
+                    raise ValueError('it changes more than wording, and only wording is committed without a simulation')
+                if allowed is not None:
+                    errors = validate(compile_workflow(candidate['workflow'], self.contracts)[0], self.contracts)['errors']
+                    if len(errors) > len(allowed):
+                        raise ValueError('it adds compiler errors: ' + '; '.join([e for e in errors if e not in allowed][:3]))
+            except BROKEN as exc:
+                rejected.append((fix, self.trace.redact(str(exc))[:500]))
+                continue
+            source = candidate
+            applied.append(fix)
+        return source, applied, rejected
+
+    def note(self, fix, status, why=''):
+        self.history.append({'problem': fix['problem'], 'cases': fix['cases'], 'edits': [f"{e['op']} {e['stage']}{'.' + e['field'] if e['field'] else ''}" for e in fix['edits']], 'status': status, 'note': why})
+
+    # ------------------------------------------------------------------ root
+
+    def build_root(self):
+        source = self.design()
+        workflow, result = self.check(source)
+        cid = self.record(source, workflow, result)
+        tried, carried = [(cid, workflow, result)], []
+        for attempt in range(2):
+            if result['valid']:
+                break
+            try:
+                patch = self.fix('Fix what the compiler rejects', source, {'compiler': carried + result['errors']}, hints=result['warnings'], docs=True)
+            except (ValueError, TimeoutError) as exc:
+                self.trace.event('fix_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
+                break
+            fixed, applied, rejected = self.apply_fixes(source, patch['fixes'])
+            carried = [f"Your fix '{fix['problem'][:120]}' was not applied: {why}" for fix, why in rejected] or ([] if applied else ['Your last patch contained no fixes; every problem listed still stands.'])
+            self.trace.event('fixes_applied', stage='compile', applied=[fix['problem'][:160] for fix in applied], rejected=carried[:10])
+            if not applied:
+                continue
+            source = fixed
+            workflow, result = self.check(source)
+            cid = self.record(source, workflow, result, parent=cid, patch={'fixes': applied}, kind='compile_fix')
+            tried.append((cid, workflow, result))
+        if not result['valid']:
+            # No candidate passed every check. A phone agent the platform accepts still beats none:
+            # ship the least-flawed one, labelled as such.
+            for _, _, cid, workflow in sorted((len(r['errors']), i, c, w) for i, (c, w, r) in enumerate(tried) if w is not None):
+                try:
+                    self.adapter and self.adapter.validate_remote(workflow)
+                except TimeoutError:
+                    pass
+                except Exception as exc:
+                    self.archive.event('remote_validation_rejected', candidate_id=cid, errors=['Freya dry-run rejected: ' + self.trace.redact(str(exc))[:600]])
+                    continue
+                self.best_effort = True
+                self.trace.event('best_effort_root', candidate_id=cid, unresolved=len(self.static[cid]['errors']))
+                break
             else:
-                self.simulations += self.suite.repetitions
-                raw = self.adapter.evaluate(self.cases, self.suite, folder)
-        except (Exception, KeyboardInterrupt) as exc:
-            self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=str(exc))
-            path = folder / 'raw_runner.json'
-            raw = json.loads(path.read_text()) if path.exists() else {'all_rows': []}
-            if isinstance(exc, KeyboardInterrupt):
-                raise
-        self.slowest_simulation = max([self.slowest_simulation] + [float(s.get('seconds') or 0) for s in raw.get('simulations', [])])
+                raise ValueError('No workflow that Freya accepts: ' + '; '.join(result['errors'][:5]))
+        write_json(self.root / 'pinned_root.json', {'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'requirements': self.requirements, 'spec': self.archive.source(cid)}, immutable=True)
+        return cid
+
+    # ------------------------------------------------------------------ measuring
+
+    def simulation_fits(self, extra=0):
+        """Never start a simulation that cannot finish inside the build budget."""
+        return bool(self.suite) and self.simulations + self.suite.repetitions <= self.cfg.max_simulations and \
+            self.deadline.remaining() >= extra + 1.2 * (self.slowest or FIRST_SIMULATION) * self.suite.repetitions
+
+    def deploy(self, cid):
+        """Publish a candidate and keep a verified export of it, so a later outage cannot leave the build with nothing."""
+        workflow = self.archive.workflow(cid)
+        if cid not in self.exports or not self.adapter.deployment or self.adapter.deployment.get('workflow_hash') != digest(workflow):
+            self.adapter.deploy(self.slot, workflow)
+            self.exports[cid] = self.adapter.export(workflow, self.root / 'candidates' / cid / 'deployed.workflow.json')
+
+    def measure(self, cid):
+        """Deploy a candidate, run the practice customers once and freeze the score. True when the result is complete."""
+        folder = self.root / 'evaluations' / (cid + '_' + uuid.uuid4().hex[:6])
+        raw = {'all_rows': []}
+        try:
+            self.deploy(cid)
+            self.simulations += self.suite.repetitions
+            raw = self.adapter.evaluate(self.cases, self.suite, folder)
+        except Exception as exc:
+            self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
+            saved = folder / 'raw_runner.json'
+            raw = json.loads(saved.read_text()) if saved.exists() else raw
+        self.slowest = max([self.slowest] + [float(s.get('seconds') or 0) for s in raw.get('simulations', [])])
         frozen = score(raw, self.suite)
-        self.scores[cid] = frozen
         write_json(folder / 'core_score.json', asdict(frozen), immutable=True)
         self.archive.event('core_score_frozen', candidate_id=cid, **asdict(frozen))
-        diagnoses = []
-        if self.cfg.mode == 'scoring_with_diagnostics' and frozen.failed and self.deadline.remaining() > 30:
-            try:
-                evidence = self.trace.redact({**raw, 'calls': call_evidence(folder, raw)})
-                result = self.roles.ask('DiagnosisAgent', 'Diagnose frozen failures without changing score', prompts.DIAGNOSIS,
-                                        {'core_score': asdict(frozen), 'evidence': evidence, 'requirements': self.requirements,
-                                         'workflow': spec['workflow']}, Diagnostics, self.cfg.referee_model)
-                diagnoses = grounded_diagnoses(result['diagnoses'], evidence, self.requirements, spec['workflow'], set(self.suite.case_ids))
-                write_json(folder / 'diagnostics.json', diagnoses, immutable=True)
-            except Exception as exc:
-                self.trace.event('diagnosis_unavailable', error=type(exc).__name__)
-        self.feedback[cid] = self.feedback_adapter.for_optimizer(frozen, diagnoses)
-        if frozen.hard_fail_count and self.champion == cid:
-            self.champion = None
-        self.champion = choose_champion(self.champion, cid, self.scores, self.usable)
-        if self.champion and self.scores.get(self.champion) and self.scores[self.champion].complete:
-            self.best_official = self.champion
-        self.checkpoint()
+        failed, visited = call_records(folder, raw)
+        findings = {row['id']: row.get('failed', []) for rows in raw.get('all_rows', []) for row in rows if row.get('pass') is not True}
+        # The evidence stays with the candidate it was observed on: a fix is only ever shown calls of the workflow it edits.
+        self.measured[cid] = {'score': frozen, 'verdicts': verdicts(raw, self.suite), 'visited': visited, 'failed_calls': failed, 'findings': findings}
+        self.checkpoint(cid)
+        return frozen.complete
 
-    def search(self, root_id):
-        beam, count, diversify = [root_id], 1, False
-        rejected, barren = {}, {}
-        for depth in range(1, self.cfg.max_depth + 1):
-            if count >= self.cfg.max_candidates or self.deadline.remaining() < 30:
-                break
-            children = []
-            for parent_id in beam:
-                if barren.get(parent_id, 0) >= 2:
-                    # Two whole groups without one usable child: more of the same prompt will not help.
-                    self.trace.event('parent_exhausted', candidate_id=parent_id)
-                    continue
-                self.deadline.require(20)
-                group = 'group_' + uuid.uuid4().hex[:8]
-                parent = self.archive.spec(parent_id)
-                limit = min(self.cfg.group_size, self.cfg.max_candidates - count)
-                if limit <= 0:
+    def champion(self, root_id):
+        """The best measured candidate, later one on a tie, with its wording-only child when it has one."""
+        complete = [cid for cid, result in self.measured.items() if result['score'].complete]
+        if not complete:
+            return root_id
+        best = max(complete, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
+        return self.wording.get(best, best)
+
+    def checkpoint(self, root_id):
+        self.archive.checkpoint(champion_id=self.champion(root_id), active_deployment_id=self.adapter.deployment if self.adapter else None)
+
+    # ------------------------------------------------------------------ improving
+
+    def improve(self, root_id):
+        """A chain of batches. Each round applies every fix at once, measures once, and keeps or blames each fix alone."""
+        evidence = lambda cid: tuple(dict(self.measured[cid][key]) for key in ('verdicts', 'failed_calls', 'findings'))
+        base = root_id                               # the candidate the next fixes are applied to
+        known, calls, findings = evidence(root_id)   # what is known about `base`: verdict, failed call and finding per customer
+        barren = 0
+        while not all(known.values()):
+            simulate = self.simulation_fits(FIX_SECONDS)
+            if not simulate:
+                # No simulation fits any more. Wording can still be committed, onto what will be exported.
+                if self.deadline.remaining() < FIX_SECONDS:
                     break
-                feedback = self.feedback.get(parent_id, {'strict_pass_rate': None, 'complete': False, 'unknown_count': len(self.cases), 'evidence_type': 'unknown'})
-                proposals = self.roles.ask('MutationDesignerAgent', 'Generate diverse typed sibling workflow patches', prompts.MUTATOR + prompts.DESIGNER,
-                                            {'parent_id': parent_id, 'parent': parent, 'requirements': self.requirements, 'contracts': self.contracts,
-                                             'feedback': feedback, 'number_of_proposals': limit, 'diversify': diversify, 'seed': self.random.randrange(2**31),
-                                             'rejected_siblings': rejected.get(parent_id, [])[-12:], 'parent_static_findings': self.findings.get(parent_id, [])[:20]}, MutationGroup, self.cfg.mutator_model)['proposals']
-                usable, ready = 0, []
-                for proposal in proposals[:limit]:
-                    count += 1
-                    try:
-                        if not proposal.get('target_rule_ids') or not set(proposal['target_rule_ids']) <= {r['rule_id'] for r in self.requirements['requirements']}:
-                            raise ValueError('Mutation must target known source requirements')
-                        child = apply_mutation(parent, proposal, parent_id)
-                        child['workflow'] = compile_tools(child['workflow'], self.contracts)
-                        validation = validate(child, self.contracts, self.requirements)
-                        # The parent was shipped with its findings; a child that adds none is no worse and may be measured.
-                        inherited = bool(not validation['valid'] and not self.valid.get(parent_id) and self.usable.get(parent_id)
-                                         and set(validation['errors']) <= set(self.findings.get(parent_id, [])))
-                        if (validation['valid'] or inherited) and self.probes['probes']:
-                            # Probes are unverified tests, so a child is rejected only for a regression:
-                            # failing a probe its parent passes. Inherited failures do not block it.
-                            failing = lambda s: {row['id'] for row in run_probes(s, self.probes, self.requirements, self.deadline)['results'] if not row['pass'] and not row.get('skipped')}
-                            regressed = sorted(failing(child) - failing(parent))
-                            if regressed:
-                                validation, inherited = {'valid': False, 'errors': ['Code probes that passed on the parent now fail: ' + ', '.join(regressed)], 'evidence_type': 'local_code_only'}, False
-                    except Exception as exc:
-                        child, inherited = parent, False
-                        validation = {'valid': False, 'errors': [str(exc)], 'evidence_type': 'static'}
-                    record = self.archive.add(child, parent=parent_id, mutation=proposal, group=group, mutation_kind=proposal.get('mutation_type', 'other'), brief_sha256=self.brief_hash, openapi_sha256=self.contracts['sha256'])
-                    cid = record['candidate_id']
-                    self.kinds[cid] = proposal.get('mutation_type', 'other')
-                    self.record_validation(cid, validation)
-                    if inherited:
-                        self.usable[cid] = True
-                        self.trace.event('inherited_findings_accepted', candidate_id=cid, parent_id=parent_id, findings=len(validation['errors']))
-                    children.append(cid)
-                    if self.usable[cid] and not record['duplicate_of']:
-                        usable += 1
-                        ready.append((cid, proposal))
-                    else:
-                        # Compiler findings only: the same structural facts both feedback modes may see.
-                        reasons = ['Same workflow as an earlier candidate'] if self.usable[cid] else [self.trace.redact(str(e))[:300] for e in validation['errors'][:4]]
-                        rejected.setdefault(parent_id, []).append({'mutation_type': proposal.get('mutation_type'), 'edited': [str(o.get('target')) for o in proposal.get('operations', []) if isinstance(o, dict)], 'refused_because': reasons})
-                    self.checkpoint()
-                barren[parent_id] = 0 if usable else barren.get(parent_id, 0) + 1
-                # Simulations are scarce: the children aimed at the most failed customers are measured first.
-                for cid, proposal in sorted(ready, key=lambda item: -self.failed_cases_addressed(feedback, item[1])):
-                    self.evaluate(cid)
-                    self.checkpoint()
-                sibling_scores = {cid: self.scores.get(cid) for cid in children if self.archive.get(cid)['sibling_group_id'] == group}
-                advantages, summaries = group_advantages(sibling_scores, {cid: parent_id for cid in sibling_scores})
-                self.advantages.update(advantages)
-                diversify = not summaries or any(s['diversify'] for s in summaries)
-                self.archive.event('relative_rank', group_id=group, advantages=advantages, summaries=summaries, diversify=diversify)
-            beam = select_beam(beam + children, self.scores, self.usable, self.kinds, self.advantages, self.cfg.beam_width)
-            if not beam:
+                base = self.champion(root_id)
+                known, calls, findings = evidence(base)
+            failed = [case for case, ok in known.items() if not ok]
+            if not failed:
                 break
+            source = self.archive.source(base)
+            try:
+                patch = self.fix('Fix the causes of the failed practice calls', source,
+                                 {'failed_calls': [{'case': case, 'findings': findings.get(case, [])} for case in failed], 'passing': [case for case, ok in known.items() if ok]},
+                                 hints=self.static[base]['warnings'], calls={case: calls[case] for case in failed if case in calls}, wording_only=not simulate)
+            except (ValueError, TimeoutError) as exc:
+                self.trace.event('fix_unavailable', error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
+                break
+            fixed, applied, rejected = self.apply_fixes(source, patch['fixes'], allowed=self.static[base]['errors'], wording_only=not simulate)
+            workflow = result = None
+            if applied:
+                workflow, result = self.check(fixed)
+                added = [error for error in result['errors'] if error not in self.static[base]['errors']]
+                if len(result['errors']) > len(self.static[base]['errors']):
+                    rejected, applied = rejected + [(fix, (added or result['errors'])[0][:500]) for fix in applied], []
+            for fix, why in rejected:
+                self.note(fix, 'rejected', why)
+            self.trace.event('fixes_applied', stage='improve', base=base, applied=[fix['problem'][:160] for fix in applied], rejected=[f"{fix['problem'][:100]}: {why[:200]}" for fix, why in rejected][:10])
+            if not applied:
+                barren += 1
+                if barren == 2 or not rejected or not simulate:
+                    break
+                continue
+            barren = 0
+            wording = is_wording(source, fixed)
+            child = self.record(fixed, workflow, result, parent=base, patch={'fixes': applied}, kind='wording' if wording else 'fixes')
+            if wording and base in self.measured:
+                # Decided for this build: a change to what the agent is told or says is committed onto a
+                # measured agent without spending a simulation on it. Nothing new is learned without a
+                # simulation, so this is where improving ends.
+                for fix in applied:
+                    self.note(fix, 'untested', 'wording only: committed without a simulation')
+                self.wording[base] = child
+                break
+            if not self.measure(child):
+                for fix in applied:
+                    self.note(fix, 'unmeasured', 'its simulation did not complete')
+                break
+            after, visited = self.measured[child]['verdicts'], self.measured[child]['visited']
+            regressed = [case for case in known if known[case] and after[case] is False]
+            touches = lambda fix, case: edited_stages(fix) is None or case not in visited or bool(edited_stages(fix) & visited[case])
+            blamed = [fix for fix in applied if any(touches(fix, case) for case in regressed)]
+            kept, branch = [fix for fix in applied if fix not in blamed], None
+            if blamed:
+                # Branch from the parent with the fixes that broke nothing. The branch is unmeasured as a
+                # whole: it can be built on, but it is never exported before a simulation has seen it.
+                branch, kept, _ = self.apply_fixes(source, kept, allowed=self.static[base]['errors'])
+            for fix in applied:
+                if fix in blamed:
+                    self.note(fix, 'blamed', 'broke ' + ', '.join(c for c in regressed if touches(fix, c)) + ', which passed before; taken out again')
+                elif fix in kept:
+                    self.note(fix, 'kept', 'now passing: ' + (', '.join(c for c in fix['cases'] if after.get(c)) or 'none of its customers yet'))
+                else:
+                    self.note(fix, 'rejected', 'it does not apply without a fix that was taken out')
+            self.archive.event('fixes_judged', candidate_id=child, parent_id=base, regressed=regressed, kept=[fix['problem'][:160] for fix in kept], blamed=[fix['problem'][:160] for fix in blamed])
+            self.trace.event('fixes_judged', candidate_id=child, passed=self.measured[child]['score'].passed, regressed=regressed, kept=len(kept), blamed=len(blamed))
+            if not blamed:
+                base, (known, calls, findings) = child, evidence(child)
+                continue
+            # What the branch is expected to do: a customer a blamed fix broke passes again, and one that
+            # passed only on the child counts as passing only if a kept fix touched its call.
+            undone = {case for fix in blamed for case in regressed if touches(fix, case)}
+            known = {case: True if case in undone else bool(after[case]) and (known[case] or any(touches(fix, case) for fix in kept)) for case in after}
+            calls.update(self.measured[child]['failed_calls'])
+            findings.update(self.measured[child]['findings'])
+            if kept:
+                workflow, result = self.check(branch, remote=False)
+                base = self.record(branch, workflow, result, parent=base, patch={'fixes': kept}, kind='revert_branch')
 
-    @staticmethod
-    def failed_cases_addressed(feedback, proposal):
-        """How many diagnosed customers a mutation's edited stages are blamed for (0 without diagnoses)."""
-        edited = {str(o.get('target')) for o in proposal.get('operations', []) if isinstance(o, dict)}
-        return len({d['case_id'] for d in feedback.get('diagnostics', []) if edited & set(d['likely_workflow_nodes'])})
-
-    def revalidate_finalist(self):
-        repetitions = self.cfg.final_repetitions
-        if not self.champion or not self.suite or self.simulations + repetitions > self.cfg.max_simulations or self.deadline.remaining() < 60 * repetitions:
-            self.trace.event('held_out_skipped', reason='suite_or_simulation_or_wall_budget')
-            return
-        # A fixed unused speaking style is withheld from every optimizer call.
-        style = 'corrects' if self.suite.style != 'corrects' else 'in_words'
-        held_out = Suite(self.suite.case_ids, self.suite.suite_hash, self.suite.evidence_type, repetitions, style, self.suite.seed)
-        folder = self.root / 'evaluations' / ('held_out_' + self.champion)
-        try:
-            self.adapter.deploy(self.slot, self.archive.spec(self.champion)['workflow'])
-            self.simulations += repetitions
-            raw = self.adapter.evaluate(self.cases, held_out, folder)
-        except Exception as exc:
-            self.trace.event('held_out_incomplete', error=type(exc).__name__)
-            path = folder / 'raw_runner.json'
-            raw = json.loads(path.read_text()) if path.exists() else {'all_rows': []}
-        frozen = score(raw, held_out)
-        self.held_out_score = asdict(frozen)
-        write_json(folder / 'core_score.json', self.held_out_score, immutable=True)
-        # Held-out results never go to a mutator. A verified safety regression vetoes export.
-        if frozen.hard_fail_count:
-            self.usable[self.champion] = False
-            self.champion = None
-            for candidate in self.scores:
-                self.champion = choose_champion(self.champion, candidate, self.scores, self.usable)
-        self.checkpoint()
+    # ------------------------------------------------------------------ run
 
     def run(self):
-        status, error, exported, restored = 'failed', None, None, False
-        root_id = None
-        self.slot = 'ticket01-' + Path(self.documents[-1]['path']).stem + '-' + self.cfg.mode
+        status, error, exported, restored, root_id, champion = 'failed', None, None, False, None, None
         try:
             self.adapter = self.adapter_factory(self.cfg, self.deadline, self.trace)
-            root_id = self.compile()
+            root_id = champion = self.build_root()
             with self.adapter.workspace():
                 try:
-                    workflow = self.archive.spec(root_id)['workflow']
-                    self.adapter.deploy(self.slot, workflow)
-                    self.exports[root_id] = self.adapter.export(workflow, self.root / 'root.workflow.json')
-                    self.checkpoint()
-                    self.evaluate(root_id)
-                    # A best-effort root is searched too: it is what gets submitted, and a build that
-                    # stops improving exactly when its first design was weakest helps nobody.
-                    self.search(root_id)
-                    self.revalidate_finalist()
-                    status = 'exported_best_effort' if self.best_effort and not self.valid.get(self.champion) else 'exported'
+                    self.deploy(root_id)
+                    if not self.simulation_fits():
+                        self.trace.event('measurement_skipped', reason='no simulation fits the budget' if self.suite else 'this brief has no practice customers; the design is exported after compiler fixes only')
+                    elif self.measure(root_id):
+                        self.improve(root_id)
+                    status = 'exported'
                 except (Exception, KeyboardInterrupt) as exc:
                     error = self.trace.redact(str(exc) or type(exc).__name__)
                     status = 'terminated_by_budget' if isinstance(exc, TimeoutError) else 'exported_with_errors'
-                    self.trace.event('search_stopped', error=type(exc).__name__, message=error)
+                    self.trace.event('improvement_stopped', error=type(exc).__name__, message=error)
                 finally:
-                    if not self.champion and root_id:
-                        # A measured failure vetoes promotion, not submission: an imperfect agent outscores none.
-                        self.champion = root_id
-                        self.trace.event('champion_fallback_to_root', candidate_id=root_id)
-                    if self.champion:
-                        self.adapter.exporting = True
-                        workflow = self.archive.spec(self.champion)['workflow']
-                        try:
-                            self.adapter.deploy(self.slot, workflow)
-                            exported = self.adapter.export(workflow, self.root / 'champion.workflow.json')
-                            restored = True
-                        except Exception as exc:
-                            cached = self.exports.get(self.champion)
-                            if not cached:
-                                raise
-                            from .freya_adapter import contains_definition
-                            cached_export = json.loads(Path(cached).read_text())
-                            contains_definition(workflow, cached_export['workflow'])
-                            write_json(self.root / 'champion.workflow.json', cached_export)
-                            exported = str(self.root / 'champion.workflow.json')
-                            status, error = 'exported_cached', self.trace.redact(str(exc) or type(exc).__name__)
-                            self.trace.event('cached_export_fallback', candidate_id=self.champion, remote_restored=False, source=cached, error=error)
-                        submission = writable(self.submission_dir / (Path(self.documents[-1]['path']).stem + '.workflow.json'))
-                        write_json(submission, json.loads(Path(exported).read_text()))
-                        self.checkpoint()
+                    champion = self.champion(root_id)
+                    self.adapter.exporting = True
+                    workflow = self.archive.workflow(champion)
+                    try:
+                        self.adapter.deploy(self.slot, workflow)
+                        exported = self.adapter.export(workflow, self.root / 'champion.workflow.json')
+                        restored = True
+                    except Exception as exc:
+                        # Freya is unreachable. A measured candidate was exported when it was deployed:
+                        # submit that verified file, and say plainly that the live workflow was not restored.
+                        measured = [cid for cid in self.measured if cid in self.exports]
+                        fallback = champion if champion in self.exports else max(measured, key=lambda cid: self.measured[cid]['score'].passed) if measured else None
+                        if not fallback:
+                            raise
+                        champion = fallback
+                        cached = json.loads(Path(self.exports[champion]).read_text())
+                        contains_definition(self.archive.workflow(champion), cached['workflow'])
+                        write_json(self.root / 'champion.workflow.json', cached)
+                        exported = str(self.root / 'champion.workflow.json')
+                        status, error = 'exported_cached', self.trace.redact(str(exc) or type(exc).__name__)
+                        self.trace.event('cached_export_fallback', candidate_id=champion, remote_restored=False, source=self.exports[champion], error=error)
+                    if status == 'exported' and self.best_effort and not self.static[champion]['valid']:
+                        status = 'exported_best_effort'
+                    write_json(writable(self.submission_dir / (Path(self.documents[-1]['path']).stem + '.workflow.json')), json.loads(Path(exported).read_text()))
+                    self.checkpoint(root_id)
         except (Exception, KeyboardInterrupt) as exc:
             error = self.trace.redact(str(exc) or type(exc).__name__)
             status = 'failed'
             self.trace.event('build_failed', error=type(exc).__name__, message=error)
         finally:
-            final_score = self.scores.get(self.champion)
             deployment = self.adapter.deployment if self.adapter else None
-            result = {'run_id': self.run_id, 'workflow_id': deployment.get('workflow_id') if deployment else None,
-                      'agent_id': deployment.get('agent_id') if deployment else None, 'candidate_id': self.champion,
-                      'root_candidate_id': root_id, 'root_hash': self.archive.get(root_id)['workflow_sha256'] if root_id else None,
-                      'champion_hash': self.archive.get(self.champion)['workflow_sha256'] if self.champion else None,
-                      'export_path': exported, 'remote_restored': restored, 'mode': self.cfg.mode, 'evaluation_type': final_score.evidence_type if final_score else 'unknown',
-                      'strict_pass_rate': final_score.strict_pass_rate if final_score else None,
-                      'root_score': asdict(self.scores[root_id]) if root_id in self.scores else None,
-                      'final_score': asdict(final_score) if final_score else None, 'held_out_score': self.held_out_score,
+            # A wording-only champion was never simulated itself; the score reported is its measured parent's.
+            scored = champion if champion in self.measured else next((cid for cid, child in self.wording.items() if child == champion), None)
+            final = self.measured[scored]['score'] if scored else None
+            statuses = [entry['status'] for entry in self.history]
+            result = {'run_id': self.run_id, 'workflow_id': deployment.get('workflow_id') if deployment else None, 'agent_id': deployment.get('agent_id') if deployment else None,
+                      'candidate_id': champion, 'root_candidate_id': root_id, 'export_path': exported, 'remote_restored': restored,
+                      'evaluation_type': final.evidence_type if final else 'unknown', 'strict_pass_rate': final.strict_pass_rate if final else None,
+                      'root_score': asdict(self.measured[root_id]['score']) if root_id in self.measured else None, 'final_score': asdict(final) if final else None,
+                      'wording_untested': bool(champion) and champion not in self.measured and scored is not None,
                       'status': status if exported else 'failed', 'best_effort_root': self.best_effort, 'error': error, 'start': self.started, 'end': now(),
-                      'seconds': round(time.monotonic() - self.start_clock, 2), 'simulations': self.simulations,
-                      'valid_candidates': sum(self.valid.values()), 'invalid_candidates': sum(not v for v in self.valid.values()), 'model_calls': self.roles.calls}
+                      'seconds': round(time.monotonic() - self.start_clock, 2), 'simulations': self.simulations, 'candidates': len(self.static),
+                      'fixes': {name: statuses.count(name) for name in ('kept', 'blamed', 'rejected', 'untested', 'unmeasured')}, 'model_calls': self.roles.calls}
             write_json(self.root / 'report.json', result)
             self.trace.close(**result)
             self.archive.db.close()
         return result
 
 
+def inputs(paths, openapi=None):
+    """Split the command line into the brief documents and the one tool API file that belongs to them.
+
+    Every final brief comes with its own tool API. Falling back to the kit's file for an unknown brief
+    would build an agent for the wrong bank without a word, so only the kit's own briefs default to it."""
+    def is_api(path):
+        # Told apart by content: a brief document may be JSON too (a code list).
+        try:
+            document = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            return False
+        return isinstance(document, dict) and 'openapi' in document
+    apis = {str(Path(p).resolve()) for p in [*(p for p in paths if is_api(p)), *([openapi] if openapi else [])]}
+    briefs = [p for p in paths if not is_api(p)]
+    if not briefs:
+        raise ValueError('No brief document given')
+    if len(apis) > 1:
+        raise ValueError('More than one tool API file given: ' + ', '.join(sorted(apis)))
+    if not apis and any(Path(p).resolve().parent != KIT / 'briefs' for p in briefs):
+        raise ValueError('This brief needs its own tool API file: give it after the brief, or with --openapi')
+    return briefs, apis.pop() if apis else str(KIT / 'tools/openapi.json')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('briefs', nargs='+')
-    parser.add_argument('--openapi', default=str(KIT / 'tools/openapi.json'))
-    parser.add_argument('--mode', choices=['scoring_only', 'scoring_with_diagnostics'])
-    parser.add_argument('--pinned-root')
-    parser.add_argument('--resume-run', help='Reuse source-matched analyst/root artifacts after an interrupted build')
+    parser.add_argument('briefs', nargs='+', help='The brief documents in reading order; the tool API file may be given among them')
+    parser.add_argument('--openapi', help="The brief's tool API file. Only the kit's own briefs default to the kit's file")
+    parser.add_argument('--resume-run', help='Reuse the rules and root design of an earlier run on the same brief and tool API')
     parser.add_argument('--public-brief', choices=['A', 'B'])
     parser.add_argument('--only', help='Comma-separated public case IDs; defines a distinct suite')
     parser.add_argument('--style', default='', choices=['', 'pieces', 'corrects', 'talkative', 'asks_back', 'in_words'])
     args = parser.parse_args(argv)
     try:
-        cfg = Config.from_env(args.mode)
+        cfg = Config.from_env()
         missing = missing_credentials(cfg)
         if missing:
             raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
-        builder = Builder(cfg, args.briefs, args.openapi, pinned=args.pinned_root, resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief)
+        briefs, openapi = inputs(args.briefs, args.openapi)
+        builder = Builder(cfg, briefs, openapi, resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief)
         result = builder.run()
     except (ValueError, OSError, KeyError) as exc:
         print(json.dumps({'status': 'invalid_input', 'error': str(exc)}))

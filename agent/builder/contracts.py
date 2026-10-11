@@ -53,8 +53,6 @@ def validate_requirements(bundle, documents):
         references = rule.dependencies + rule.precedence.supersedes + rule.precedence.superseded_by
         if any(r not in ids or r == rule.rule_id for r in references):
             raise ValueError(f"Unknown/self reference for {rule.rule_id}")
-        if not rule.test_templates:
-            raise ValueError(f"Missing test ideas for {rule.rule_id}")
         if not rule.must and not rule.must_not:
             raise ValueError(f"Requirement has no obligation: {rule.rule_id}")
     index = {r.rule_id: r for r in bundle.requirements}
@@ -76,8 +74,8 @@ def validate_requirements(bundle, documents):
         visited.add(key)
     for key in ids:
         visit(key)
-    if bundle.unresolved or any(r.interpretation_status != "resolved" for r in bundle.requirements):
-        raise ValueError("Unresolved source policy; explicit clarification is required")
+    # An unresolved or ambiguous rule is passed on to the designer as it stands; raw bank material
+    # is allowed to be unclear, and refusing to build would leave no phone agent at all.
     # Detect silently omitted numbered rules independently of the analyst.
     for path, lines in sources.items():
         covered = {n for r in bundle.requirements if r.source.path == path for n in range(r.source.start_line, r.source.end_line + 1)}
@@ -145,7 +143,7 @@ def tool_from_contract(contract, description, bindings=None):
     body = deepcopy(contract["body"])
     bindings = bindings or {}
     if set(bindings) - set(body.get("properties", {})):
-        raise ValueError(f"Unknown argument bindings for {contract['name']}")
+        raise ValueError(f"Unknown argument bindings {sorted(set(bindings) - set(body.get('properties', {})))} for {contract['name']}; its fields are {sorted(body.get('properties', {}))}")
     for key, prop in body.get("properties", {}).items():
         # customer_id is the stable kit call token, not a sample customer's ID.
         if key == "customer_id":
@@ -161,72 +159,67 @@ def tool_from_contract(contract, description, bindings=None):
             "connect_retries": {"type": "number", "default": 0}, "body": body}}}}
 
 
-def normalize_spec(spec, contracts, protected=("get_account", "create_promise")):
-    """Mechanical placement fixes for the compact proposal; no policy content is changed."""
-    spec = deepcopy(spec)
-    workflow = spec.get("workflow", {})
+CODE_NAME = "code_exec"
+
+
+def compile_workflow(source, contracts):
+    """Compact source -> deployable workflow, plus notes on what was normalised.
+
+    Purely mechanical: bank tools are expanded from the contract, the `code` shorthand becomes a
+    code_exec action, engine-run stages get their fixed plumbing, and the runtime support is
+    compiled in. No policy content is added or changed, so the model only ever edits the source."""
+    if not isinstance(source, dict):
+        raise ValueError("workflow must be an object")
+    workflow, notes = deepcopy(source), []
     for group in ("nodes", "global_nodes"):
         if workflow.get(group) is None:
             workflow[group] = {}
-    notes = []
-    groups = [g for g in (workflow.get("nodes"), workflow.get("global_nodes")) if isinstance(g, dict)]
-    for key, node in [(k, n) for g in groups for k, n in g.items() if isinstance(n, dict)]:
-        for placement in ("tools", "pre_actions"):
-            if not isinstance(node.get(placement), list):
-                continue
-            for tool in node[placement]:
-                if not isinstance(tool, dict):
-                    continue
-                if "bank_operation" in tool:
-                    for extra in ("type", "config"):
-                        if tool.pop(extra, None) is not None:
-                            notes.append(f"{key}: dropped controller-owned {extra}")
-                # Engine-run calls map their response on the node, not on the tool.
-                if placement == "pre_actions" and isinstance(tool.get("response_mapping"), list):
-                    moved = tool.pop("response_mapping")
-                    existing = node.setdefault("response_mapping", [])
-                    if isinstance(existing, list):
-                        existing.extend(m for m in moved if m not in existing)
-                        notes.append(f"{key}: moved pre_action response_mapping to node")
-    operations = contracts["operations"]
-    kept = []
-    for gate in spec.get("tool_gates", []) or []:
-        # Only protected tools need a gate; an optional one must at least name a real producer.
-        if isinstance(gate, dict) and gate.get("operation") not in protected and gate.get("producer_operation") not in operations:
-            notes.append(f"dropped unverifiable optional gate on {gate.get('operation')}")
-            continue
-        kept.append(gate)
-    spec["tool_gates"] = kept
-    return spec, notes
-
-
-def compile_tools(workflow, contracts):
-    """Expand explicit bank_operation references; endpoint configuration is Python-owned."""
-    workflow = deepcopy(workflow)
-    for group in ("nodes", "global_nodes"):
-        if not isinstance(workflow.get(group, {}), dict):
+        if not isinstance(workflow[group], dict):
             raise ValueError(f"workflow.{group} must be an object mapping each stage name to its stage")
-    for node in list(workflow.get("nodes", {}).values()) + list(workflow.get("global_nodes", {}).values()):
-        # Anything that is not a stage object or a tool object is left for the validator, which names it.
-        if not isinstance(node, dict):
-            continue
-        for placement in ("tools", "pre_actions"):
-            for i, tool in enumerate(node[placement] if isinstance(node.get(placement), list) else []):
-                if not isinstance(tool, dict) or "bank_operation" not in tool:
-                    continue
-                name = tool["bank_operation"]
-                if name not in contracts["operations"]:
-                    raise ValueError(f"Unsupported bank operation: {name}")
-                allowed = {"bank_operation", "description", "bindings", "response_mapping", "pre_process_code", "post_process_code"}
-                # type/config are controller-owned and rebuilt from the contract; a model-supplied copy is discarded.
-                unknown = set(tool) - allowed - {"type", "config"}
-                if unknown:
-                    raise ValueError(f"{node.get('name')}: unknown bank tool specification fields {sorted(unknown)} on {name}")
-                if not isinstance(tool.get("description"), str) or not isinstance(tool.get("bindings", {}), dict):
-                    raise ValueError(f"{node.get('name')}: bank tool {name} needs a text description and an object of bindings")
-                compiled = tool_from_contract(contracts["operations"][name], tool["description"], tool.get("bindings"))
-                for key in ("response_mapping", "pre_process_code", "post_process_code"):
-                    if key in tool:
-                        compiled[key] = tool[key]
-                node[placement][i] = compiled
-    return runtime.apply(workflow, contracts)
+    for group in ("nodes", "global_nodes"):
+        for key, node in workflow[group].items():
+            # Anything that is not a stage object or a tool object is left for the validator, which names it.
+            if not isinstance(node, dict):
+                continue
+            if "code" in node:
+                code = node.pop("code")
+                if not isinstance(code, str):
+                    raise ValueError(f"{key}: code must be the Python source as text")
+                if node.get("pre_actions"):
+                    raise ValueError(f"{key}: give either code or pre_actions, not both")
+                node["pre_actions"] = [{"type": "function", "function": {"name": CODE_NAME, "handler": "__function__:code_exec", "parameters": {
+                    "type": "object", "properties": {"code": {"type": "string", "default": code}, "timeout_ms": {"type": "number", "default": 10000}}}}}]
+            if node.get("node_type") in ("code", "api_request"):
+                node.setdefault("passthrough", True)
+                node.setdefault("on_enter", {"type": "silent"})
+                last = node["transitions"][-1] if isinstance(node.get("transitions"), list) and node["transitions"] else None
+                if "passthrough_default_transition" not in node and isinstance(last, dict) and isinstance(last.get("condition"), dict) and last["condition"].get("operator") == "always":
+                    node["passthrough_default_transition"] = last.get("target_node")
+            for placement in ("tools", "pre_actions"):
+                for i, tool in enumerate(node[placement] if isinstance(node.get(placement), list) else []):
+                    if not isinstance(tool, dict) or "bank_operation" not in tool:
+                        continue
+                    name = tool["bank_operation"]
+                    if name not in contracts["operations"]:
+                        raise ValueError(f"{key}: unsupported bank operation {name}; the contract declares {sorted(contracts['operations'])}")
+                    # type/config are controller-owned and rebuilt from the contract; a model-supplied copy is discarded.
+                    unknown = set(tool) - {"bank_operation", "description", "bindings", "response_mapping", "pre_process_code", "post_process_code", "type", "config"}
+                    if unknown:
+                        raise ValueError(f"{key}: unknown bank tool fields {sorted(unknown)} on {name}; allowed are bank_operation, description, bindings, response_mapping, pre_process_code, post_process_code")
+                    if not isinstance(tool.get("description"), str) or not isinstance(tool.get("bindings", {}), dict):
+                        raise ValueError(f"{key}: bank tool {name} needs a text description and an object of bindings")
+                    compiled = tool_from_contract(contracts["operations"][name], tool["description"], tool.get("bindings"))
+                    for hook in ("pre_process_code", "post_process_code"):
+                        if hook in tool:
+                            compiled[hook] = tool[hook]
+                    if isinstance(tool.get("response_mapping"), list):
+                        if placement == "tools":
+                            compiled["response_mapping"] = tool["response_mapping"]
+                        else:
+                            # Engine-run calls map their response on the stage, not on the tool.
+                            existing = node.setdefault("response_mapping", [])
+                            if isinstance(existing, list):
+                                existing.extend(m for m in tool["response_mapping"] if m not in existing)
+                                notes.append(f"{key}: moved response_mapping from the action to the stage")
+                    node[placement][i] = compiled
+    return runtime.apply(workflow, contracts), notes

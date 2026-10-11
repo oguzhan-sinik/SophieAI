@@ -32,7 +32,6 @@ class Requirement(Record):
     dependencies: list[str] = Field(default_factory=list)
     precedence: Precedence = Field(default_factory=Precedence)
     interpretation_status: Literal["resolved", "ambiguous", "conflicting"]
-    test_templates: list[str]
 
 
 class RequirementsBundle(Record):
@@ -41,91 +40,25 @@ class RequirementsBundle(Record):
     unresolved: list[str]
 
 
-class Coverage(Record):
-    nodes: list[str]
-    tests: list[str]
-
-
-class ToolGate(Record):
-    """A source-backed gate checked on every entry path to a protected tool."""
-    operation: str
-    rule_ids: list[str]
-    variable: str
-    allowed_values: list[str]
-    producer_operation: str
-    response_path: str
-
-
 class WorkflowSpec(Record):
+    """The editable source of a phone agent: compact, before the controller compiles it."""
     workflow: dict[str, Any]
-    coverage: dict[str, Coverage]
-    tool_gates: list[ToolGate]
-    architecture: str
-
-
-class CalendarExpectation(Record):
-    variable: str = Field(description='The expected output variable holding the calculated day.')
-    anchor: str = Field(description='ISO date (or date-time) the count starts after, normally the call now of this probe.')
-    weekdays: list[int] = Field(description='Business weekdays from the source, Monday=0.')
-    excluded_dates: list[str] = Field(description='Every non-business ISO date the source lists.')
-    count: int = Field(ge=1, le=366, description='Which business day after the anchor.')
-
-
-class CodeProbe(Record):
-    probe_id: str
-    rule_ids: list[str]
-    node_id: str
-    variables: dict[str, Any]
-    expected: dict[str, Any] = Field(description='Only actual output variable names and expected values. No explanations or metadata.')
-    rationale: str = ''
-    calendar: list[CalendarExpectation] = Field(default_factory=list, description='One entry per expected variable that is the Nth business day after a date. The controller calculates the day and writes it into expected.')
-
-
-class CodeProbes(Record):
-    probes: list[CodeProbe]
+    architecture: str = Field(description="A short rationale: the stages, what decides each route, and where each bank tool is called.")
 
 
 class Edit(Record):
-    op: Literal["set_node", "remove_node", "set_system_prompt", "set_initial_node", "set_global_nodes"]
-    target: str
-    value: Any = None
+    op: Literal["set_field", "set_stage", "remove_stage", "set_workflow_field"]
+    stage: str = Field(default="", description="The stage the edit is for. Empty for set_workflow_field.")
+    field: str = Field(default="", description="set_field: the stage field to replace. set_workflow_field: system_prompt or initial_node.")
+    value: Any = Field(default=None, description="The complete new value of that field, or the complete stage for set_stage.")
 
 
-class RepairPatch(Record):
-    """Only what a repair changes. Rewriting a whole workflow to fix two stages has corrupted the rest."""
-    operations: list[Edit] = Field(min_length=1, description='set_node carries the complete corrected stage under its own name.')
-    tool_gates: list[ToolGate] = Field(default_factory=list, description='The complete new gate list, only when a gate declaration itself must change.')
-    summary: str
+class Fix(Record):
+    """One cause, the customers it is for, and the smallest edits that remove it."""
+    cases: list[str] = Field(default_factory=list, max_length=20)
+    problem: str = Field(description="One line: what goes wrong, and in which stage.")
+    edits: list[Edit] = Field(min_length=1, max_length=6)
 
 
-class Mutation(Record):
-    parent_id: str
-    mutation_type: Literal["add_guard", "change_route", "repair_tool_args", "adjust_prompt", "change_code_node", "add_role", "simplify_graph", "other"]
-    target_nodes: list[str]
-    target_rule_ids: list[str]
-    hypothesis: str
-    operations: list[Edit]
-    expected_effect: str
-    risk: Literal["low", "normal", "high"]
-    coverage: dict[str, Coverage]
-
-
-class MutationGroup(Record):
-    proposals: list[Mutation]
-
-
-class Diagnostic(Record):
-    case_id: str
-    rule_ids: list[str] = Field(max_length=6)
-    # Bounded: asked for "every turn", a model has enumerated references until its output ran out.
-    evidence_refs: list[str] = Field(max_length=4)
-    failure_type: str
-    likely_workflow_nodes: list[str] = Field(max_length=4)
-    repair_hypothesis: str
-    confidence: float = Field(ge=0, le=1)
-    counterfactual_test: str
-    status: Literal["hypothesis"] = "hypothesis"
-
-
-class Diagnostics(Record):
-    diagnoses: list[Diagnostic]
+class Patch(Record):
+    fixes: list[Fix] = Field(max_length=8)

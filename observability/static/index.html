@@ -241,6 +241,12 @@ $("#live").onclick=()=>{S.live=!S.live; if(S.live) refreshAll();};
 function refreshAll(){ if(S.runId) selectRun(S.runId); }
 
 /* ---------- header ---------- */
+// One card per fix of a patch: what was wrong, for which customers, and the edits made.
+function fixCards(fixes){
+  if(!fixes.length) return `<div class="meta">no fixes proposed</div>`;
+  return fixes.map(x=>`<div class="ncard"><h4>${esc(x.problem)}</h4>${(x.cases||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join("")}
+    <div class="meta" style="white-space:normal">${(x.edits||[]).map(e=>esc(e.op+" "+(e.stage||"")+(e.field?"."+e.field:""))).join(" · ")}</div></div>`).join("");
+}
 function renderHeader(){
   const s=S.summary||{};
   const st=$("#hdrStatus");
@@ -531,11 +537,12 @@ async function loadPayloads(sp){
     else if(rs.workflow&&rs.workflow.nodes){
       const made=(S.tree?.nodes||[]).filter(n=>n.created_at&&sp.end_at&&n.created_at>=sp.end_at)[0];
       out+=`<div class="say" style="white-space:pre-wrap;margin-bottom:6px">${esc(rs.architecture||"")}</div>
-        ${kvTable([["steps",Object.keys(rs.workflow.nodes).length],["first step",rs.workflow.initial_node],["identity gates",(rs.tool_gates||[]).map(g=>`${g.operation} needs ${g.variable} after ${g.producer_operation}`).join("; ")],["rules mapped",Object.keys(rs.coverage||{}).length]])}
+        ${kvTable([["steps",Object.keys(rs.workflow.nodes).length],["first step",rs.workflow.initial_node]].concat(rs.tool_gates?[["identity gates",rs.tool_gates.map(g=>`${g.operation} needs ${g.variable} after ${g.producer_operation}`).join("; ")],["rules mapped",Object.keys(rs.coverage||{}).length]]:[]))}
         ${made?`<div style="margin:8px 0"><button class="ctl" id="openMade">Open this workflow as a graph (${esc(made.label||made.candidate_id)})</button></div>`:""}
         ${fold("System prompt",`<div class="say" style="white-space:pre-wrap">${esc(rs.workflow.system_prompt||"")}</div>`)}`;
       host.dataset.made=made?made.candidate_id:"";
     }
+    else if(Array.isArray(rs.fixes)) out+=fixCards(rs.fixes);
     else if(Array.isArray(rs.diagnoses)) out+=rs.diagnoses.length?`<table class="cases">${rs.diagnoses.map(x=>`<tr><td class="mono">${esc(x.case_id)}</td><td>${(x.likely_workflow_nodes||[]).map(n=>`<span class="chip">${esc(n)}</span>`).join("")}<div>${esc(x.repair_hypothesis)}</div><div class="meta" style="white-space:normal">${esc(x.failure_type)} · confidence ${esc(x.confidence)} · rules ${esc((x.rule_ids||[]).join(", "))}</div></td></tr>`).join("")}</table>`:`<div class="meta">no diagnoses</div>`;
     else if(Array.isArray(rs.proposals)) out+=rs.proposals.map(x=>`<div class="ncard"><h4>${esc(x.mutation_type)} <span class="badge">risk ${esc(x.risk)}</span></h4><div>${esc(x.hypothesis)}</div><div class="meta" style="white-space:normal">targets ${esc((x.target_nodes||[]).join(", "))} · expects ${esc(x.expected_effect)}</div></div>`).join("");
     else if(Array.isArray(rs.probes)) out+=`<table class="cases">${rs.probes.map(x=>`<tr><td class="mono">${esc(x.probe_id)}</td><td class="mono">${esc(x.node_id)}</td><td><div class="meta" style="white-space:normal">given ${esc(JSON.stringify(x.variables))}</div>expects ${esc(JSON.stringify(x.expected))}</td></tr>`).join("")}</table>`;
@@ -571,10 +578,11 @@ async function renderCandidate(el,c,soft){
     const host=$("#ctab");
     if(t==="origin"){
       host.innerHTML=`<h3 class="sec">How this candidate was created</h3>`+
-        (prop?`<pre class="code">${esc(JSON.stringify({coverage:prop.data.coverage,architecture:prop.data.architecture,tool_gates:prop.data.tool_gates},null,1))}</pre>`
+        (c.files.mutation&&Array.isArray(c.files.mutation.data.fixes)?fixCards(c.files.mutation.data.fixes):"")+
+        (prop?`<div class="say" style="white-space:pre-wrap">${esc(prop.data.architecture||"")}</div>`+(prop.data.tool_gates?`<pre class="code">${esc(JSON.stringify({coverage:prop.data.coverage,tool_gates:prop.data.tool_gates},null,1))}</pre>`:"")
              :`<div class="meta">proposal: not captured</div>`)+
         (c.parent_candidate_id?`<div class="meta" style="margin-top:8px">parent ${esc(c.parent_candidate_id)} → this candidate${c.recorded_lineage?"":" (lineage derived from snapshots; mutation details not recorded)"}</div>`
-             :`<div class="meta">root candidate (ADAS baseline)</div>`);
+             :`<div class="meta">root candidate (first design)</div>`);
     }else if(t==="diff"){
       host.innerHTML=`<div class="empty">loading diff…</div>`;
       const r=await api(`runs/${S.runId}/candidates/${encodeURIComponent(c.candidate_id)}/diff`);

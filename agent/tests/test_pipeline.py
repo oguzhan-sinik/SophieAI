@@ -1,50 +1,57 @@
 """Controller tests use explicit fakes; their scores are not real Freya evidence."""
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import replace
 import json
 import multiprocessing
 import time
 
+from conftest import route
+from builder import runtime
 from builder.artifacts import digest, write_json
 from builder.build import Builder
-from builder.config import AGENT, KIT, Config, Deadline
+from builder.config import KIT, Config, Deadline
 from builder.freya_adapter import file_lock
-from builder.scoring import Suite
+
+BRIEF = [KIT / 'briefs/brief-a.md']
+CASES = ['PUB-01', 'PUB-02', 'PUB-03']
 
 
 class FakeFreya:
+    """Deploys nothing. `outcomes(workflow)` decides, per customer, whether the call passes and which stages it visits."""
+    outcomes = staticmethod(lambda workflow: {})
+
     def __init__(self, cfg, deadline, trace):
         self.cfg, self.deadline, self.trace = cfg, deadline, trace
-        self.deployment = None
-        self.exporting = False
-        self.evaluations = 0
-        self.version = 0
+        self.deployment, self.exporting, self.version, self.simulated = None, False, 0, []
     @contextmanager
     def workspace(self):
         yield self
-    def deploy(self, slot, workflow):
-        self.version += 1
-        self.deployment = {'workflow_id': 'FAKE-workflow', 'agent_id': 'FAKE-agent', 'version': self.version, 'workflow_hash': digest(workflow)}
-        return self.deployment
     def validate_remote(self, workflow):
         return None
+    def deploy(self, slot, workflow):
+        self.version += 1
+        self.deployment = {'workflow_id': 'FAKE-workflow', 'agent_id': 'FAKE-agent', 'version': self.version, 'workflow_hash': digest(workflow), 'workflow': workflow}
+        return self.deployment
     def export(self, workflow, path):
         write_json(path, {'workflow_id': 'FAKE-workflow', 'agent_id': 'FAKE-agent', 'workflow': workflow, 'test_only': True})
         return str(path)
     def evaluate(self, cases, suite, folder):
-        self.evaluations += 1
-        passed = self.evaluations > 1
-        raw = {'all_rows': [[{'id': c, 'pass': passed, 'failed': [] if passed else ['LEAK_TEST_SENTINEL']} for c in suite.case_ids] for _ in range(suite.repetitions)]}
+        results = self.outcomes(self.deployment['workflow'])
+        self.simulated.append(self.deployment['workflow_hash'])
+        rows = [{'id': c, 'pass': results.get(c, (True, []))[0], 'failed': [] if results.get(c, (True, []))[0] else [f'{c} did not end as expected']} for c in suite.case_ids]
+        write_json(folder / 'calls_0.json', {c: {'call_id': c, 'turns': [{'role': 'assistant', 'node': stage, 'text': 'spoken'} for stage in results.get(c, (True, []))[1]]} for c in suite.case_ids})
+        raw = {'all_rows': [rows], 'simulations': []}
         write_json(folder / 'raw_runner.json', raw)
         return raw
 
 
-def fake_roles_factory(spec, requirements, seen, crash=False):
+def roles(spec, requirements, patches, seen):
+    """Analyst and designer return fixtures; each fix call returns the next scripted patch."""
+    patches = list(patches)
     class FakeRoles:
         def __init__(self, cfg, deadline, trace, root):
             self.calls = 0
-        def ask(self, role, purpose, instruction, payload, schema, model=None):
+        def ask(self, role, purpose, instruction, payload, schema, max_tokens=None):
             self.calls += 1
             seen.append((role, deepcopy(payload)))
             if role == 'BriefAnalystAgent':
@@ -52,180 +59,238 @@ def fake_roles_factory(spec, requirements, seen, crash=False):
                 doc = payload['documents'][0]
                 bundle['requirements'][0]['source'].update(path=doc['path'], start_line=1, end_line=len(doc['text'].splitlines()), span=doc['text'].strip())
                 return bundle
-            if role == 'ADASDesignerAgent': return deepcopy(spec)
-            if role == 'DiagnosisAgent':
-                return {'diagnoses': [{'case_id': 'PUB-01', 'rule_ids': ['R1'], 'evidence_refs': ['all_rows.0.0.failed.0'], 'failure_type': 'fixture_failure', 'likely_workflow_nodes': ['verify'], 'repair_hypothesis': '[REDACTED TEST FIXTURE: LEAK_TEST_SENTINEL]', 'confidence': .9, 'counterfactual_test': 'Run corrected input', 'status': 'hypothesis'}]}
-            if role == 'MutationDesignerAgent':
-                if crash: raise RuntimeError('forced mutation failure')
-                proposals = []
-                for i, kind in enumerate(['adjust_prompt', 'change_route', 'add_guard']):
-                    node = deepcopy(payload['parent']['workflow']['nodes']['verify'])
-                    if i == 0: node['task_message'] += ' Ask once more if unclear.'
-                    elif i == 1: node['max_node_turns'] = 11
-                    else: node['transitions'][0]['description'] = 'Only enter account after verified result.'
-                    proposals.append({'parent_id': payload['parent_id'], 'mutation_type': kind, 'target_nodes': ['verify'], 'target_rule_ids': ['R1'], 'hypothesis': f'Fixture change {i}', 'operations': [{'op': 'set_node', 'target': 'verify', 'value': node}], 'expected_effect': 'Test patch handling', 'risk': 'low', 'coverage': spec['coverage']})
-                return {'proposals': proposals}
+            if role == 'ADASDesignerAgent':
+                return deepcopy(spec)
+            if role == 'FixAgent':
+                patch = patches.pop(0) if patches else {'fixes': []}
+                if isinstance(patch, Exception):
+                    raise patch
+                return deepcopy(patch)
             raise AssertionError(role)
     return FakeRoles
 
 
-def run_fake(work, spec, requirements, mode, seen, pinned=None, crash=False):
-    cfg = Config(mode=mode, artifacts=work, tracing=False, max_candidates=4, max_depth=1, max_simulations=4)
-    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=fake_roles_factory(spec, requirements, seen, crash), adapter_factory=FakeFreya, pinned=pinned, only=['PUB-01'])
-    # Do not allow tests to overwrite the real submission output.
-    builder.submission_dir = work / 'out'
-    result = builder.run()
-    return builder, result
+def fix(*edits, problem='fixture', cases=()):
+    return {'problem': problem, 'cases': list(cases), 'edits': [{'op': op, 'stage': stage, 'field': field, 'value': value} for op, stage, field, value in edits]}
 
 
-def test_paired_isolation_and_lineage(work, spec, requirements):
-    first_seen, second_seen = [], []
-    first, a = run_fake(work, spec, requirements, 'scoring_only', first_seen)
-    second, b = run_fake(work, spec, requirements, 'scoring_with_diagnostics', second_seen, first.root / 'pinned_root.json')
-    assert a['status'] == b['status'] == 'exported'
-    assert a['root_hash'] == b['root_hash']
-    assert a['root_score'] == b['root_score']
-    assert a['run_id'] != b['run_id']
-    assert a['strict_pass_rate'] == b['strict_pass_rate'] == 1
-    assert a['valid_candidates'] == b['valid_candidates'] == 4
-    scalar_payloads = [payload for role, payload in first_seen if role == 'MutationDesignerAgent']
-    diagnostic_payloads = [payload for role, payload in second_seen if role == 'MutationDesignerAgent']
-    assert 'LEAK_TEST_SENTINEL' not in json.dumps(scalar_payloads)
-    assert 'LEAK_TEST_SENTINEL' in json.dumps(diagnostic_payloads[0]['feedback']['diagnostics'])
-    assert not any(role == 'DiagnosisAgent' for role, _ in first_seen)
-    assert json.loads((first.root / 'champion.json').read_text())['champion_id'] == a['candidate_id']
-    assert 'relative_rank' in (first.root / 'lineage.jsonl').read_text()
+def code(marker):
+    return f"try:\n    vars['{marker}'] = 'set'\nexcept Exception:\n    vars['{marker}'] = ''\n"
 
 
-def test_failure_restores_root(work, spec, requirements):
-    builder, result = run_fake(work, spec, requirements, 'scoring_only', [], crash=True)
-    assert result['status'] == 'exported_with_errors'
-    assert result['candidate_id'] == result['root_candidate_id']
-    assert result['export_path']
-    exported = json.loads((builder.root / 'champion.workflow.json').read_text())['workflow']
-    assert digest(exported) == result['root_hash']
+def chain(spec):
+    """account -> step_a -> step_b -> close, so two fixes can touch two different stages."""
+    nodes = spec['workflow']['nodes']
+    nodes['account']['transitions'] = [route('step_a')]
+    nodes['step_a'] = {'name': 'step_a', 'node_type': 'code', 'code': code('a'), 'transitions': [route('step_b')]}
+    nodes['step_b'] = {'name': 'step_b', 'node_type': 'code', 'code': code('b'), 'transitions': [route('close')]}
+    return spec
 
 
-def test_resume_revalidates_saved_proposal_without_model_call(work, spec, requirements):
+def build(work, spec, requirements, patches=(), freya=FakeFreya, outcomes=None, only=CASES, briefs=BRIEF, **config):
+    seen = []
+    adapter = type('Freya', (freya,), {'outcomes': staticmethod(outcomes)}) if outcomes else freya
+    builder = Builder(Config(artifacts=work, tracing=False, **config), briefs, KIT / 'tools/openapi.json', roles_factory=roles(spec, requirements, patches, seen), adapter_factory=adapter, only=only)
+    builder.submission_dir = work / 'out'  # tests never overwrite the real submission output
+    return builder, builder.run(), seen
+
+
+def lineage(builder):
+    return [json.loads(line) for line in (builder.root / 'lineage.jsonl').read_text().splitlines()]
+
+
+def kinds(builder):
+    return [e['mutation_kind'] for e in lineage(builder) if e['event'] == 'candidate_created']
+
+
+def created(builder, cid):
+    """A candidate's archive record, read from the lineage file (the database is closed after a run)."""
+    return next(e for e in lineage(builder) if e['event'] == 'candidate_created' and e['candidate_id'] == cid)
+
+
+def fixes_seen(seen):
+    return [payload for role, payload in seen if role == 'FixAgent']
+
+
+# ------------------------------------------------------------------ root
+
+def test_compiler_errors_are_fixed_by_patch_and_a_brief_without_customers_is_exported(work, spec, requirements):
     policy = work / 'policy.md'
     policy.write_text('Verify first.\n')
-    requirements['requirements'][0]['source']['path'] = str(policy)
-    cfg = Config(artifacts=work, tracing=False, official=False, max_depth=0)
-    seen = []
-    roles = fake_roles_factory(spec, requirements, seen)
-    old = Builder(cfg, [policy], KIT / 'tools/openapi.json', roles_factory=roles)
-    write_json(old.root / 'requirements.json', requirements)
-    old.archive.add(spec, mutation_kind='baseline')
-    old.archive.db.close()
-    resumed = Builder(cfg, [policy], KIT / 'tools/openapi.json', roles_factory=roles, resume=old.root)
-    try:
-        candidate = resumed.compile()
-        # The archived candidate is the saved proposal plus controller-owned runtime support only.
-        from builder.contracts import compile_openapi, compile_tools
-        compiled = compile_tools(spec['workflow'], compile_openapi(KIT / 'tools/openapi.json'))
-        assert resumed.archive.spec(candidate) == {**spec, 'workflow': compiled}
-        assert not seen
-    finally:
-        resumed.archive.db.close()
+    spec['workflow']['nodes']['verify']['max_turn_transition'] = 'end'  # skips close_call
+    patch = {'fixes': [fix(('set_field', 'verify', 'max_turn_transition', 'close'), problem='verify can end the call without close_call')]}
+    builder, result, seen = build(work, spec, requirements, [patch], only=None, briefs=[policy])
+    assert result['status'] == 'exported' and result['export_path'] and result['simulations'] == 0 and result['strict_pass_rate'] is None
+    assert kinds(builder) == ['design', 'compile_fix'] and builder.static[result['candidate_id']]['valid']
+    asked = fixes_seen(seen)
+    assert len(asked) == 1 and 'close_call' in asked[0]['problems']['compiler'][0] and 'runtime_docs' in asked[0] and 'calls' not in asked[0]
+    # The model is shown the compact source, never the compiled workflow.
+    shown = json.dumps(asked[0]['workflow'])
+    assert 'bank_operation' in shown and runtime.START not in shown and '__function__:api_call' not in shown
+    exported = json.loads((builder.root / 'champion.workflow.json').read_text())['workflow']
+    assert exported['nodes']['verify']['max_turn_transition'] == 'close' and '__function__:api_call' in json.dumps(exported)
+    assert 'measurement_skipped' in (builder.root / 'build_trace.log').read_text()
 
 
-def test_probe_referee_cannot_see_implementation_or_observations(work, requirements):
-    builder = Builder.__new__(Builder)
-    builder.probes, builder.pinned, builder.resume = {'probes': []}, None, None
-    builder.cfg, builder.root = Config(), work
-    builder.requirements, builder.documents = requirements, [{'text': 'Source policy'}]
-    spec = {'workflow': {'nodes': {'calc': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': "vars['band'] = 'late'"}}}}}]}}}}
-    seen = []
-    class Roles:
-        def ask(self, role, purpose, instruction, payload, schema, model=None):
-            seen.append((role, payload))
-            return {'probes': [{'probe_id': 'date', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {}, 'expected': {'band': 'late'}, 'rationale': 'Source-derived'}]}
-    builder.roles = Roles()
-    builder.prepare_probes(spec)
-    assert [role for role, _ in seen] == ['ScenarioPlannerAgent', 'ScenarioRefereeAgent']
-    assert set(seen[1][1]) == {'documents', 'requirements', 'proposed_probes'}
-    assert 'code' not in json.dumps(seen[1][1])
+def test_unusable_patches_are_reported_back_and_the_least_flawed_design_ships(work, spec, requirements):
+    spec['workflow']['nodes']['verify']['max_turn_transition'] = 'end'
+    garbled = {'fixes': [fix(('set_field', 'nowhere', 'task_message', 'x'), problem='wrong stage')]}
+    builder, result, seen = build(work, spec, requirements, [garbled, {'fixes': []}], max_simulations=0)
+    asked = fixes_seen(seen)
+    assert len(asked) == 2 and "Your fix 'wrong stage' was not applied" in asked[1]['problems']['compiler'][0] and 'no such stage' in asked[1]['problems']['compiler'][0]
+    assert result['status'] == 'exported_best_effort' and result['best_effort_root'] and result['candidate_id'] == result['root_candidate_id']
+    assert kinds(builder) == ['design']
 
 
-def test_remote_schema_rejection_repairs_before_pinning(work, spec, requirements):
-    seen = []
-    base = fake_roles_factory(spec, requirements, seen)
-    class Roles(base):
-        def ask(self, role, purpose, instruction, payload, schema, model=None):
-            if role == 'WorkflowCompilerAgent':
-                self.calls += 1
-                seen.append((role, deepcopy(payload)))
-                # A repair is a patch: only what changes.
-                return {'operations': [{'op': 'set_system_prompt', 'target': 'system_prompt', 'value': f'Follow the input policy. Repair {self.calls}.'}], 'tool_gates': [], 'summary': 'fixture'}
-            return super().ask(role, purpose, instruction, payload, schema, model)
+def test_design_that_freya_rejects_is_never_pinned(work, spec, requirements):
     class RejectingFreya(FakeFreya):
         def validate_remote(self, workflow):
             raise ValueError('Platform rejected a documented field')
         def deploy(self, slot, workflow):
-            raise AssertionError('Invalid root must not deploy')
-    cfg = Config(artifacts=work, tracing=False, max_depth=0)
-    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles, adapter_factory=RejectingFreya)
-    result = builder.run()
-    assert result['status'] == 'failed' and result['invalid_candidates'] == 3
-    assert not (builder.root / 'pinned_root.json').exists()
-    repairs = [payload for role, payload in seen if role == 'WorkflowCompilerAgent']
-    assert len(repairs) == 2 and 'Freya dry-run rejected' in repairs[0]['compiler_errors'][0]
+            raise AssertionError('A rejected design must not be deployed')
+    reword = lambda n: {'fixes': [fix(('set_workflow_field', '', 'system_prompt', f'Follow the input policy. Attempt {n}.'))]}
+    builder, result, seen = build(work, spec, requirements, [reword(1), reword(2)], freya=RejectingFreya)
+    assert result['status'] == 'failed' and not result['export_path'] and not (builder.root / 'pinned_root.json').exists()
+    asked = fixes_seen(seen)
+    assert len(asked) == 2 and 'Freya dry-run rejected' in asked[0]['problems']['compiler'][0]
 
 
-def test_valid_root_with_dead_end_gets_one_targeted_repair(work, spec, requirements):
-    trapped = deepcopy(spec)
-    node = trapped['workflow']['nodes']['verify']
-    node['extraction_schema'] = [{'name': 'answer', 'type': 'string', 'enum_values': ['agrees', 'refuses'], 'description': 'What the caller said.', 'min_confidence': 0.7}]
-    node['transitions'] += [{'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'refuses'}]}},
-                            {'target_node': 'verify', 'description': 'Stay', 'condition': {'operator': 'always'}}]
-    def build(repaired):
-        seen = []
-        base = fake_roles_factory(trapped, requirements, seen)
-        class Roles(base):
-            def ask(self, role, purpose, instruction, payload, schema, model=None):
-                if role == 'WorkflowCompilerAgent':
-                    seen.append((role, deepcopy(payload)))
-                    return deepcopy(repaired)
-                return super().ask(role, purpose, instruction, payload, schema, model)
-        builder = Builder(Config(artifacts=work, tracing=False, official=False, max_depth=0), [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles)
-        try:
-            root = builder.compile()
-            return builder, root, builder.archive.get(root)['mutation_kind'], [payload for role, payload in seen if role == 'WorkflowCompilerAgent']
-        finally:
-            builder.archive.db.close()
-    fixed = deepcopy(trapped['workflow']['nodes']['verify'])
-    fixed['transitions'].insert(1, {'target_node': 'verify', 'description': 'Agreed, ask the next question', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
-    builder, root, kind, repairs = build({'operations': [{'op': 'set_node', 'target': 'verify', 'value': fixed}], 'tool_gates': [], 'summary': 'route the agreement'})
-    assert len(repairs) == 1 and 'answer can be extracted as' in repairs[0]['compiler_errors'][0]
-    assert kind == 'compile_repair' and builder.valid[root] and not builder.best_effort
-    # A repair that breaks the workflow never displaces the deployable root it was asked to improve.
-    builder, root, kind, repairs = build({'operations': [{'op': 'set_initial_node', 'target': 'initial_node', 'value': 'missing'}], 'tool_gates': [], 'summary': 'breaks it'})
-    assert kind == 'baseline' and builder.valid[root] and not builder.best_effort
-    # A patch that cannot be applied leaves the proposal as it was and the next attempt is told why.
-    builder, root, kind, repairs = build({'operations': [{'op': 'set_node', 'target': 'verify', 'value': 'not a stage'}], 'tool_gates': [], 'summary': 'garbled'})
-    assert kind == 'baseline' and len(repairs) == 2 and 'repair patch was rejected' in repairs[1]['compiler_errors'][0]
+def test_a_dry_run_that_gets_no_answer_is_not_a_rejection(work, spec, requirements):
+    class SlowFreya(FakeFreya):
+        def validate_remote(self, workflow):
+            raise TimeoutError('Freya operation exceeded remaining budget')
+    builder, result, seen = build(work, spec, requirements, freya=SlowFreya, max_simulations=0)
+    assert result['status'] == 'exported' and builder.static[result['candidate_id']]['valid'] and not fixes_seen(seen)
 
 
-def test_best_effort_root_is_still_searched_and_can_be_beaten(work, spec, requirements):
-    flawed = deepcopy(spec)
-    flawed['tool_gates'] = []  # the gate finding no repair removes
+def test_rule_extraction_failure_is_not_fatal(work, spec, requirements):
+    requirements['requirements'][0]['precedence']['supersedes'] = ['R404']  # refers to a rule that does not exist
+    builder, result, seen = build(work, spec, requirements, max_simulations=0)
+    assert result['status'] == 'exported' and [role for role, _ in seen] == ['BriefAnalystAgent', 'BriefAnalystAgent', 'ADASDesignerAgent']
+    assert 'requirements' not in seen[-1][1] and 'requirements_unavailable' in (builder.root / 'build_trace.log').read_text()
+
+
+def test_resume_reuses_the_root_without_model_calls(work, spec, requirements):
+    first, a, _ = build(work, spec, requirements, max_simulations=0)
     seen = []
-    base = fake_roles_factory(flawed, requirements, seen)
-    class Roles(base):
-        def ask(self, role, purpose, instruction, payload, schema, model=None):
-            if role == 'WorkflowCompilerAgent':
-                raise ValueError('model returned nothing usable')
-            return super().ask(role, purpose, instruction, payload, schema, model)
-    cfg = Config(mode='scoring_only', artifacts=work, tracing=False, max_candidates=4, max_depth=1, max_simulations=4)
-    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles, adapter_factory=FakeFreya, only=['PUB-01'])
+    builder = Builder(Config(artifacts=work, tracing=False, max_simulations=0), BRIEF, KIT / 'tools/openapi.json', roles_factory=roles(spec, requirements, [], seen), adapter_factory=FakeFreya, resume=first.root)
     builder.submission_dir = work / 'out'
-    result = builder.run()
-    mutations = [payload for role, payload in seen if role == 'MutationDesignerAgent']
-    assert result['best_effort_root'] and mutations and 'missing source-backed deterministic tool gate' in mutations[0]['parent_static_findings'][0]
-    # The fake passes every simulation after the first: a child carrying only the root's finding is measured and wins.
-    assert result['candidate_id'] != result['root_candidate_id'] and result['strict_pass_rate'] == 1.0
-    assert result['status'] == 'exported_best_effort' and not builder.valid[result['candidate_id']] and builder.usable[result['candidate_id']]
+    b = builder.run()
+    assert not seen and b['status'] == 'exported' and created(builder, b['candidate_id'])['source_sha256'] == created(first, a['candidate_id'])['source_sha256']
 
+
+# ------------------------------------------------------------------ improving
+
+def test_each_fix_is_kept_or_blamed_alone_and_a_blamed_one_is_branched_away(work, spec, requirements):
+    def outcomes(workflow):
+        a, b = (json.dumps(workflow['nodes'][key]) for key in ('step_a', 'step_b'))
+        return {'PUB-01': ('B_FIX' not in b, ['verify', 'account', 'step_b', 'close']),          # passes until fix B breaks it
+                'PUB-02': ('A_FIX' in a, ['verify', 'account', 'step_a', 'close']),              # repaired by fix A
+                'PUB-03': ('B_FIX' in b or 'C_FIX' in b, ['verify', 'account', 'step_b', 'close'])}  # repaired by B, or properly by C
+    first = {'fixes': [fix(('set_field', 'step_a', 'code', code('A_FIX')), problem='A', cases=['PUB-02']), fix(('set_field', 'step_b', 'code', code('B_FIX')), problem='B', cases=['PUB-03'])]}
+    second = {'fixes': [fix(('set_field', 'step_b', 'code', code('C_FIX')), problem='C', cases=['PUB-03'])]}
+    builder, result, seen = build(work, chain(spec), requirements, [first, second], outcomes=outcomes)
+    assert kinds(builder) == ['design', 'fixes', 'revert_branch', 'fixes']
+    assert [(h['problem'], h['status']) for h in builder.history] == [('A', 'kept'), ('B', 'blamed'), ('C', 'kept')]
+    assert result['status'] == 'exported' and result['strict_pass_rate'] == 1 and result['simulations'] == 3 and result['fixes']['blamed'] == 1
+    exported = json.dumps(json.loads((builder.root / 'champion.workflow.json').read_text())['workflow'])
+    assert 'A_FIX' in exported and 'C_FIX' in exported and 'B_FIX' not in exported
+    asked = fixes_seen(seen)
+    # Round one sees only the failed calls; round two is told what was blamed and still owes PUB-03.
+    assert sorted(asked[0]['calls']) == ['PUB-02', 'PUB-03'] and asked[0]['problems']['passing'] == ['PUB-01'] and asked[0]['history'] == []
+    assert [c['case'] for c in asked[1]['problems']['failed_calls']] == ['PUB-03'] and 'PUB-01' in asked[1]['history'][1]['note'] and asked[1]['history'][1]['status'] == 'blamed'
+    assert 'A_FIX' in json.dumps(asked[1]['workflow']) and 'B_FIX' not in json.dumps(asked[1]['workflow'])
+    judged = [e for e in lineage(builder) if e['event'] == 'fixes_judged']
+    assert judged[0]['blamed'] == ['B'] and judged[0]['kept'] == ['A'] and judged[0]['regressed'] == ['PUB-01']
+
+
+def test_a_regression_no_fix_touched_is_noise_and_the_measured_best_is_exported(work, spec, requirements):
+    def outcomes(workflow):
+        fixed = 'A_FIX' in json.dumps(workflow['nodes']['step_a'])
+        return {'PUB-01': (not fixed, ['verify', 'close']),                      # fails on the child without visiting an edited stage
+                'PUB-02': (False, ['verify', 'account', 'step_a', 'close']),
+                'PUB-03': (not fixed, ['verify', 'close'])}
+    patch = {'fixes': [fix(('set_field', 'step_a', 'code', code('A_FIX')), problem='A', cases=['PUB-02'])]}
+    builder, result, seen = build(work, chain(spec), requirements, [patch], outcomes=outcomes)
+    assert [(h['problem'], h['status']) for h in builder.history] == [('A', 'kept')]
+    # The child scored lower, so the root stays the export even though nothing could be blamed.
+    assert result['candidate_id'] == result['root_candidate_id'] and result['final_score']['passed'] == 2 and result['simulations'] == 2
+
+
+def test_wording_is_committed_without_a_simulation(work, spec, requirements):
+    patch = {'fixes': [fix(('set_field', 'verify', 'task_message', 'Ask for the date of birth first.'), problem='unclear instruction', cases=['PUB-01'])]}
+    builder, result, seen = build(work, spec, requirements, [patch], outcomes=lambda workflow: {'PUB-01': (False, ['verify'])})
+    assert kinds(builder) == ['design', 'wording'] and result['simulations'] == 1 and len(fixes_seen(seen)) == 1
+    assert result['candidate_id'] != result['root_candidate_id'] and result['wording_untested'] and result['strict_pass_rate'] == 2 / 3
+    assert builder.history[0]['status'] == 'untested'
+    assert 'Ask for the date of birth first.' in (builder.root / 'champion.workflow.json').read_text()
+
+
+def test_without_room_for_a_simulation_only_wording_is_committed(work, spec, requirements):
+    patch = {'fixes': [fix(('set_field', 'step_a', 'code', code('A_FIX')), problem='logic'), fix(('set_field', 'verify', 'task_message', 'Ask once.'), problem='wording')]}
+    builder, result, seen = build(work, chain(spec), requirements, [patch], outcomes=lambda workflow: {'PUB-01': (False, ['verify'])}, max_simulations=1)
+    assert fixes_seen(seen)[0]['wording_only'] is True and result['simulations'] == 1
+    assert [(h['problem'], h['status']) for h in builder.history] == [('logic', 'rejected'), ('wording', 'untested')] and 'only wording' in builder.history[0]['note']
+    exported = (builder.root / 'champion.workflow.json').read_text()
+    assert 'Ask once.' in exported and 'A_FIX' not in exported
+
+
+def test_wording_for_the_export_is_written_from_the_calls_of_the_exported_agent(work, spec, requirements):
+    def outcomes(workflow):
+        fixed = 'A_FIX' in json.dumps(workflow['nodes']['step_a'])
+        return {'PUB-01': (not fixed, ['verify', 'close']),   # lost on the child, without visiting the edited stage
+                'PUB-02': (False, ['verify', 'account', 'step_b' if fixed else 'step_a'])}
+    first = {'fixes': [fix(('set_field', 'step_a', 'code', code('A_FIX')), problem='A', cases=['PUB-02'])]}
+    second = {'fixes': [fix(('set_field', 'verify', 'task_message', 'Ask once.'), problem='wording', cases=['PUB-02'])]}
+    builder, result, seen = build(work, chain(spec), requirements, [first, second], outcomes=outcomes, max_simulations=2)
+    asked = fixes_seen(seen)
+    # The child scored lower, so the root is what will be exported; the wording round is shown the root and the root's own call.
+    assert asked[1]['wording_only'] is True and 'A_FIX' not in json.dumps(asked[1]['workflow'])
+    assert [c['case'] for c in asked[1]['problems']['failed_calls']] == ['PUB-02']
+    assert [turn['node'] for turn in asked[1]['calls']['PUB-02']['turns']] == ['verify', 'account', 'step_a']
+    exported = (builder.root / 'champion.workflow.json').read_text()
+    assert result['wording_untested'] and 'Ask once.' in exported and 'A_FIX' not in exported
+
+
+def test_a_kept_fix_that_stood_on_a_blamed_one_is_not_reported_as_kept(work, spec, requirements):
+    def outcomes(workflow):
+        return {'PUB-01': ('extra' not in workflow['nodes'], ['verify', 'account', 'step_b', 'close']),
+                'PUB-02': (False, ['verify'])}
+    patch = {'fixes': [fix(('set_stage', 'extra', '', {'node_type': 'code', 'code': code('x'), 'transitions': [route('close')]}), ('set_field', 'step_b', 'transitions', [route('extra')]), problem='B', cases=['PUB-02']),
+                       fix(('set_field', 'extra', 'code', code('D_FIX')), problem='D', cases=['PUB-02'])]}
+    builder, result, seen = build(work, chain(spec), requirements, [patch], outcomes=outcomes)
+    assert {h['problem']: h['status'] for h in builder.history} == {'B': 'blamed', 'D': 'rejected'} and kinds(builder) == ['design', 'fixes']
+    assert result['candidate_id'] == result['root_candidate_id'] and 'D_FIX' not in (builder.root / 'champion.workflow.json').read_text()
+
+
+def test_a_fix_that_cannot_be_applied_is_dropped_alone(work, spec, requirements):
+    def outcomes(workflow):
+        return {'PUB-01': ('A_FIX' in json.dumps(workflow['nodes']['step_a']), ['verify', 'account', 'step_a'])}
+    patch = {'fixes': [fix(('set_field', 'nowhere', 'code', 'x'), problem='lost'), fix(('set_field', 'step_a', 'code', code('A_FIX')), problem='A', cases=['PUB-01']),
+                       fix(('set_field', 'verify', 'max_turn_transition', 'end'), problem='breaks close')]}
+    builder, result, seen = build(work, chain(spec), requirements, [patch], outcomes=outcomes)
+    assert {h['problem']: h['status'] for h in builder.history} == {'lost': 'rejected', 'breaks close': 'rejected', 'A': 'kept'}
+    assert 'adds compiler errors' in next(h['note'] for h in builder.history if h['problem'] == 'breaks close')
+    assert result['strict_pass_rate'] == 1 and result['simulations'] == 2
+
+
+def test_a_crash_while_improving_still_exports_the_root(work, spec, requirements):
+    builder, result, seen = build(work, spec, requirements, [RuntimeError('forced failure')], outcomes=lambda workflow: {'PUB-01': (False, ['verify'])})
+    assert result['status'] == 'exported_with_errors' and result['candidate_id'] == result['root_candidate_id'] and result['export_path']
+    assert digest(json.loads((builder.root / 'champion.workflow.json').read_text())['workflow']) == created(builder, result['root_candidate_id'])['workflow_sha256']
+
+
+def test_cached_real_export_survives_restore_outage(work, spec, requirements):
+    class RestoreOutage(FakeFreya):
+        def deploy(self, slot, workflow):
+            if self.exporting:
+                raise ConnectionError('forced restore outage')
+            return super().deploy(slot, workflow)
+    builder, result, seen = build(work, spec, requirements, freya=RestoreOutage, max_simulations=0)
+    assert result['status'] == 'exported_cached' and result['remote_restored'] is False and result['export_path'] and result['strict_pass_rate'] is None
+
+
+# ------------------------------------------------------------------ workspace
 
 def lock_worker(path, queue):
     with file_lock(path, Deadline(10)):
@@ -244,40 +309,3 @@ def test_workspace_lock_serializes(work):
         process.join(3)
         assert process.exitcode == 0
     assert intervals[1][0] >= intervals[0][1]
-
-
-def test_cached_real_export_survives_restore_outage(work, spec, requirements):
-    class RestoreOutage(FakeFreya):
-        def deploy(self, slot, workflow):
-            if self.exporting:
-                raise ConnectionError('forced restore outage')
-            return super().deploy(slot, workflow)
-    cfg = Config(mode='scoring_only', artifacts=work, tracing=False, max_depth=0, max_simulations=0)
-    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=fake_roles_factory(spec, requirements, []), adapter_factory=RestoreOutage, only=['PUB-01'])
-    builder.submission_dir = work / 'out'
-    result = builder.run()
-    assert result['status'] == 'exported_cached' and result['remote_restored'] is False
-    assert result['export_path']
-    assert result['strict_pass_rate'] is None
-
-
-def test_search_stops_asking_after_two_barren_groups_and_reports_refusals(work, spec, requirements):
-    seen = []
-    base = fake_roles_factory(spec, requirements, seen)
-    class Roles(base):
-        def ask(self, role, purpose, instruction, payload, schema, model=None):
-            if role == 'MutationDesignerAgent':
-                self.calls += 1
-                seen.append((role, deepcopy(payload)))
-                node = deepcopy(payload['parent']['workflow']['nodes']['verify'])
-                node['pre_actions'] = []  # not allowed on a conversation stage: every child is refused
-                return {'proposals': [{'parent_id': payload['parent_id'], 'mutation_type': 'add_guard', 'target_nodes': ['verify'], 'target_rule_ids': ['R1'], 'hypothesis': 'Fixture', 'operations': [{'op': 'set_node', 'target': 'verify', 'value': node}], 'expected_effect': 'none', 'risk': 'low', 'coverage': spec['coverage']}]}
-            return super().ask(role, purpose, instruction, payload, schema, model)
-    cfg = Config(mode='scoring_only', artifacts=work, tracing=False, max_candidates=10, max_depth=3, max_simulations=4)
-    builder = Builder(cfg, [KIT / 'briefs/brief-a.md'], KIT / 'tools/openapi.json', roles_factory=Roles, adapter_factory=FakeFreya, only=['PUB-01'])
-    builder.submission_dir = work / 'out'
-    result = builder.run()
-    asked = [payload for role, payload in seen if role == 'MutationDesignerAgent']
-    assert result['export_path'] and len(asked) == 2
-    assert asked[0]['rejected_siblings'] == [] and asked[1]['rejected_siblings'][0]['edited'] == ['verify']
-    assert 'pre_actions' in asked[1]['rejected_siblings'][0]['refused_because'][0]

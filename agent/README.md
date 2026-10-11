@@ -1,63 +1,99 @@
-# Ticket 1: brief-driven Freya builder
+# Brief-driven Freya builder
 
-All implementation and runtime writes live in this directory. The surrounding kit is read-only. Google ADK generates requirements, workflows and typed patches; deterministic Python controls validation, deployments, scores, time limits and exports. Agents have no shell, file, network, deployment or trace-query tools. The code-test referee has one pure calendar calculator, parameterized entirely from source policy.
+Reads a bank brief and its tool API file, designs a Freya phone agent, fixes it, measures it on
+practice customers where they exist, improves it and exports it. One command, no manual step.
+All code and every runtime write live in this directory; the surrounding kit is read-only.
 
 ## Run
 
-From the kit root, with Python 3.10+ and the existing kit credentials:
+From the kit root, with Python 3.10+:
 
 ```sh
 python3 -m venv agent/.venv
 agent/.venv/bin/pip install -r agent/requirements.lock
-python3 agent/agent_builder.py briefs/brief-a.md
-python3 agent/agent_builder.py briefs/brief-a.md briefs/brief-b.md
-python3 agent/agent_builder.py path/to/policy.md --openapi path/to/openapi.json
+agent/.venv/bin/python agent/agent_builder.py briefs/brief-a.md
+agent/.venv/bin/python agent/agent_builder.py briefs/brief-a.md briefs/brief-b.md
+agent/.venv/bin/python agent/agent_builder.py path/to/brief.md path/to/tool-api.json
 ```
 
-Use the virtual environment's Python if dependencies are not already installed. Put keys in the kit-root `env.sh` (template provided, git-ignored): `FREYA_API_KEY`, `FREYA_BANK_TEAM_KEY` and the builder LLM settings. The default builder LLM is Qwen 3.8 (`Qwen/Qwen3.8-2.4T-A95B`) served on Modal (`modal/<served model name>`): set `MODAL_BASE_URL` (the OpenAI-compatible `.../v1` URL), `MODAL_KEY` (`wk-...`) and `MODAL_SECRET` (`ws-...`), sent as Modal proxy-auth headers. Other LiteLLM providers still work (`anthropic/...` needs `ANTHROPIC_API_KEY`, `gemini/...` needs `GOOGLE_API_KEY`). The builder loads it automatically and exits with code 2, naming any missing key, before doing any work. Settings resolve as CLI mode > process environment > `agent/.env` > root `.env` > root `env.sh` > defaults.
+A brief that is not one of the kit's own needs its tool API file, given after the brief or with
+`--openapi`; without it the builder stops at once instead of building for the kit's bank.
 
-Optional public test selectors:
+Keys go in the kit-root `env.sh` (template `env.example`, git-ignored): `FREYA_API_KEY`,
+`FREYA_BANK_TEAM_KEY` and the builder model settings. The default builder model is Qwen 3.8 on
+Modal (`MODAL_BASE_URL`, `MODAL_KEY`, `MODAL_SECRET`); any LiteLLM model name works through
+`BUILDER_MODEL`. The builder names any missing key and exits with code 2 before doing any work.
+Settings resolve as process environment > `agent/.env` > root `.env` > root `env.sh` > defaults.
+
+Options: `--only PUB-01,PUB-03` and `--style pieces` select practice customers and how they
+talk; `--resume-run agent/artifacts/<run_id>` reuses that run's rules and first design.
+
+The last stdout line is JSON: workflow and agent ids, the exported candidate, status, pass rate
+(or null), simulations used and what became of each fix. Exit codes: 0 exported, 2 bad input or
+configuration, 3 no workflow Freya accepts, 4 export failure.
+
+## How a build works
+
+1. **Rules.** One model call extracts the brief's rules with their source lines, as a checklist
+   for the designer. If that fails twice the build goes on with the brief alone.
+2. **Design.** One call writes the workflow *source*: compact, with bank tools as
+   `{"bank_operation": ...}` and code stages as plain Python. The controller compiles it:
+   it expands the tools from the tool API file, wraps the code, and injects the runtime support
+   (spoken-date resolution against the call's `now`, business-day helpers, a loop guard).
+   Models only ever see and edit the source.
+3. **Compiler fixes.** Static checks and a Freya dry run produce errors that each name the stage
+   to change. Up to two fix calls answer them. If no candidate is clean, the least-flawed one
+   Freya accepts is exported as best effort.
+4. **Measure.** Where practice customers exist (the kit's Brief A and B), the agent is deployed
+   and simulated once; the kit's own runner and scorer give the verdicts.
+5. **Improve.** A chain of rounds. One fix call reads the failed calls step by step and returns
+   a patch: several small fixes, each a few field-level edits. All fixes that apply cleanly go
+   into one child, which is simulated once. Each fix is then kept, or blamed if a customer that
+   passed before now fails *and* its call visited a stage that fix edited. A blamed fix is
+   dropped by branching from the parent with the kept ones. Edits that change wording only (what
+   the agent is told or says; a description or a routing prompt is not wording) are committed
+   without a simulation; anything else is never exported unmeasured.
+6. **Export.** The best measured candidate (with its wording-only child, if any) is published
+   and exported to `agent/out/<brief>.workflow.json`.
+
+A brief without practice customers stops after step 3: no speculative edits are made to an agent
+that cannot be tested. `docs/tickets/ticket-02.md` specifies generated practice customers to
+close that gap.
+
+## What the static checks cover
+
+Stage shapes and field placement, bank tools exactly as the tool API declares them (URL, method,
+fields, enums, zero retries), sandbox-safe code, every stage reachable and able to end, `close_call`
+alone in its stage and before every hang-up, and identity: no route may reach `get_account` or
+`create_promise` without a `verify_identity` call followed by a transition that tests something
+the caller cannot simply say. An identity error prints the offending route. Hints (a value no
+route tests, an offer that is never applied) are passed to fix calls and never block.
+
+They do not prove how the agent speaks or what the bank records; only a simulation shows that.
+
+## Artifacts
+
+`agent/artifacts/<run_id>/`: inputs and their hashes, extracted rules, `build_trace.log` (start
+and end, every model call with its purpose, what was created on Freya, every simulation and its
+result), `lineage.jsonl`, and per candidate its source (`proposal.json`), compiled workflow,
+the patch that made it and its static result; per simulation the raw runner output, bank ledgers
+and call records. `python3 -m observability.serve --artifacts-dir agent/artifacts` (from the kit
+root) shows all of it at http://127.0.0.1:8765.
+
+`agent/.runtime/` holds the Freya slot state and the workspace lock: one workflow per brief,
+updated in place, and never more than one simulation at a time.
+
+Restore an archived candidate without any model call:
 
 ```sh
-python3 agent/agent_builder.py briefs/brief-a.md --only PUB-01,PUB-03
-python3 agent/agent_builder.py briefs/brief-a.md --style pieces
-BENCHMARK_MODE=scoring_only python3 agent/agent_builder.py briefs/brief-a.md
-PYTHONPATH=agent python3 -m builder.experiments.compare_modes --brief briefs/brief-a.md --only PUB-01,PUB-03
+PYTHONPATH=agent agent/.venv/bin/python -m builder.restore --run agent/artifacts/<run_id>
 ```
 
-`--only`, styles and repetition counts create distinct suites. Partial or different suites are never ranked as equal. Unfamiliar input has unknown official fitness; no practice expected values are applied to it. The paired experiment first builds a pinned root and freezes its baseline measurement, then runs isolated arms sequentially. Every build gets its own wall-clock budget. A shared baseline is explicitly identified; its cost belongs to the baseline run.
-
-The last stdout line is JSON with workflow/agent/candidate IDs, mode, evidence type, strict rate (or null), status and actual export path. Exit codes: 0 real export, 2 bad input/config, 3 no valid candidate, 4 deployment/export failure. `exported_with_errors` means the champion was recovered after a later failure, not that all search objectives passed.
-
-## Artifacts and recovery
-
-Each `agent/artifacts/<run_id>/` contains input hashes/snapshots, requirements, tool contracts, SQLite + JSONL lineage, immutable candidate snapshots/patches, validations, frozen scores, authorized diagnostics, model requests, local build trace, pinned root, report and real root/champion exports. Submission copy: `agent/out/<last-brief-stem>.workflow.json`. State/locks remain in `agent/.runtime/`; each feedback mode reuses one workflow slot. A timed-out simulation leaves a lease so the next run waits for it to settle.
-
-`--pinned-root agent/artifacts/<run_id>/pinned_root.json` starts from an exact source-matched snapshot without regenerating it. Historical candidates never change. Export restores and publishes the selected candidate and checks all submitted semantic fields against the server export; added server defaults are tolerated. If final restoration fails, a previously verified real export of that exact champion can be recovered with status `exported_cached` and `remote_restored=false`. This preserves the submission without claiming the remote deployment was restored. Without such an export, the build fails.
-
-The benchmark wrapper calls the original kit `persona_for` and `run_once`, keeping their bank-state and conversation verdicts. It avoids the stock main's writes outside `agent`. Real runs must report the expected `agentVersionNumber`. Missing versions or incomplete runs cannot produce a complete scored suite. No LLM diagnosis changes core scores. A proxy or static check is never labeled official success.
-
-## Validation
+## Tests
 
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m pytest agent/tests -q -p no:cacheprovider
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=agent python3 -m builder.audit_smoke
+agent/.venv/bin/python -m pytest agent/tests observability/tests -q
 ```
 
-The audit smoke intentionally loads the stock example unchanged and tests startup only. The supplied example has legacy fields and incomplete policy; it is not used as a compliant generated root. Unit/controller tests explicitly use fake Freya evidence and cannot demonstrate live bank correctness.
-
-Static checks reject misplaced fields, unsupported operations and URLs, missing mapping prefixes, altered tool schemas, retry hazards, dangling/deadlocked routes, unguarded account access and closing bypasses. Snippet validation rejects undocumented imports, filesystem/network capabilities, dynamic execution and host-clock use. It does not prove all spoken policies; actual practice runs remain necessary.
-
-LangSmith is optional at runtime: local durable logs survive missing credentials/outages. Remote traces contain metadata and artifact references rather than customer transcripts. Local evidence is restricted to the synthetic kit, with credentials and structured identity fields redacted. No real customer data is supported. LangSmith receipt is unverified unless a configured account receives a trace.
-
-No model weight training, frontend or builder self-rewriting is included. Search uses GRPO-style relative normalization only on complete matched sibling suites. With the default four-simulation budget, some children will still have unknown fitness; they cannot displace a measured champion without comparable evidence.
-
-Restore after an interrupted run without another model call:
-
-```sh
-PYTHONPATH=agent python3 -m builder.restore --run agent/artifacts/<run_id>
-```
-
-Recovery revalidates the selected immutable snapshot, rejects known hard failures, updates/publishes its original slot and exports into a new recovery directory. The original lineage stays intact.
-
-Code probes are generated from source rules once and reused for children. They run in a separate process with restricted builtins/imports and CPU/wall limits; they test deterministic snippet outputs only. Held-out validation uses a speaking style withheld from optimization and runs only if repetition, simulation and wall budgets allow it.
+Controller tests use fake Freya evidence; they show how the loop behaves, not that an agent is
+correct.

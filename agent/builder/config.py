@@ -6,7 +6,6 @@ import time
 
 AGENT = Path(__file__).resolve().parents[1]
 KIT = AGENT.parent
-MODES = ("scoring_only", "scoring_with_diagnostics")
 
 
 def writable(path):
@@ -38,19 +37,10 @@ def boolean(name, default):
 
 @dataclass(frozen=True)
 class Config:
-    mode: str = "scoring_with_diagnostics"
     builder_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
-    mutator_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
-    referee_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
     max_wall_seconds: int = 1800
     reserve: int = 180
-    max_candidates: int = 10
-    max_depth: int = 3
-    beam_width: int = 2
-    group_size: int = 3
-    seed: int = 42
     repetitions: int = 1
-    final_repetitions: int = 3
     max_simulations: int = 4
     llm_timeout: int = 480
     request_timeout: int = 90
@@ -59,29 +49,26 @@ class Config:
     artifacts: Path = AGENT / "artifacts"
 
     def __post_init__(self):
-        if self.mode not in MODES:
-            raise ValueError(f"BENCHMARK_MODE must be one of {MODES}")
         if not 30 <= self.max_wall_seconds <= 1800:
             raise ValueError("MAX_WALL_SECONDS must be between 30 and 1800")
         if not 1 <= self.reserve < self.max_wall_seconds:
             raise ValueError("Export reserve must be positive and below build budget")
-        for key in ("max_candidates", "beam_width", "group_size", "repetitions", "final_repetitions", "llm_timeout", "request_timeout"):
+        for key in ("repetitions", "llm_timeout", "request_timeout"):
             if getattr(self, key) < 1:
                 raise ValueError(f"{key} must be positive")
-        if self.max_depth < 0 or self.max_simulations < 0:
-            raise ValueError("Depth and simulation budget cannot be negative")
+        if self.max_simulations < 0:
+            raise ValueError("Simulation budget cannot be negative")
         writable(self.artifacts)
 
     @classmethod
-    def from_env(cls, mode=None):
+    def from_env(cls):
         load_env()
-        model = os.getenv("BUILDER_MODEL") or cls.builder_model
-        ints = {"max_wall_seconds": "MAX_WALL_SECONDS", "reserve": "MIN_EXPORT_RESERVE_SECONDS", "max_candidates": "MAX_CANDIDATES", "max_depth": "MAX_TREE_DEPTH", "beam_width": "BEAM_WIDTH", "group_size": "GROUP_SIZE", "seed": "SEARCH_SEED", "repetitions": "EVAL_REPETITIONS", "final_repetitions": "EVAL_FINAL_REPETITIONS", "max_simulations": "EVAL_MAX_SIMULATIONS", "llm_timeout": "LLM_CALL_TIMEOUT_SECONDS", "request_timeout": "FREYA_REQUEST_TIMEOUT_SECONDS"}
+        ints = {"max_wall_seconds": "MAX_WALL_SECONDS", "reserve": "MIN_EXPORT_RESERVE_SECONDS", "repetitions": "EVAL_REPETITIONS", "max_simulations": "EVAL_MAX_SIMULATIONS",
+                "llm_timeout": "LLM_CALL_TIMEOUT_SECONDS", "request_timeout": "FREYA_REQUEST_TIMEOUT_SECONDS"}
         values = {k: int(os.getenv(v, str(getattr(cls, k)))) for k, v in ints.items()}
         if os.getenv("FREYA_MAX_CONCURRENT_SIMULATIONS", "1") != "1":
             raise ValueError("Freya permits exactly one simulation at a time")
-        return cls(**values, mode=mode or os.getenv("BENCHMARK_MODE", cls.mode), builder_model=model,
-                   mutator_model=os.getenv("MUTATOR_MODEL") or model, referee_model=os.getenv("REFEREE_MODEL") or cls.referee_model,
+        return cls(**values, builder_model=os.getenv("BUILDER_MODEL") or cls.builder_model,
                    official=boolean("EVAL_ENABLE_OFFICIAL_PUBLIC", True), tracing=boolean("LANGSMITH_TRACING", True),
                    artifacts=writable(AGENT / os.getenv("ARTIFACTS_DIR", "artifacts")))
 
@@ -90,14 +77,12 @@ PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "ant
                  "gemini/": ("GOOGLE_API_KEY",), "gemini-": ("GOOGLE_API_KEY",), "openai/": ("OPENAI_API_KEY",)}
 
 
-def missing_credentials(cfg, need_models=True):
+def missing_credentials(cfg):
     """Names (never values) of required keys that are unset for this configuration."""
     need = {"FREYA_API_KEY", "FREYA_BANK_TEAM_KEY"}
-    if need_models:
-        for model in {cfg.builder_model, cfg.mutator_model, cfg.referee_model}:
-            for prefix, keys in PROVIDER_KEYS.items():
-                if model.startswith(prefix):
-                    need |= set(keys)
+    for prefix, keys in PROVIDER_KEYS.items():
+        if cfg.builder_model.startswith(prefix):
+            need |= set(keys)
     return sorted(key for key in need if not os.getenv(key, "").strip())
 
 

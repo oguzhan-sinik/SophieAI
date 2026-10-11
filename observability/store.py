@@ -23,6 +23,9 @@ def _sha256(data: bytes) -> str:
 
 
 LIVE_SECONDS = 600
+# Candidate kinds of the fix loop: one batch of fixes per round, wording committed unmeasured,
+# and a branch that drops a blamed fix.
+FIX_KINDS = {"fixes": "Fixes", "wording": "Wording only (not simulated)", "revert_branch": "Branch without the blamed fix"}
 
 
 class ArtifactForbidden(Exception):
@@ -316,11 +319,13 @@ class Store:
             if derived:
                 n["parent_id"], n["parent_derived"] = parent, True
             kind = n["mutation_kind"]
-            if kind == "compile_repair":
+            if kind in ("compile_repair", "compile_fix"):
                 repairs += 1
-                n["label"] = f"Repair {repairs}"
-            elif kind == "baseline":
+                n["label"] = f"Compiler fix {repairs}" if kind == "compile_fix" else f"Repair {repairs}"
+            elif kind in ("baseline", "design"):
                 n["label"], repairs = "First design", 0
+            elif kind in FIX_KINDS:
+                n["label"] = FIX_KINDS[kind]
             else:
                 n["label"] = "Mutation: " + str(kind).replace("_", " ")
             n.update(self._candidate_stats(run_id, cid, n["parent_id"]))

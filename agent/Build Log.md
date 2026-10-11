@@ -91,3 +91,33 @@ All implementation, test outputs, dependencies and runtime artifacts stay in `ag
 - Resumed unfamiliar compilation and Brief A generation on the same user-approved NVIDIA endpoint. All writes remain under `agent/`.
 - Alternate model outputs exposed malformed JSON and output truncation from a large reasoning allocation. Verified NVIDIA JSON mode with a tiny real request (HTTP 200), enabled it, and used documented Nemotron non-thinking mode for bounded generation. Stopped obsolete retries and restarted with those settings.
 - Provider references: https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/modelcard and https://build.nvidia.com/nvidia/nemotron-3-super-120b-a12b/deploy. Local suite: 46 passing tests.
+
+## Batch 10 — The fixing stage rebuilt
+
+- Ten live builds: 19 repair attempts with 1 success, 12 of the failures on the declared identity
+  gate; mutations of ~10 KB per stage for 5–15 changed lines; sibling ranking computed once in six
+  groups; probes with three false alarms and no real bug.
+- Replaced by one loop: a compact workflow source that every model call sees, one patch format of
+  field-level edits used for compiler fixes and for improvement, one fix call that reads failed
+  calls step by step, one child per round, and each fix kept or blamed on the customers whose calls
+  visited the stages it edited. Wording-only edits are committed without a simulation.
+- Identity is checked on the routes themselves and the error prints the route. Business-day
+  arithmetic became controller helpers; the probe machinery, feedback modes, beam and ranking,
+  held-out revalidation and the paired experiment were deleted.
+
+## Batch 11 — First live build on the rebuilt loop, and a logic review
+
+- The first live build scored 0 of 10. Two causes, both mine: a new helper was named like a
+  variable of the injected prelude, so every business-day call failed once a spoken date had been
+  resolved; and the rewritten design rules allowed bank tools in conversation stages again, so
+  identity ran through a model-called tool with unnormalised dates. Prelude variables now carry
+  their own prefix, bank tools must be engine-run, and an identity route with one spoken
+  alternative is no longer accepted as proof.
+- Review of every path afterwards. Fixed: a leftover simulation or a held lock could end a build
+  with no export (the lease is gone, the lock no longer raises); a provider error in any model call
+  ended the build (one more try, then handled like a bad answer); a dry run that got no answer
+  counted as a rejection; descriptions and routing prompts counted as wording although the router
+  and the extractor decide by them; the last wording round could be shown another candidate's
+  calls; a fix that only stood on a blamed one was reported as kept; a year said in words was
+  replaced by the call's year; and a brief from outside the kit was silently built against the
+  kit's tool API when none was given.

@@ -1,146 +1,166 @@
-"""Generic compiler instructions. Business values come only from input sources."""
+"""Instructions for the three model roles. Business values come only from the input sources."""
 ANALYST = """Compile every atomic policy in the ordered input documents into RequirementsBundle.
 Preserve actual absolute source path, heading, exact verbatim source span and inclusive line numbers.
 Use unique IDs. Include numbered rules, unnumbered tables, calendars and closing invariants.
 The same rule may cite a multi-line block containing its parameters. Do not omit a numbered rule.
 Resolve explicit overlay/replacement language with precedence.supersedes edges; do not replace
-unrelated inherited constraints. Ambiguous contradictions remain unresolved. Never invent a rule
-or resolve contradictions merely because one paragraph is later. Input variables come from the
-brief. Test templates are concrete policy probes, not claims of test execution. Keep fields concise.
+unrelated inherited constraints. Where the documents contradict each other without saying which
+one holds, mark the rules conflicting and list the question in unresolved; never invent a rule or
+settle a contradiction merely because one paragraph is later. Input variables come from the brief.
+Keep fields concise.
 """
 
-DESIGNER = """Generate a complete WorkflowSpec for the supplied effective policy and bank contract.
-Read all requirements and original documents. Supplied Freya documentation is authoritative.
-Return executable workflow JSON. All money, dates, enums, names, attempts and outcomes must come
-from these sources or live bank responses. Call now is the date anchor; never host/system clock.
+# How to write a workflow or any part of one. Shared by the designer and by every fix.
+RULES = """All money, dates, enums, names, attempts and outcomes must come from the source documents or
+from live bank responses. Call now is the date anchor; never the host or system clock.
 
-The controller expands bank tools from this compact intermediate shape:
+WORKFLOW SOURCE. You write a compact source; the controller compiles it for the platform.
+Stages are conversation, api_request, code and end_call nodes under workflow.nodes, each with a name
+equal to its snake_case key. initial_node is a conversation stage. No nulls, agent_config,
+undocumented fields or lifecycle tools. The live schema rejects loop_prompt: express
+repeat-turn behaviour in task_message and explicit routes. Every stage a call should reach must be
+the target_node of some transition.
+
+Every bank tool runs in its own api_request stage, as the single entry of pre_actions, never as a
+tool of a conversation stage. A conversation stage asks, extracts the reply into variables and
+routes; the api_request stage it routes to makes the call, and the routes out of that stage read the
+mapped result. This is how every call is certain to happen once, with the values the controller has
+normalised. A bank tool is always written in this shape, with only these keys:
 {"bank_operation":"<declared operation>","description":"CALL when ...",
  "bindings":{"<field>":"{{previously_set_variable}}"},
  "response_mapping":[{"path":"data.<field>","variable":"..."}],
- "pre_process_code":"optional sandbox Python", "post_process_code":"optional sandbox Python"}.
-Every bank tool MUST use that compact shape, including during repairs; do not expand API-call
-function objects. Omit unused fields. Do not write URLs, headers or request schemas yourself. Unbound fields are
-model-filled from the exact contract. customer_id is automatically baked from the call variable.
-Product IDs come only from account data. For pre_actions, response_mapping is on the NODE.
-Post hooks may add truthful what_to_do_next in result['data'] and read/write vars, not falsify results.
+ "pre_process_code":"optional Python","post_process_code":"optional Python"}
+Omit unused keys. Never write URLs, headers, request schemas, type or config: the controller takes
+them from the contract and sets zero retries. customer_id is bound automatically. Product ids come
+only from account data. Every other required field needs a binding to a variable that an extraction
+or a code stage has set; an answer the customer gives as a date is bound to its date-typed
+extraction variable, never to free text. Post hooks may add a truthful
+what_to_do_next to result['data'] and read or write vars; they never change what a tool returned.
 
-Use conversation/api_request/code/end_call nodes. initial_node should be conversation for chat.
-No nulls, agent_config, undocumented fields or lifecycle tools. Node names match snake_case keys.
-Runtime compatibility: the live Freya schema rejects loop_prompt despite the supplied docs;
-omit it and express repeat-turn behavior in task_message and explicit routes.
-No pre_actions on conversation, even empty. No tools on action/code. Each action/code is passthrough,
-with default target and final always route. Conversations have max_node_turns and a closing
-max_turn_transition. End nodes use __function__:end_call terminal. If source requires goodbye
-before close, speak it in the close api_request on_enter TTS; terminal can use message_mode none.
+Code stage: {"name":"...","node_type":"code","code":"<Python source>","transitions":[...]}.
+Write the Python as plain text in code. The controller adds the execution wrapper, makes api_request
+and code stages run silently and route at once, and uses their last transition, which must be
+always, as the fallback. Code reads vars.get('name') and writes vars['name']; it is wrapped in
+try/except and sets a fallback status on error. Import only json, re and datetime. No adjacent
+double braces in code (put a space between nested braces). No network, files, private attributes,
+eval/exec/getattr, dynamic imports or clock calls. Hooks may read config['body'] only.
 
-Routing belongs in transitions, extraction in extraction_schema with explicit min_confidence.
-List the values of every variable a stage routes on in enum_values, and give each listed value its
-own transition in that stage (back to the same stage where staying is intended). An agreement to
-what the stage just proposed is such a value: route it, never wait for the customer to repeat it.
-Top grouped conditions use OR (nest AND). Match true/True strings, never boolean operands.
-Protect account access with deterministic response-based gates on EVERY path including fallbacks.
-Keep get_account/create_promise downstream of successful identity responses, away from identity
-tools. Declare tool_gates: operation, source rule_ids, variable, allowed_values, producer_operation,
-response_path. Use flattened tool_response.data.* or mapped response variables. Speech is not proof.
-Declare tool_gates only for get_account and create_promise. producer_operation is a declared bank
-operation, response_path a data.* field of its response, variable the mapped response variable, and
-every route into the protected tool tests that variable with equals. In the compact bank tool shape
-write only the listed keys (no type, config or function). Every node any route should reach must be
-the target_node of some transition; do not leave stages unreachable.
+Conversation stage: it does one thing. It asks one question or makes one offer, extracts the reply
+and routes. task_message says what this stage is for, not how routing works, and does not carry the
+policy for several steps: what decides between outcomes lives in code stages and transitions. Give
+max_node_turns and a max_turn_transition that closes the call correctly. A conversation stage has no
+tools and no pre_actions. End stages use an
+__function__:end_call terminal and have no transitions.
 
-Compute dates/amounts in code nodes using vars and source constants. Verified platform behaviour:
-response_mapping stores scalar fields only. For a list or object field (for example the account's
-product list) still declare the mapping; the controller then delivers that variable to code nodes as
-a JSON string, so read it with json.loads and also accept a list. Never bind a tool argument to a
-variable that no code node or scalar mapping sets. Code that depends on such data must set an explicit
-ready flag and route to a safe close when the data is missing, never continue with empty values.
-An engine-run call flattens its result under <node name>_response.data.*, a model-called tool under
+ROUTING. Routing lives in transitions, extraction in extraction_schema with an explicit
+min_confidence on every variable. Top-level grouped conditions use OR (nest AND inside). Compare
+with the strings true/True, never boolean operands. List the values of every variable a stage routes
+on in enum_values and give each value that should move the call its own transition. An agreement to
+what the stage just proposed is such a value: route it, never wait for the customer to repeat a
+number or a date the stage itself stated.
+
+IDENTITY. Protect account access with deterministic, response-based routes on EVERY path, including
+fallbacks and turn caps. get_account and create_promise may only be reached after verify_identity
+has run and a transition after it has tested its result: a mapped response variable, the flattened
+<stage>_response.data.* value, or a status that a code stage derives from that response. What the
+caller says is never proof of identity: no alternative of such a route may test an extracted value.
+
+TOOL RESULTS. response_mapping stores scalar fields only. For a list or object field (for example
+the account's product list) still declare the mapping; the controller delivers that variable to code
+stages as a JSON string, so read it with json.loads and also accept a list. Never bind a tool
+argument to a variable that no code stage or scalar mapping sets. Code that depends on such data
+sets an explicit ready flag and routes to a safe close when the data is missing: a status a code
+stage sets is tested by that stage's own transitions, and a stage is never entered to speak a line
+built from values that may be empty. An engine-run call
+flattens its result under <stage name>_response.data.*, a model-called tool under
 <tool name>_response.data.*; prefer mapped variables in routes.
 
-Spoken dates: the platform resolves a date extraction against the real clock, not call now, so the
-controller handles them. Declare every calendar date the customer may say (a payment day, a callback
-day, a date of birth) as extraction type date and never write your own parser for spoken dates: a
-complete date with its year arrives as YYYY-MM-DD from the extractor, anything else is resolved by
-the controller. At run time
-the controller captures the customer's words and, before any code node or bound tool call, replaces
-the variable with the ISO day resolved against call now; <name>_said keeps the words. The variable is
-'' when the words name no single day (a vague period, or nothing): treat '' as not given and follow
-the source rule for a missing or vague day, never substitute a default silently. If the source
-prescribes its own reading of a phrase, call ctl_date(vars.get('<name>_said'), vars.get('now'),
-next_weekday='following_week' or 'next_occurrence') in your code and apply the source rule there.
-Do not ask the extractor to do calendar arithmetic and do not use platform date placeholders.
-A date variable is filled only when the customer names one single day; a vague period leaves it
-unset. So a stage that asks for a day extracts the date there, routes a vague answer through its own
-listed value, and tests that value before any is_set route on the date.
+DATES. The controller provides these functions inside every code stage; use them and never write
+your own calendar loop or spoken-date parser. weekdays is the list of business weekdays with
+Monday=0 and excluded the list of non-business ISO dates, both always taken from the source:
+  ctl_is_business_day(day, weekdays, excluded) -> True/False
+  ctl_add_business_days(day, count, weekdays, excluded) -> the count-th business day after day
+  ctl_business_day_on_or_after(day, weekdays, excluded) -> day itself if a business day, else the next
+  ctl_last_business_day_of_week(day, weekdays, excluded) -> last business day of day's Mon-Sun week
+  ctl_date(said, call_now, next_weekday='following_week' or 'next_occurrence') -> the day a phrase names
+All return YYYY-MM-DD text, or '' when the day cannot be worked out.
+Declare every calendar date the customer may say (a payment day, a callback day, a date of birth)
+as extraction type date. A complete date with its year arrives as YYYY-MM-DD; anything else is
+captured as the customer's words and, before any code stage or bound tool call, replaced by the day
+resolved against call now, with <name>_said keeping the words. The variable is filled only when the
+customer names one single day; a vague period leaves it unset or ''. So a stage that asks for a day
+extracts the date there, routes a vague answer through its own listed value, and tests that value
+before any is_set route on the date. Treat '' as not given and follow the source rule for a missing
+or vague day; never substitute a default silently. Where the source prescribes its own reading of a
+phrase, call ctl_date on <name>_said in code. Do not use platform date placeholders.
 
-Never replace a value the customer gave without their agreement. When code must change or reject a
-day or an amount (not allowed, outside a limit, missing), it sets a status variable and the proposed
-alternative, and routes to a conversation stage that states the reason and offers the alternative;
-only an accepted value reaches the read-back and the write. When the customer accepts an offered
+OFFERS AND WRITES. Never replace a value the customer gave without their agreement. When code must
+change or reject a day or an amount, it sets a status variable and the proposed alternative and
+routes to a conversation stage that states the reason and offers the alternative. Each status has
+its own route, tested before the generic success route. When the customer accepts an offered
 alternative, the accepting route first passes a code stage that copies the offered value into the
-variable the check reads; routing an acceptance straight back into the check changes nothing and loops. Each such status needs its own route,
-checked before the generic success route. A stage that speaks after a code check must receive the
-outcome through variables in its task_message and must not confirm anything the check rejected.
-A read-back states exactly the variables the write tool is bound to. After a failed write, apologise
-in neutral words and avoid the phrasing reserved for confirming success. Promise an action aloud
-(callback, transfer, record) only in the stage whose tool performs it, after that tool succeeded.
-code_exec is pre_actions with code.default; wrap in try/except, set fallback state. Only import
-json/re/datetime. No adjacent '{{' or '}}' in code (space nested braces). No network, files, private
-attributes, eval/exec/getattr, dynamic imports or host clock. Hooks may access only config['body']
-or config.get('body'), never URL/method/headers. Every code/action needs a valid fallback route.
+variable the check reads; routing an acceptance straight back into the check changes nothing and
+loops. Only an accepted value reaches the read-back and the write. A read-back states exactly the
+variables the write tool is bound to. A stage that speaks after a check receives the outcome through
+variables in its task_message and never confirms what the check rejected. Say that something is
+recorded, booked or transferred only in the stage after the tool that did it succeeded; in every
+other stage say nothing of the kind. After a failed write, apologise in neutral words. Retry a write
+only where the source permits it and the failure is known.
 
-Use explicit state for confirmation before writes, corrections, per-product attempts, retry limits
-and duplicate prevention. Controller sets zero HTTP retries. Application retry only when source
-permits and failure is known. No success claim after failure; speak or move after every tool result.
-Centralize close_call in an engine-run api_request stage, its only tool, followed by end_call.
-No path after close can reach any bank tool. Every terminal must pass close. Compute outcome and
-reason first using source policy and results. If source forbids notes on transfers, defer all notes
-until non-transfer commitment so earlier refusals cannot write notes before a later transfer.
+Keep explicit state for confirmation before writes, corrections, per-product attempts, retry limits
+and duplicate prevention. Speak or move on after every tool result.
 
-tool_gates describe identity only: the proof that the caller passed the security check, read from
-the identity tool's response. A customer's spoken confirmation is not a tool gate; route on it, but
-never declare it in tool_gates.
-coverage maps every active rule to real nodes and test IDs. tool_gates/coverage are outside workflow.
-architecture is a short rationale. Separate stages for tool boundaries and computations; avoid
-unnecessary graph size. Prompts must explain each state's job, not narrate internal routing.
+CLOSING. close_call runs in its own api_request stage, as its only tool, followed by an end stage.
+Every end stage is reached only through a close stage and nothing after close can reach a bank tool.
+Work out the outcome and reason from the source policy and the results before closing. If the source
+requires a goodbye before close, speak it in the close stage's on_enter tts; the terminal can then
+use message_mode none. If the source forbids notes on transfers, defer all notes until the call can
+no longer end in a transfer.
+
+Use separate stages for tool boundaries and computations, and no more stages than the policy needs.
 """
 
-REPAIR = """You are repairing the supplied proposal. compiler_errors lists what blocks it; each one names
-the stage or gate at fault. Return a RepairPatch, never a whole WorkflowSpec: operations that touch
-only what must change. set_node replaces one stage: target is the stage name and value is that
-complete corrected stage (same compact bank tool shape, name equal to target). Add a stage with
-set_node under a new name; remove one with remove_node. Every stage you do not name is kept exactly
-as it is, so do not repeat unchanged stages. Give tool_gates (the complete list) only when a gate
-declaration itself is wrong. A patch that changes nothing is a failure. advisory_warnings are hints;
-act on one only where the source supports it. The rules below describe a whole workflow: every
-stage you write must follow them, but your output is the patch.
+DESIGN = """Design a phone agent for the supplied bank policy and tool contract, as a WorkflowSpec.
+Read the original documents in full; requirements, when supplied, is a checklist extracted from them
+and the documents win where the two differ. The supplied Freya documentation is authoritative for
+the platform. Write architecture first, then the complete workflow source.
 
-"""
+""" + RULES
 
-MUTATOR = """Propose the requested number of distinct sibling Mutation objects for one immutable parent.
-Use only typed operations: set_node (whole node), remove_node, set_system_prompt, set_initial_node,
-set_global_nodes. Keep linked edits coherent, preserve tool_gates and upstream policy, include
-complete coverage. Each proposal needs a different meaningful mutation family and source-backed
-hypothesis. Use only authorized supplied feedback. Absent diagnoses are unknown, not invented
-failures. Diagnostics are uncertain hypotheses. Never insert benchmark labels, transcripts or
-practice customer facts into the workflow; repair general behavior. No builder source edits.
-parent_static_findings lists compiler findings the parent still carries. A child may keep them but
-must not add any; removing one is a valid mutation.
-rejected_siblings lists earlier proposals for this parent that the compiler refused, with the stages
-they edited and the reason. Do not submit them again: avoid each stated cause. Python runs only in
-code stages (pre_actions with code_exec) or as pre_process_code/post_process_code on a bank tool
-object, never as a field of a stage and never in a conversation stage.
-"""
+FIX = """You are fixing a phone agent workflow that already exists. Return a Patch: a list of fixes,
+each a small set of edits to the supplied workflow source. Everything you do not name stays exactly
+as it is, so never repeat an unchanged stage or field.
 
-DIAGNOSIS = """Read-only referee: core score is frozen and cannot change. Diagnose observed failures only.
-evidence.calls holds, per repetition and failed case, the call step by step: each spoken turn with the
-stage (node) it ran in, every stage change with the route that fired, extracted values, tool calls and
-results. Read it before the judge's summary: find the stage where the call stopped making progress and
-the extracted value or route condition that kept it there, and name that stage in likely_workflow_nodes.
-Cite evidence_refs as exact dot paths into the supplied evidence object, such as all_rows.0.0.failed.0
-or calls.0.<case id>.turns.12. Give at most four references per diagnosis: the judge's finding and the
-one or two turns where the call first went wrong, never a run of consecutive turns. Cite source rule IDs, likely workflow nodes, repair hypothesis and
-counterfactual test. Never infer a bank commit from speech or fabricate missing evidence. No
-evidence means no diagnosis. Every diagnosis is an uncertain hypothesis, never a replacement score.
-"""
+An edit is one of:
+  set_field (stage, field, value): replace one field of one existing stage, such as its task_message,
+    transitions, extraction_schema, code or pre_actions. value is the complete new value of that field only.
+  set_stage (stage, value): add a new stage, or replace a whole one when field edits cannot express it.
+  remove_stage (stage).
+  set_workflow_field (field = system_prompt or initial_node, value).
+Prefer the smallest edit: one field over a stage, one stage over several. A route change is an edit
+to that stage's transitions; a wrong calculation is an edit to that stage's code.
+
+problems lists what must be fixed.
+- Compiler problems each name the stage at fault and say what is wrong. Fix every one of them.
+- For failed practice calls, calls holds each failed call step by step: every spoken turn with the
+  stage it ran in, each stage change with the route that fired, extracted values, tool calls and
+  results. Read the call before the judge's summary. Find the first step where it went wrong (a
+  route that did not fire, a value never extracted, a code result, a tool that was not called) and
+  fix that stage.
+Write one fix per distinct cause. In cases list the customers it is for; in problem say what goes
+wrong and in which stage. Do not change what is not shown to be broken.
+
+hints are static observations that may or may not matter. Act on one only when a failed call or the
+source policy supports it.
+history lists earlier fixes. Kept fixes are already in the workflow. Blamed fixes broke a customer
+that passed before and were taken out; rejected fixes could not be applied, for the stated reason.
+Do not submit either again: remove the cause in a different way.
+If wording_only is true, only edits that change wording alone (task_message, role_message,
+system_prompt, a fixed spoken line) will be applied; a description, a route or an extraction is not
+wording.
+Never write a practice customer's name, amounts, dates or expected results into the workflow:
+repair the general behaviour the source policy asks for. If nothing can be fixed, return no fixes.
+
+The rules below describe a whole workflow. Every value you write must follow them.
+
+""" + RULES

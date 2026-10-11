@@ -1,70 +1,34 @@
 from copy import deepcopy
-from dataclasses import asdict, replace
 import json
-import os
 from pathlib import Path
 import pytest
-from builder.artifacts import Archive, Redactor, Trace, digest, write_json
-from builder.config import Config, Deadline, writable
-from builder.contracts import compile_openapi, compile_tools, source_documents, validate_requirements
-from builder.freya_adapter import contains_definition, public_suite, time_limit
-from builder.scoring import Suite, FeedbackAdapter, score, group_advantages, choose_champion
-from builder.validation import validate, code_errors, apply_mutation
+from conftest import action, bank, equals, route
+from builder.artifacts import Archive, Redactor, Trace, write_json
+from builder.config import Config, writable
+from builder.contracts import compile_openapi, compile_workflow, source_documents, tool_from_contract, validate_requirements
+from builder.freya_adapter import contains_definition, time_limit
+from builder.scoring import Suite, score, verdicts
+from builder import runtime
+from builder.validation import apply_fix, code_errors, edited_stages, is_wording
 
+
+def code_stage(name, source, *routes):
+    return {'name': name, 'node_type': 'code', 'code': source, 'transitions': [route(target, condition) for target, condition in routes]}
+
+
+def fix(*edits, problem='fixture', cases=()):
+    return {'problem': problem, 'cases': list(cases), 'edits': [{'op': op, 'stage': stage, 'field': field, 'value': value} for op, stage, field, value in edits]}
+
+
+# ------------------------------------------------------------------ configuration and sources
 
 def test_scope_and_config(work, monkeypatch):
     with pytest.raises(ValueError): writable(work.parent.parent.parent / 'outside.json')
-    with pytest.raises(ValueError): Config(mode='both')
     with pytest.raises(ValueError): Config(max_wall_seconds=1801)
     with pytest.raises(ValueError): Config(reserve=1800)
-    with pytest.raises(ValueError): Config(group_size=0)
-    monkeypatch.setenv('BENCHMARK_MODE', 'wrong')
+    with pytest.raises(ValueError): Config(repetitions=0)
+    monkeypatch.setenv('LANGSMITH_TRACING', 'maybe')
     with pytest.raises(ValueError): Config.from_env()
-
-
-def test_static_good(spec, contracts, requirements):
-    result = validate(spec, contracts, requirements)
-    assert result['valid'], result['errors']
-    assert not result['policy_proven']
-
-
-def test_gate_accepts_declared_alias_and_canonical_response(spec, contracts, requirements):
-    gate = spec['tool_gates'][0]
-    canonical = gate['variable']
-    gate['variable'] = 'verified_alias'
-    node = spec['workflow']['nodes']['verify']
-    node['tools'][0]['response_mapping'] = [{'path': 'data.all_verified', 'variable': 'verified_alias'}]
-    node['transitions'][0]['condition']['conditions'][0]['variable'] = 'verified_alias'
-    assert validate(spec, contracts, requirements)['valid']
-    spec['workflow']['test_variables'] = {canonical: 'true'}
-    assert not validate(spec, contracts, requirements)['valid']
-
-
-def test_model_tool_name_string_is_rejected_without_crashing(spec, contracts, requirements):
-    spec['workflow']['nodes']['verify']['tools'] = ['verify_identity']
-    result = validate(spec, contracts, requirements)
-    assert not result['valid'] and 'array of objects' in result['errors'][0]
-
-
-@pytest.mark.parametrize('fault', ['placement', 'null', 'unsupported', 'passthrough', 'mapping', 'schema', 'retry', 'ungated', 'gate_or', 'after_close', 'skip_close', 'unreachable', 'url', 'required', 'loop_prompt'])
-def test_static_rejects(fault, spec, contracts, requirements):
-    nodes = spec['workflow']['nodes']
-    if fault == 'placement': nodes['verify']['pre_actions'] = []
-    elif fault == 'loop_prompt': nodes['verify']['loop_prompt'] = 'Repeat security question.'
-    elif fault == 'null': nodes['verify']['role_message'] = None
-    elif fault == 'unsupported': nodes['account']['pre_actions'][0]['function']['name'] = 'steal_data'
-    elif fault == 'passthrough': nodes['account']['transitions'] = []
-    elif fault == 'mapping': nodes['account']['pre_actions'][0]['response_mapping'] = [{'path': 'ok', 'variable': 'x'}]
-    elif fault == 'schema': nodes['close']['pre_actions'][0]['function']['parameters']['properties']['body']['properties']['outcome']['enum'] = ['invented']
-    elif fault == 'retry': nodes['close']['pre_actions'][0]['config']['maxRetries'] = 2
-    elif fault == 'ungated': spec['workflow']['initial_node'] = 'account'
-    elif fault == 'gate_or': nodes['verify']['transitions'][0]['condition']['conditions'].append({'operator': 'always'})
-    elif fault == 'after_close': nodes['close']['transitions'][0]['target_node'] = 'account'
-    elif fault == 'skip_close': nodes['verify']['max_turn_transition'] = 'end'
-    elif fault == 'unreachable': nodes['unused'] = {**deepcopy(nodes['end']), 'name': 'unused'}
-    elif fault == 'url': nodes['account']['pre_actions'][0]['function']['parameters']['properties']['url']['default'] = 'https://evil.invalid'
-    elif fault == 'required': nodes['close']['pre_actions'][0]['function']['parameters']['properties']['body']['required'] = []
-    assert not validate(spec, contracts, requirements)['valid']
 
 
 def test_contract_refs_and_changed_fields(work):
@@ -72,15 +36,14 @@ def test_contract_refs_and_changed_fields(work):
     path = work / 'api.json'; write_json(path, api)
     c = compile_openapi(path)
     assert c['operations']['resolve']['body']['properties']['decision']['enum'] == ['hold', 'release']
-    workflow = {'nodes': {'x': {'tools': [{'bank_operation': 'resolve', 'description': 'CALL when approved.'}]}}}
-    compiled = compile_tools(workflow, c)['nodes']['x']['tools'][0]
+    compiled = compile_workflow({'nodes': {'x': {'tools': [{'bank_operation': 'resolve', 'description': 'CALL when approved.'}]}}}, c)[0]['nodes']['x']['tools'][0]
     assert compiled['function']['parameters']['properties']['url']['default'] == 'https://sandbox.invalid/v2/resolve'
     api['components']['schemas']['Body'] = {'$ref': '#/components/schemas/Body'}
     write_json(path, api)
     with pytest.raises(ValueError): compile_openapi(path)
 
 
-def test_provenance_override_and_conflict(work, requirements):
+def test_rules_keep_their_provenance_and_unclear_ones_do_not_stop_the_build(work, requirements):
     first, second = work / 'policy.md', work / 'memo.md'
     first.write_text('1. The limit is 83 units.\n')
     second.write_text('1. Replace the limit with 97 units.\n')
@@ -92,13 +55,150 @@ def test_provenance_override_and_conflict(work, requirements):
     overlay['source'].update(path=str(second), span=second.read_text().strip())
     overlay['precedence']['supersedes'] = ['R1']
     bundle['requirements'].append(overlay)
-    result = validate_requirements(bundle, docs)
-    assert result['requirements'][0]['precedence']['superseded_by'] == ['R2']
+    assert validate_requirements(bundle, docs)['requirements'][0]['precedence']['superseded_by'] == ['R2']
+    # Raw bank material may contradict itself; that is handed to the designer, not a reason to build nothing.
     bundle['requirements'][1]['interpretation_status'] = 'conflicting'
-    with pytest.raises(ValueError, match='Unresolved'): validate_requirements(bundle, docs)
-    bundle['requirements'][1]['interpretation_status'] = 'resolved'
+    bundle['unresolved'] = ['Which limit holds?']
+    assert validate_requirements(bundle, docs)['unresolved'] == ['Which limit holds?']
     bundle['requirements'][0]['source']['span'] = 'invented'
     with pytest.raises(ValueError, match='verbatim'): validate_requirements(bundle, docs)
+
+
+def test_unknown_tool_binding_rejected(contracts):
+    with pytest.raises(ValueError, match='Unknown argument'):
+        tool_from_contract(contracts['operations']['create_promise'], 'CALL on confirmation', {'not_a_field': 'value'})
+
+
+# ------------------------------------------------------------------ compiling a source
+
+def test_source_compiles_to_a_deployable_workflow(spec, contracts, check):
+    compiled, notes = compile_workflow(spec['workflow'], contracts)
+    assert check(spec)['valid'], check(spec)['errors']
+    account = compiled['nodes']['account']
+    tool = account['pre_actions'][0]
+    assert tool['function']['handler'] == '__function__:api_call' and tool['config']['maxRetries'] == 0
+    assert account['passthrough'] is True and account['passthrough_default_transition'] == 'close' and account['on_enter'] == {'type': 'silent'}
+    # The source is untouched, and compiling a compiled workflow changes nothing.
+    assert 'bank_operation' in spec['workflow']['nodes']['account']['pre_actions'][0]
+    assert compile_workflow(compiled, contracts)[0] == compiled
+
+
+def test_code_shorthand_gets_its_wrapper_and_the_helpers_it_calls(spec, contracts, check):
+    nodes = spec['workflow']['nodes']
+    nodes['account']['transitions'] = [route('calc')]
+    nodes['calc'] = code_stage('calc', "try:\n    vars['deadline'] = ctl_add_business_days(vars.get('now'), 4, [0, 1, 2, 3, 4], ['2031-03-05'])\nexcept Exception:\n    vars['deadline'] = ''\n", ('close', None))
+    assert check(spec)['valid'], check(spec)['errors']
+    code = compile_workflow(spec['workflow'], contracts)[0]['nodes']['calc']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
+    assert code.count(runtime.START) == 1 and code_errors(code) == []
+    scope = {'vars': {'now': '2031-03-03T11:00'}}
+    exec(code, scope, scope)
+    assert scope['vars']['deadline'] == '2031-03-10'
+    nodes['calc']['pre_actions'] = [{'type': 'function'}]
+    with pytest.raises(ValueError, match='either code or pre_actions'): compile_workflow(spec['workflow'], contracts)
+
+
+def test_malformed_source_gets_named_errors_not_a_crash(spec, contracts, check):
+    spec['workflow']['nodes']['verify']['tools'] = [True]
+    spec['workflow']['nodes']['stray'] = [{'operation': 'get_account'}]
+    result = check(spec)
+    assert not result['valid'] and any('stray: node must be an object' in e for e in result['errors']) and any('verify: tools must be an array of objects' in e for e in result['errors'])
+    spec['workflow']['nodes'] = ['verify']
+    with pytest.raises(ValueError, match='workflow.nodes must be an object'): compile_workflow(spec['workflow'], contracts)
+    with pytest.raises(ValueError, match='unsupported bank operation steal_data'):
+        compile_workflow({'nodes': {'x': {'name': 'x', 'tools': [bank('steal_data')]}}}, contracts)
+
+
+# ------------------------------------------------------------------ static checks
+
+@pytest.mark.parametrize('fault', ['placement', 'null', 'passthrough', 'mapping', 'schema', 'retry', 'after_close', 'skip_close', 'unreachable', 'url', 'required', 'loop_prompt', 'unbound'])
+def test_static_rejects(fault, spec, contracts):
+    from builder.validation import validate
+    compiled = compile_workflow(spec['workflow'], contracts)[0]
+    nodes = compiled['nodes']
+    body = lambda key: nodes[key]['pre_actions'][0]['function']['parameters']['properties']
+    if fault == 'placement': nodes['verify']['pre_actions'] = []
+    elif fault == 'loop_prompt': nodes['verify']['loop_prompt'] = 'Repeat security question.'
+    elif fault == 'null': nodes['verify']['role_message'] = None
+    elif fault == 'passthrough': nodes['account']['transitions'] = []
+    elif fault == 'mapping': nodes['account']['response_mapping'] = [{'path': 'ok', 'variable': 'x'}]
+    elif fault == 'schema': body('close')['body']['properties']['outcome']['enum'] = ['invented']
+    elif fault == 'retry': nodes['close']['pre_actions'][0]['config']['maxRetries'] = 2
+    elif fault == 'after_close': nodes['close']['transitions'][0]['target_node'] = 'account'
+    elif fault == 'skip_close': nodes['verify']['max_turn_transition'] = 'end'
+    elif fault == 'unreachable': nodes['unused'] = {**deepcopy(nodes['end']), 'name': 'unused'}
+    elif fault == 'url': body('account')['url']['default'] = 'https://evil.invalid'
+    elif fault == 'required': body('close')['body']['required'] = []
+    elif fault == 'unbound': del body('close')['body']['properties']['outcome']['default']
+    assert not validate(compiled, contracts)['valid']
+
+
+def test_identity_is_read_from_the_routes(spec, check):
+    nodes = spec['workflow']['nodes']
+    assert check(spec)['valid'], check(spec)['errors']
+    proven = deepcopy(nodes['check']['transitions'])
+    # The identity tool is called but its result is ignored: the error prints the route and the stage to change.
+    nodes['check']['transitions'] = [route('account')]
+    error = check(spec)['errors'][0]
+    assert 'account: get_account can be reached without a tested identity check, by the route verify > check > account' in error
+    assert 'After verify_identity in check no transition on that route tests its result' in error
+    # What the caller says is not proof, and one spoken alternative in an OR is a way round the real test.
+    nodes['verify']['extraction_schema'].append({'name': 'said_done', 'type': 'string', 'description': 'Caller says they are verified.', 'min_confidence': 0.7})
+    nodes['check']['transitions'] = [route('account', {'logic': 'or', 'conditions': [{'variable': 'said_done', 'operator': 'equals', 'operand': 'yes'}, {'variable': 'all_verified', 'operator': 'equals', 'operand': 'true'}]}), route('close')]
+    assert any('tested identity check' in e for e in check(spec)['errors'])
+    # Inside an AND the response test still has to hold, so that is proof.
+    nodes['check']['transitions'][0]['condition'] = {'logic': 'or', 'conditions': [{'logic': 'and', 'conditions': [{'variable': 'said_done', 'operator': 'equals', 'operand': 'yes'}, {'variable': 'all_verified', 'operator': 'equals', 'operand': 'true'}]}]}
+    assert check(spec)['valid'], check(spec)['errors']
+    # A status that code derives from the response is proof too: the design every working build has used.
+    nodes['check']['transitions'] = [route('judge')]
+    nodes['judge'] = code_stage('judge', "try:\n    vars['identity'] = 'verified' if str(vars.get('all_verified')).lower() == 'true' else 'failed'\nexcept Exception:\n    vars['identity'] = 'failed'\n",
+                                ('account', equals('identity', 'verified')), ('close', None))
+    assert check(spec)['valid'], check(spec)['errors']
+    # No identity call on the way at all.
+    spec['workflow']['initial_node'] = 'account'
+    for gone in ('verify', 'check', 'judge'): nodes.pop(gone)
+    assert 'No stage on that route calls verify_identity' in check(spec)['errors'][0]
+    # A second identity call resets the proof: its own result must be tested too.
+    spec['workflow']['initial_node'] = 'verify'
+    nodes.update(verify={'name': 'verify', 'node_type': 'conversation', 'task_message': 'Ask.', 'max_node_turns': 3, 'max_turn_transition': 'close', 'transitions': [route('check')]},
+                 check=action('check', bank('verify_identity', {'all_verified': 'all_verified'}, field='date_of_birth', answer='{{dob}}'), ('account', proven[0]['condition']), 'close'),
+                 again=action('again', bank('verify_identity', field='phone_last4', answer='{{phone}}'), 'promise'),
+                 promise=action('promise', bank('create_promise', product_id='{{product_id}}', amount='{{amount}}', date='{{day}}'), 'close'))
+    nodes['account']['transitions'] = [route('again')]
+    assert any('promise: create_promise can be reached' in e and 'After verify_identity in again' in e for e in check(spec)['errors'])
+
+
+def test_bank_tools_are_run_by_the_engine_never_offered_to_the_dialogue_model(spec, check):
+    nodes = spec['workflow']['nodes']
+    nodes['verify']['tools'] = [bank('verify_identity', {'all_verified': 'all_verified'})]
+    error = next(e for e in check(spec)['errors'] if 'offered to the dialogue model' in e)
+    assert error.startswith('verify: verify_identity is offered') and 'api_request stage' in error
+
+
+def test_hints_never_block(spec, check):
+    node = spec['workflow']['nodes']['verify']
+    node['extraction_schema'].append({'name': 'answer', 'type': 'string', 'enum_values': ['agrees', 'refuses', 'unclear'], 'description': 'What the caller said.', 'min_confidence': 0.7})
+    node['transitions'].insert(1, route('close', equals('answer', 'refuses')))
+    result = check(spec)
+    assert result['valid'] and len(result['warnings']) == 1 and "verify: answer can be extracted as ['agrees', 'unclear']" in result['warnings'][0]
+    # A stage whose unmatched answers move on elsewhere cannot trap the call.
+    node['transitions'][-1]['target_node'] = 'close'
+    assert check(spec)['warnings'] == []
+
+
+def test_accepted_offer_that_is_never_applied_is_hinted(spec, check):
+    nodes = spec['workflow']['nodes']
+    nodes['account']['transitions'] = [route('check_day')]
+    nodes['check_day'] = code_stage('check_day', "try:\n    vars['status'] = 'ok' if vars.get('day') == 'x' else 'late'\n    vars['offer'] = 'y'\nexcept Exception:\n    vars['status'] = 'late'",
+                                    ('close', equals('status', 'ok')), ('offer_day', None))
+    nodes['offer_day'] = {'name': 'offer_day', 'node_type': 'conversation', 'task_message': 'The status is {{status}}. Offer {{offer}} instead.', 'max_node_turns': 3, 'max_turn_transition': 'close',
+                          'extraction_schema': [{'name': 'reply', 'type': 'string', 'enum_values': ['accept', 'refuse'], 'description': 'Answer.', 'min_confidence': 0.7}],
+                          'transitions': [route('check_day', equals('reply', 'accept')), route('close', equals('reply', 'refuse')), route('close')]}
+    result = check(spec)
+    assert result['valid'], result['errors']
+    assert len(result['warnings']) == 1 and "offer_day: offers ['offer']" in result['warnings'][0]
+    nodes['apply_offer'] = code_stage('apply_offer', "try:\n    vars['day'] = vars.get('offer', '')\nexcept Exception:\n    vars['day'] = ''", ('check_day', None))
+    nodes['offer_day']['transitions'][0]['target_node'] = 'apply_offer'
+    assert check(spec)['valid'] and check(spec)['warnings'] == []
 
 
 def test_code_gate():
@@ -107,57 +207,125 @@ def test_code_gate():
         assert code_errors('try:\n    ' + source.replace('\n', '\n    ') + '\nexcept Exception:\n    pass')
 
 
+# ------------------------------------------------------------------ fixes
+
+def test_fix_changes_only_what_it_names(spec):
+    patched = apply_fix(spec, fix(('set_field', 'verify', 'task_message', 'Ask the security question.')))
+    assert patched['workflow']['nodes']['verify']['task_message'] == 'Ask the security question.' and spec['workflow']['nodes']['verify']['task_message'] != 'Ask the security question.'
+    assert {k: v for k, v in patched['workflow']['nodes'].items() if k != 'verify'} == {k: v for k, v in spec['workflow']['nodes'].items() if k != 'verify'}
+    assert {k: v for k, v in patched['workflow']['nodes']['verify'].items() if k != 'task_message'} == {k: v for k, v in spec['workflow']['nodes']['verify'].items() if k != 'task_message'}
+    added = apply_fix(spec, fix(('set_stage', 'extra', '', {'node_type': 'code', 'code': 'pass', 'transitions': []}), ('set_workflow_field', '', 'initial_node', 'extra')))
+    assert added['workflow']['nodes']['extra']['name'] == 'extra' and added['workflow']['initial_node'] == 'extra'
+    assert 'account' not in apply_fix(spec, fix(('remove_stage', 'account', '', None)))['workflow']['nodes']
+    for bad in ([('set_field', 'nowhere', 'task_message', 'x')], [('set_field', 'verify', '', 'x')], [('set_field', 'verify', 'task_message', spec['workflow']['nodes']['verify']['task_message'])],
+                [('set_stage', 'verify', '', 'not a stage')], [('remove_stage', 'nowhere', '', None)], [('set_workflow_field', '', 'nodes', {})], []):
+        with pytest.raises(ValueError): apply_fix(spec, fix(*bad))
+
+
+def test_wording_is_told_apart_from_logic(spec):
+    reworded = apply_fix(spec, fix(('set_field', 'verify', 'task_message', 'Ask kindly.'), ('set_workflow_field', '', 'system_prompt', 'Be brief.')))
+    assert is_wording(spec, reworded) and not is_wording(spec, spec)
+    spoken = deepcopy(spec); spoken['workflow']['nodes']['verify']['on_enter'] = {'type': 'tts', 'text': 'Hello.'}
+    respoken = deepcopy(spoken); respoken['workflow']['nodes']['verify']['on_enter']['text'] = 'Good morning.'
+    assert is_wording(spoken, respoken) and not is_wording(spec, spoken)
+    rerouted = apply_fix(spec, fix(('set_field', 'verify', 'max_turn_transition', 'end')))
+    rebound = deepcopy(spec); rebound['workflow']['nodes']['close']['pre_actions'][0]['bindings']['outcome'] = 'promise'
+    assert not is_wording(spec, rerouted) and not is_wording(spec, rebound)
+    # The extractor and the routing model decide by descriptions: changing one changes values and routes.
+    extracted = deepcopy(spec); extracted['workflow']['nodes']['verify']['extraction_schema'][0]['description'] = 'Any date the caller mentions.'
+    intent = deepcopy(spec); intent['workflow']['nodes']['verify']['transitions'][0]['description'] = 'The caller refuses.'
+    prompted = deepcopy(spec); prompted['workflow']['nodes']['verify']['routing_prompt'] = 'Leave when a date was given.'
+    assert not is_wording(spec, extracted) and not is_wording(spec, intent) and not is_wording(spec, prompted)
+    # A stage or a bound field that happens to be called like a wording key is still a stage or a field.
+    named = deepcopy(spec); named['workflow']['nodes']['text'] = code_stage('text', 'pass', ('close', None))
+    note = deepcopy(spec); note['workflow']['nodes']['close']['pre_actions'][0]['bindings']['text'] = '{{note}}'
+    assert not is_wording(spec, named) and not is_wording(spec, note)
+    assert edited_stages(fix(('set_field', 'verify', 'task_message', 'x'), ('set_stage', 'new', '', {}))) == {'verify', 'new'}
+    assert edited_stages(fix(('set_workflow_field', '', 'system_prompt', 'x'))) is None and edited_stages(fix(('remove_stage', 'account', '', None))) is None
+
+
+# ------------------------------------------------------------------ inputs, model calls, the workspace lock
+
+def test_a_brief_from_outside_the_kit_is_never_built_against_the_kit_tool_api(work):
+    from builder.build import inputs
+    from builder.config import KIT
+    kit_api, brief_a = str(KIT / 'tools/openapi.json'), str(KIT / 'briefs/brief-a.md')
+    assert inputs([brief_a]) == ([brief_a], kit_api)
+    policy, codes, api = work / 'policy.md', work / 'codes.json', work / 'bank.json'
+    policy.write_text('Verify first.\n'); codes.write_text('{"outcomes": ["paid"]}'); api.write_text(Path(kit_api).read_text())
+    with pytest.raises(ValueError, match='needs its own tool API'): inputs([str(policy)])
+    # The tool API is recognised by its content wherever it stands; a JSON code list stays a brief.
+    assert inputs([str(policy), str(api)]) == ([str(policy)], str(api))
+    assert inputs([str(policy), str(codes)], str(api)) == ([str(policy), str(codes)], str(api))
+    assert inputs([str(policy), str(api)], str(api))[1] == str(api)
+    with pytest.raises(ValueError, match='More than one'): inputs([str(policy), str(api)], kit_api)
+    with pytest.raises(ValueError, match='No brief'): inputs([str(api)])
+
+
+def test_a_provider_error_gets_one_more_try_and_then_fails_like_a_bad_answer(work):
+    from builder.adk import ADKRoles
+    from builder.config import Deadline
+    roles = ADKRoles(Config(artifacts=work, tracing=False), Deadline(60), Trace(work / 'trace.log', {'run_id': 'test'}, False), work)
+    def scripted(*outcomes):
+        outcomes = list(outcomes)
+        def request(*args):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception): raise outcome
+            return outcome
+        roles._request = request
+        return outcomes
+    scripted(ConnectionError('reset by peer'), {'ok': True})
+    assert roles.ask('R', 'p', 'i', {}, None) == {'ok': True}
+    scripted(ConnectionError('reset by peer'), RuntimeError('503 from the provider'))
+    with pytest.raises(ValueError, match='failed twice: RuntimeError'): roles.ask('R', 'p', 'i', {}, None)
+    left = scripted(TimeoutError('too slow'), {'ok': True})
+    with pytest.raises(TimeoutError): roles.ask('R', 'p', 'i', {}, None)
+    assert left == [{'ok': True}]  # a timeout is not retried: the time is gone
+
+
+def test_a_lock_that_never_comes_free_costs_the_budget_not_the_export(work):
+    import fcntl
+    from builder.config import Deadline
+    from builder.freya_adapter import file_lock
+    with (work / 'lock').open('a+') as other:
+        fcntl.flock(other, fcntl.LOCK_EX)   # another build holds it
+        with file_lock(work / 'lock', Deadline(.3)) as held:
+            assert held is False
+    with file_lock(work / 'lock', Deadline(5)) as held:
+        assert held is True
+
+
+# ------------------------------------------------------------------ scoring and artifacts
+
 def test_strict_repetitions_unknown():
     suite = Suite(('a', 'b'), 'hash', 'official_public', 3)
     raw = {'all_rows': [[{'id': 'a', 'pass': True}, {'id': 'b', 'pass': True}]] * 3}
-    assert score(raw, suite).strict_pass_rate == 1
+    assert score(raw, suite).strict_pass_rate == 1 and verdicts(raw, suite) == {'a': True, 'b': True}
     raw['all_rows'][2] = [{'id': 'a', 'pass': False}, {'id': 'b', 'pass': True}]
-    assert score(raw, suite).strict_pass_rate == .5
+    assert score(raw, suite).strict_pass_rate == .5 and verdicts(raw, suite) == {'a': False, 'b': True}
     raw['all_rows'].pop()
     result = score(raw, suite)
     assert result.unknown == 2 and result.strict_pass_rate is None and not result.complete
     raw['all_rows'][0][0]['pass'] = 'true'
     assert score(raw, suite).strict_pass_rate is None
+    record = score({'all_rows': [[{'id': 'a', 'pass': False}]]}, Suite(('a',), 's', 'official_public', 2))
+    assert record.failed == 1 and record.strict_pass_rate is None and record.coverage_ratio == .5
+    with pytest.raises(ValueError): Suite(('a',), 's', 'made_up', 1)
 
 
-def test_mixed_groups_and_champion():
-    s = Suite(('a',), 'same', 'official_public', 1)
-    good = score({'all_rows': [[{'id': 'a', 'pass': True}]]}, s)
-    bad = score({'all_rows': [[{'id': 'a', 'pass': False}]]}, s)
-    advantages, summaries = group_advantages({'a': good, 'b': bad, 'missing': None}, {'a': 'p', 'b': 'p', 'missing': 'p'})
-    assert advantages == {'a': 1, 'b': -1, 'missing': None}
-    equal, summaries = group_advantages({'a': bad, 'b': bad}, {'a': 'p', 'b': 'p'})
-    assert equal == {'a': 0, 'b': 0} and summaries[0]['diversify']
-    mixed, _ = group_advantages({'a': good, 'b': replace(good, suite_key='different')}, {'a': 'p', 'b': 'p'})
-    assert mixed == {'a': None, 'b': None}
-    assert choose_champion('a', 'b', {'a': bad, 'b': good}, {'a': True, 'b': True}) == 'b'
-    assert choose_champion('a', 'b', {'a': bad, 'b': replace(good, hard_fail_count=1)}, {'a': True, 'b': True}) == 'a'
-    assert choose_champion('a', 'b', {'a': bad, 'b': replace(good, suite_key='different')}, {'a': True, 'b': True}) == 'a'
-
-
-def test_feedback_sentinel():
-    record = score({'all_rows': [[{'id': 'a', 'pass': False, 'failed': ['LEAK_TEST_SENTINEL']}]]}, Suite(('a',), 's', 'official_public', 1))
-    diagnostics = [{'repair_hypothesis': '[REDACTED TEST FIXTURE: LEAK_TEST_SENTINEL]'}]
-    scalar = FeedbackAdapter('scoring_only').for_optimizer(record, diagnostics)
-    diagnostic = FeedbackAdapter('scoring_with_diagnostics').for_optimizer(record, diagnostics)
-    assert 'LEAK_TEST_SENTINEL' not in json.dumps(scalar)
-    assert 'LEAK_TEST_SENTINEL' in json.dumps(diagnostic['diagnostics'])
-    assert {k: v for k, v in diagnostic.items() if k != 'diagnostics'} == scalar
-
-
-def test_archive_immutable_and_patch(work, spec):
+def test_archive_keeps_source_and_workflow_immutable(work, spec, contracts):
     archive = Archive(work / 'archive')
-    parent = archive.add(spec)
-    mutation = {'parent_id': parent['candidate_id'], 'mutation_type': 'adjust_prompt', 'target_nodes': ['verify'], 'target_rule_ids': ['R1'], 'hypothesis': 'Clarify', 'operations': [{'op': 'set_system_prompt', 'target': '', 'value': 'New policy wording'}], 'expected_effect': 'Clarity', 'risk': 'low', 'coverage': spec['coverage']}
-    child = apply_mutation(spec, mutation, parent['candidate_id'])
-    record = archive.add(child, parent=parent['candidate_id'], mutation=mutation)
-    assert archive.spec(parent['candidate_id']) == spec
+    workflow = compile_workflow(spec['workflow'], contracts)[0]
+    parent = archive.add(spec, workflow, mutation_kind='design')
+    child_source = apply_fix(spec, fix(('set_workflow_field', '', 'system_prompt', 'New policy wording')))
+    record = archive.add(child_source, compile_workflow(child_source['workflow'], contracts)[0], parent=parent['candidate_id'], patch={'fixes': []}, mutation_kind='wording')
+    assert archive.source(parent['candidate_id']) == spec and archive.workflow(parent['candidate_id']) == workflow
     assert record['generation'] == 1 and record['parent_id'] == parent['candidate_id']
     archive.checkpoint(champion_id=parent['candidate_id'])
     assert json.loads((work / 'archive/champion.json').read_text())['champion_id'] == parent['candidate_id']
     path = Path(parent['workflow_snapshot_path']).parent / 'proposal.json'
     altered = deepcopy(spec); altered['workflow']['system_prompt'] = 'tampered'; path.write_text(json.dumps(altered))
-    with pytest.raises(ValueError, match='modified'): archive.spec(parent['candidate_id'])
+    with pytest.raises(ValueError, match='modified'): archive.source(parent['candidate_id'])
     archive.db.close()
 
 
@@ -188,61 +356,6 @@ def test_timeout():
         with time_limit(.01): time.sleep(.1)
 
 
-def test_code_probes_use_source_values(requirements):
-    from builder.scenarios import run_probes
-    code = "import datetime\ntry:\n    anchor = datetime.date.fromisoformat(vars['now'][:10])\n    vars['next_day'] = (anchor + datetime.timedelta(days=vars['offset'])).isoformat()\nexcept Exception:\n    vars['next_day'] = ''"
-    spec = {'workflow': {'nodes': {'calendar': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': code}}}}}]}}}}
-    probes = {'probes': [{'probe_id': 'changed-date', 'rule_ids': ['R1'], 'node_id': 'calendar', 'variables': {'now': '2031-03-02T12:00', 'offset': 3}, 'expected': {'next_day': '2031-03-05'}}]}
-    result = run_probes(spec, probes, requirements, Deadline(10))
-    assert result['passed'] == 1 and result['evidence_type'] == 'local_code_only'
-    probes['probes'][0]['expected']['next_day'] = 'wrong'
-    assert run_probes(spec, probes, requirements, Deadline(10))['passed'] == 0
-
-
-def test_invalid_probe_metadata_never_becomes_workflow_expectation():
-    from builder.scenarios import validate_probe_targets
-    spec = {'workflow': {'nodes': {'calc': {'node_type': 'code', 'pre_actions': [{'function': {'parameters': {'properties': {'code': {'default': "vars['deadline'] = '2031-03-05'"}}}}}]}}}}
-    probes = {'probes': [{'probe_id': 'boundary', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {}, 'expected': {'deadline': '2031-03-05'}}]}
-    validate_probe_targets(spec, probes)
-    probes['probes'][0]['expected']['oracle'] = 'Explanatory prose'
-    with pytest.raises(ValueError, match='written variables'):
-        validate_probe_targets(spec, probes)
-    probes['probes'][0]['node_id'] = 'close_api'
-    with pytest.raises(ValueError, match='code node'):
-        validate_probe_targets(spec, probes)
-
-
-def test_failure_with_missing_repeat_not_complete():
-    suite = Suite(('a',), 's', 'official_public', 2)
-    record = score({'all_rows': [[{'id': 'a', 'pass': False}]]}, suite)
-    assert record.failed == 1 and record.strict_pass_rate is None and record.coverage_ratio == .5
-    proxy = Suite(('a',), 's', 'proxy', 1)
-    record = score({'all_rows': [[{'id': 'a', 'state_ok': False}]]}, proxy)
-    assert record.failed == 1 and not record.complete and record.coverage_ratio == 0
-
-
-def test_hook_cannot_forge_verification(spec, contracts, requirements):
-    spec['workflow']['nodes']['verify']['tools'][0]['post_process_code'] = "try:\n    d = result.get('data', {})\n    d['all_verified'] = True\nexcept Exception:\n    pass"
-    result = validate(spec, contracts, requirements)
-    assert not result['valid']
-    assert any('gate response' in e for e in result['errors'])
-
-
-def test_unknown_tool_binding_rejected(contracts):
-    from builder.contracts import tool_from_contract
-    with pytest.raises(ValueError, match='Unknown argument'):
-        tool_from_contract(contracts['operations']['create_promise'], 'CALL on confirmation', {'not_a_field': 'value'})
-
-
-def test_diagnostics_need_real_evidence(spec, requirements):
-    from builder.diagnostics import grounded_diagnoses
-    d = {'case_id': 'case', 'rule_ids': ['R1'], 'evidence_refs': ['all_rows.0.0.failed.0'], 'likely_workflow_nodes': ['verify'], 'confidence': .8}
-    raw = {'all_rows': [[{'id': 'case', 'failed': ['Observed failure']}]]}
-    assert grounded_diagnoses([d], raw, requirements, spec['workflow'], {'case'}) == [d]
-    d['evidence_refs'] = ['all_rows.9.0.failed.0']
-    assert grounded_diagnoses([d], raw, requirements, spec['workflow'], {'case'}) == []
-
-
 def test_adk_does_not_expand_freya_placeholders():
     import asyncio
     from google.adk.agents import LlmAgent
@@ -253,19 +366,12 @@ def test_adk_does_not_expand_freya_placeholders():
     assert instruction == text and bypass is True
 
 
-def test_source_parameter_calendar_calculator():
-    from builder.adk import business_day_dates
-    assert business_day_dates('2028-02-11', [0, 1, 2, 3], ['2028-02-17'], 5) == {
-        'dates': ['2028-02-14', '2028-02-15', '2028-02-16', '2028-02-21', '2028-02-22'], 'deadline': '2028-02-22'}
-    assert business_day_dates('2028-02-28', list(range(7)), [], 1)['deadline'] == '2028-02-29'
-    with pytest.raises(ValueError): business_day_dates('2028-02-11', [], [], 5)
+# ------------------------------------------------------------------ runtime support
 
-
-def _helpers():
-    from builder import runtime
+def helpers():
     scope = {}
     exec(runtime.DATE_HELPERS, scope, scope)
-    return scope['ctl_date']
+    return scope
 
 
 @pytest.mark.parametrize('said,expected', [
@@ -275,34 +381,50 @@ def _helpers():
     ('Monday the twenty sixth', '2026-10-26'), ('the 26th', '2026-10-26'), ('the twenty-second of October', '2026-10-22'),
     ('6 November', '2026-11-06'), ('November 6th', '2026-11-06'), ('the 3rd', '2026-11-03'), ('january the 5th', '2027-01-05'),
     ('in two weeks', '2026-10-28'), ('in 3 days', '2026-10-17'), ('2026-10-20', '2026-10-20'),
-    ('I may pay on the 30th', '2026-10-30'),
+    ('I may pay on the 30th', '2026-10-30'), ('05 December 1975', '1975-12-05'), ('14 March 1988', '1988-03-14'),
+    # A year said in words is the stated year, never replaced by the call's year.
+    ('the fourteenth of March nineteen eighty-eight', '1988-03-14'), ('the fourteenth of March, one nine eight eight', '1988-03-14'),
+    ('March fourteenth, nineteen eighty eight', '1988-03-14'), ('the fifth of December nineteen seventy five', '1975-12-05'),
+    ('the ninth of September nineteen ninety', '1990-09-09'), ('3 May two thousand and five', '2005-05-03'), ('the first of June two thousand', '2000-06-01'),
+    ('twelfth of July nineteen oh five', '1905-07-12'), ('the twenty-second of October twenty twenty-six', '2026-10-22'),
+    # Numbers before the day are not a year: an amount said with the day stays an amount.
+    ('nineteen fifty on the sixth of November', '2026-11-06'), ('sixty on the 30th', '2026-10-30'),
     ('the week after next', ''), ('next week', ''), ('end of the month', ''), ('when my salary comes', ''), ('', ''),
 ])
 def test_spoken_days_resolve_against_call_now(said, expected):
-    assert _helpers()(said, '2026-10-14T11:00') == expected
+    assert helpers()['ctl_date'](said, '2026-10-14T11:00') == expected
 
 
 def test_weekday_reading_is_a_parameter_not_a_constant():
-    resolve = _helpers()
+    resolve = helpers()['ctl_date']
     assert resolve('next Friday', '2026-10-16T09:00') == '2026-10-23'
     assert resolve('next Friday', '2026-10-14T09:00', 'next_occurrence') == '2026-10-16'
     assert resolve('next Friday', '2026-10-16T09:00', 'next_occurrence') == '2026-10-23'
 
 
+def test_business_days_take_their_calendar_from_the_caller():
+    h = helpers()
+    week, off = [0, 1, 2, 3], ['2028-02-17']  # a four-day week with one excluded date: nothing here is a default
+    assert h['ctl_add_business_days']('2028-02-11T09:00', 5, week, off) == '2028-02-22'
+    assert h['ctl_add_business_days']('2028-02-28', 1, list(range(7)), []) == '2028-02-29'
+    assert [h['ctl_is_business_day'](d, week, off) for d in ('2028-02-16', '2028-02-17', '2028-02-18')] == [True, False, False]
+    assert h['ctl_business_day_on_or_after']('2028-02-16', week, off) == '2028-02-16' and h['ctl_business_day_on_or_after']('2028-02-17', week, off) == '2028-02-21'
+    assert h['ctl_last_business_day_of_week']('2028-02-14', week, off) == '2028-02-16' and h['ctl_last_business_day_of_week']('2028-02-14', [], off) == ''
+    assert h['ctl_add_business_days']('not a day', 3, week, off) == '' and h['ctl_add_business_days']('2028-02-11', 0, week, off) == '' and h['ctl_add_business_days']('2028-02-11', 3, [], off) == ''
+
+
 def test_runtime_prelude_resolves_dates_and_is_idempotent(spec, contracts):
-    from builder import runtime
-    from builder.validation import code_errors
-    from builder.contracts import compile_tools
     w = spec['workflow']
     w['nodes']['verify']['extraction_schema'] = [{'name': 'pay_day', 'type': 'date', 'description': 'Day offered.', 'min_confidence': 0.7}]
-    w['nodes']['calc'] = {'name': 'calc', 'node_type': 'code', 'passthrough': True, 'passthrough_default_transition': 'close',
-                          'transitions': [{'target_node': 'close', 'condition': {'operator': 'always'}}],
-                          'pre_actions': [{'type': 'function', 'function': {'name': 'code', 'handler': '__function__:code_exec', 'parameters': {'type': 'object', 'properties': {
-                              'code': {'type': 'string', 'default': "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n"}}}}}]}
-    once = compile_tools(w, contracts)
-    assert compile_tools(once, contracts) == once
+    w['nodes']['check']['pre_actions'][0]['bindings']['answer'] = '{{pay_day}}'
+    w['nodes']['verify']['transitions'][0]['condition']['conditions'][0]['variable'] = 'pay_day'
+    w['nodes']['calc'] = code_stage('calc', "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n", ('close', None))
+    once = compile_workflow(w, contracts)[0]
+    assert compile_workflow(once, contracts)[0] == once
     item = once['nodes']['verify']['extraction_schema'][0]
-    assert item['type'] == 'string' and runtime.SAID in item['description']
+    assert item['type'] == 'string' and runtime.SAID in item['description'] and runtime.SINGLE_DAY in item['description']
+    # A date bound straight into a request is resolved before the request is built.
+    assert runtime.START in once['nodes']['check']['pre_actions'][0]['pre_process_code']
     code = once['nodes']['calc']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
     assert code_errors(code) == [] and code.count(runtime.START) == 1
     scope = {'vars': {'now': '2026-10-14T11:00', 'pay_day': 'tomorrow'}}
@@ -315,130 +437,46 @@ def test_runtime_prelude_resolves_dates_and_is_idempotent(spec, contracts):
     assert scope['vars']['seen'] == '' and scope['vars']['pay_day_said'] == 'sometime next week'
 
 
-def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contracts, requirements):
-    from builder import runtime
-    from builder.contracts import compile_tools
-    once = compile_tools(spec['workflow'], contracts)
-    guard = once['nodes']['verify']['transitions'][0]
+def test_prelude_variables_can_never_shadow_a_helper():
+    """Seen live: a prelude loop variable had the name of a helper function, so every business-day
+    call failed once a spoken date had been resolved, and the agent went silent."""
+    import ast
+    functions = {n.name for n in ast.walk(ast.parse(runtime.DATE_HELPERS)) if isinstance(n, ast.FunctionDef)}
+    assigned = set()
+    for block in (runtime.DATE_APPLY % '[]', runtime.STRUCTURED_APPLY % '[]', runtime.STRUCTURED_HOOK % '[]'):
+        assigned |= {n.id for n in ast.walk(ast.parse(block)) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+    assert assigned and not assigned & functions and all(name.startswith('ctlv_') for name in assigned)
+    assert all(name.startswith('ctl_') for name in functions)
+
+
+def test_helpers_work_after_a_spoken_date_was_resolved_in_the_same_stage(spec, contracts):
+    w = spec['workflow']
+    w['nodes']['account']['pre_actions'][0]['response_mapping'] = [{'path': 'data.products', 'variable': 'products'}]
+    w['nodes']['account']['transitions'] = [route('plan')]
+    w['nodes']['plan'] = code_stage('plan', """import json
+try:
+    week, off = [0, 1, 2, 3, 4], ['2026-10-26']
+    vars['count'] = len(json.loads(vars.get('products') or '[]'))
+    vars['deadline'] = ctl_add_business_days(vars.get('now'), 12, week, off)
+    vars['friday'] = ctl_last_business_day_of_week(vars.get('now'), week, off)
+    vars['shifted'] = ctl_business_day_on_or_after('2026-10-24', week, off)
+    vars['open'] = 'yes' if ctl_is_business_day(vars.get('dob'), week, off) else 'no'
+    vars['ready'] = 'yes'
+except Exception:
+    vars['ready'] = 'no'
+""", ('close', None))
+    code = compile_workflow(w, contracts)[0]['nodes']['plan']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
+    # The state of a real call: a date of birth was said and extracted, the account came back flattened.
+    scope = {'vars': {'now': '2026-10-14T11:00', 'dob': '05 December 1975', 'account_response.data.products.0.product_id': 'p1', 'account_response.data.products.0.past_due': 540}}
+    for run in range(2):  # a stage can be entered twice in one call
+        exec(code, scope, scope)
+        out = scope['vars']
+        assert out['ready'] == 'yes' and out['dob'] == '1975-12-05' and out['count'] == 1
+        assert (out['deadline'], out['friday'], out['shifted'], out['open']) == ('2026-11-02', '2026-10-16', '2026-10-27', 'yes')
+
+
+def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contracts, check):
+    guard = compile_workflow(spec['workflow'], contracts)[0]['nodes']['verify']['transitions'][0]
     assert guard['description'] == runtime.GUARD and guard['target_node'] == 'close'
     assert guard['condition'] == {'variable': 'verify.total_turns', 'operator': 'greater_than', 'operand': 20}
-    assert compile_tools(once, contracts) == once
-    assert validate({**spec, 'workflow': once}, contracts, requirements)['valid']
-
-
-def test_extracted_value_without_route_is_a_dead_end(spec, contracts, requirements):
-    node = spec['workflow']['nodes']['verify']
-    node['extraction_schema'] = [{'name': 'answer', 'type': 'string', 'enum_values': ['agrees', 'refuses', 'unclear'], 'description': 'What the caller said.', 'min_confidence': 0.7}]
-    node['transitions'] += [{'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'refuses'}]}},
-                            {'target_node': 'verify', 'description': 'Stay', 'condition': {'operator': 'always'}}]
-    result = validate(spec, contracts, requirements)
-    # A stay can be intended, so the finding asks for a repair and never blocks deployment.
-    assert result['valid'] and len(result['dead_ends']) == 1 and "verify: answer can be extracted as ['agrees', 'unclear']" in result['dead_ends'][0]
-    # An explicit route back to the stage is a decision; an unlisted value is an oversight.
-    node['transitions'].insert(1, {'target_node': 'verify', 'description': 'Ask again', 'condition': {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'unclear'}, {'variable': 'answer', 'operator': 'equals', 'operand': 'agrees'}]}})
-    assert not validate(spec, contracts, requirements)['dead_ends']
-    # A stage whose unmatched answers move on elsewhere cannot trap the call.
-    node['transitions'][1]['condition'] = {'logic': 'or', 'conditions': [{'variable': 'answer', 'operator': 'equals', 'operand': 'unclear'}]}
-    assert validate(spec, contracts, requirements)['dead_ends']
-    node['transitions'][-1]['target_node'] = 'close'
-    assert not validate(spec, contracts, requirements)['dead_ends']
-    node['transitions'][-1]['target_node'] = 'verify'
-    # A variable the stage only records, without routing on it, is not checked.
-    node['transitions'] = node['transitions'][:1] + node['transitions'][-1:]
-    assert not validate(spec, contracts, requirements)['dead_ends']
-
-
-def test_diagnosis_evidence_carries_failed_call_steps(work, spec, requirements):
-    from builder.build import call_evidence
-    from builder.diagnostics import grounded_diagnoses
-    turns = [{'role': 'assistant', 'node': 'verify', 'text': f'turn {i}'} for i in range(100)]
-    write_json(work / 'calls_0.json', {'bad': {'call_id': 'c1', 'turns': turns}, 'good': {'call_id': 'c2', 'turns': turns[:2]}})
-    raw = {'all_rows': [[{'id': 'bad', 'pass': False, 'failed': ['stuck']}, {'id': 'good', 'pass': True, 'failed': []}], [{'id': 'bad', 'pass': False, 'failed': ['no record']}]]}
-    calls = call_evidence(work, raw)
-    assert list(calls[0]) == ['bad'] and calls[1] == {}
-    assert len(calls[0]['bad']['turns']) == 80 and calls[0]['bad']['turns_omitted'] == 20 and calls[0]['bad']['turns'][-1]['text'] == 'turn 99'
-    d = {'case_id': 'bad', 'rule_ids': ['R1'], 'evidence_refs': ['calls.0.bad.turns.3'], 'likely_workflow_nodes': ['verify'], 'confidence': .8}
-    assert grounded_diagnoses([d], {**raw, 'calls': calls}, requirements, spec['workflow'], {'bad'}) == [d]
-
-
-def test_business_day_expectations_are_calculated_by_the_controller():
-    from builder.scenarios import reconcile_probes
-    # 2031-03-03 is a Monday; with the 5th excluded the fourth business day after it is the 10th.
-    entry = {'variable': 'deadline', 'anchor': '2031-03-03T11:00', 'weekdays': [0, 1, 2, 3, 4], 'excluded_dates': ['2031-03-05'], 'count': 4}
-    probe = {'probe_id': 'P', 'rule_ids': ['R1'], 'node_id': 'calc', 'variables': {'now': '2031-03-03T11:00', 'asked': '2031-03-20'},
-             'expected': {'deadline': '2031-03-07', 'band': 'late', 'echo': '2031-03-20', 'today': '2031-03-03', 'guess': '2031-03-14'}, 'rationale': '', 'calendar': [entry]}
-    fixed, notes = reconcile_probes({'probes': [probe]})
-    # The model's 7th is replaced, inputs echoed back stay, and a date nobody calculated is not a test.
-    assert fixed['probes'][0]['expected'] == {'deadline': '2031-03-10', 'band': 'late', 'echo': '2031-03-20', 'today': '2031-03-03'}
-    assert any('set to calculated 2031-03-10' in n for n in notes) and any('guess removed' in n for n in notes)
-    # Unusable parameters, or nothing verifiable left: no test rather than a wrong one.
-    assert reconcile_probes({'probes': [{**probe, 'calendar': [{**entry, 'weekdays': [9]}]}]})[0] == {'probes': []}
-    assert reconcile_probes({'probes': [{**probe, 'calendar': [], 'expected': {'deadline': '2031-03-07'}}]})[0] == {'probes': []}
-
-
-def test_malformed_proposal_gets_named_errors_not_a_crash(spec, contracts, requirements):
-    broken = deepcopy(spec)
-    broken['workflow']['nodes']['verify']['tools'] = [True]
-    broken['workflow']['nodes']['stray'] = [{'operation': 'get_account'}]
-    result = validate({**broken, 'workflow': compile_tools(broken['workflow'], contracts)}, contracts, requirements)
-    assert not result['valid'] and any('stray: node must be an object' in e for e in result['errors']) and any('verify: tools must be an array of objects' in e for e in result['errors'])
-    broken['workflow']['nodes'] = ['verify']
-    with pytest.raises(ValueError, match='workflow.nodes must be an object'):
-        compile_tools(broken['workflow'], contracts)
-
-
-def test_repair_patch_changes_only_what_it_names(spec):
-    from builder.validation import apply_patch
-    node = deepcopy(spec['workflow']['nodes']['verify'])
-    node['task_message'] = 'Ask the security question.'
-    patched = apply_patch(spec, {'operations': [{'op': 'set_node', 'target': 'verify', 'value': node}], 'tool_gates': [], 'summary': 'x'})
-    assert patched['workflow']['nodes']['verify']['task_message'] == 'Ask the security question.' and spec['workflow']['nodes']['verify']['task_message'] != 'Ask the security question.'
-    assert {k: v for k, v in patched['workflow']['nodes'].items() if k != 'verify'} == {k: v for k, v in spec['workflow']['nodes'].items() if k != 'verify'}
-    assert patched['tool_gates'] == spec['tool_gates'] and patched['coverage'] == spec['coverage']
-    for bad in ([{'op': 'set_node', 'target': 'verify', 'value': spec['workflow']['nodes']['verify']}], [{'op': 'set_node', 'target': 'verify', 'value': {'name': 'other'}}],
-                [{'op': 'remove_node', 'target': 'nowhere'}], []):
-        with pytest.raises(ValueError):
-            apply_patch(spec, {'operations': bad, 'tool_gates': [], 'summary': 'x'})
-
-
-def test_accepted_offer_that_is_never_applied_is_a_dead_end(spec, contracts, requirements):
-    def code(name, source, targets):
-        return {'name': name, 'node_type': 'code', 'passthrough': True, 'passthrough_default_transition': targets[-1][0],
-                'pre_actions': [{'type': 'function', 'function': {'name': 'run', 'handler': '__function__:code_exec', 'parameters': {'type': 'object', 'properties': {'code': {'type': 'string', 'default': source}}}}}],
-                'transitions': [{'target_node': t, 'description': 'next', 'condition': c} for t, c in targets]}
-    always = {'operator': 'always'}
-    nodes = spec['workflow']['nodes']
-    nodes['account']['transitions'] = [{'target_node': 'check', 'description': 'Check the day', 'condition': always}]
-    nodes['account']['passthrough_default_transition'] = 'check'
-    nodes['check'] = code('check', "try:\n    vars['status'] = 'ok' if vars.get('day') == 'x' else 'late'\n    vars['offer'] = 'y'\nexcept Exception:\n    vars['status'] = 'late'",
-                          [('close', {'logic': 'or', 'conditions': [{'variable': 'status', 'operator': 'equals', 'operand': 'ok'}]}), ('offer_day', always)])
-    nodes['offer_day'] = {'name': 'offer_day', 'node_type': 'conversation', 'task_message': 'The status is {{status}}. Offer {{offer}} instead.', 'max_node_turns': 3, 'max_turn_transition': 'close',
-                          'extraction_schema': [{'name': 'reply', 'type': 'string', 'enum_values': ['accept', 'refuse'], 'description': 'Answer.', 'min_confidence': 0.7}],
-                          'transitions': [{'target_node': 'check', 'description': 'Accepted', 'condition': {'logic': 'or', 'conditions': [{'variable': 'reply', 'operator': 'equals', 'operand': 'accept'}]}},
-                                          {'target_node': 'close', 'description': 'Refused', 'condition': {'logic': 'or', 'conditions': [{'variable': 'reply', 'operator': 'equals', 'operand': 'refuse'}]}},
-                                          {'target_node': 'close', 'description': 'Otherwise', 'condition': always}]}
-    result = validate(spec, contracts, requirements)
-    assert result['valid'], result['errors']
-    assert len(result['dead_ends']) == 1 and "offer_day: offers ['offer']" in result['dead_ends'][0]
-    # Applying the accepted offer before the check runs again is what makes the round trip progress.
-    nodes['apply_offer'] = code('apply_offer', "try:\n    vars['day'] = vars.get('offer', '')\nexcept Exception:\n    vars['day'] = ''", [('check', always)])
-    nodes['offer_day']['transitions'][0]['target_node'] = 'apply_offer'
-    result = validate(spec, contracts, requirements)
-    assert result['valid'] and not result['dead_ends'], result
-
-
-def test_vague_period_is_not_extracted_as_a_day(contracts):
-    from builder import runtime
-    workflow = {'nodes': {'ask': {'name': 'ask', 'node_type': 'conversation', 'extraction_schema': [{'name': 'pay_day', 'type': 'date', 'description': 'The day the customer will pay.', 'min_confidence': 0.7}], 'transitions': []}}, 'global_nodes': {}}
-    once = runtime.apply(deepcopy(workflow), contracts)
-    item = once['nodes']['ask']['extraction_schema'][0]
-    assert item['type'] == 'string' and runtime.SINGLE_DAY in item['description']
-    assert runtime.apply(deepcopy(once), contracts) == once
-
-
-def test_simulations_go_first_to_mutations_aimed_at_failed_customers():
-    from builder.build import Builder
-    feedback = {'diagnostics': [{'case_id': 'a', 'likely_workflow_nodes': ['ask_day']}, {'case_id': 'b', 'likely_workflow_nodes': ['ask_day', 'confirm']}, {'case_id': 'c', 'likely_workflow_nodes': ['close']}]}
-    edit = lambda *nodes: {'operations': [{'op': 'set_node', 'target': n, 'value': {}} for n in nodes]}
-    assert [Builder.failed_cases_addressed(feedback, edit(*n)) for n in (['ask_day'], ['close'], ['greeting'], ['confirm', 'close'])] == [2, 1, 0, 2]
-    assert Builder.failed_cases_addressed({'strict_pass_rate': 0.5}, edit('ask_day')) == 0
+    assert check(spec)['valid']

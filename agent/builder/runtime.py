@@ -4,6 +4,8 @@ Nothing here comes from a brief. It encodes observed platform behaviour and plai
 language, so that model-written policy code receives usable values:
 
 - response_mapping stores scalars only; a mapped list/object must be materialised for code nodes.
+- Business-day arithmetic written by a model has been wrong often enough that it is provided here;
+  the weekdays and excluded dates are always arguments the generated code takes from its source.
 - The platform resolves a `date` extraction against the real clock, not the call's `now` variable,
   so "tomorrow" lands on the wrong day whenever a call is simulated on another date. Spoken dates
   are therefore captured as the customer's words and resolved here against `now`.
@@ -28,7 +30,7 @@ CTL_UNITS = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eig
 CTL_ORDINALS = ["zeroth", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
                 "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
                 "nineteenth"]
-CTL_TENS = dict(twenty=20, thirty=30, forty=40, fifty=50, twentieth=20, thirtieth=30)
+CTL_TENS = dict(twenty=20, thirty=30, forty=40, fifty=50, sixty=60, seventy=70, eighty=80, ninety=90, twentieth=20, thirtieth=30)
 CTL_MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october",
               "november", "december"]
 CTL_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
@@ -70,6 +72,31 @@ def ctl_numbers(tokens):
     return found
 
 
+def ctl_years(tokens, numbers, after):
+    """Years the phrase states: in digits anywhere, or in words after position `after`
+    (nineteen eighty eight, one nine eight eight, two thousand and five)."""
+    found = [n[0] for n in numbers if 1900 <= n[0] <= 2100]
+    plain = [n for n in numbers if not n[1] and n[2] > after]
+    for pos in range(len(plain) - 1):
+        first = plain[pos]
+        second = plain[pos + 1]
+        gap = tokens[first[3]:second[2]]
+        if first[0] in (19, 20) and not gap and 10 <= second[0] <= 99:
+            found.append(first[0] * 100 + second[0])
+        elif first[0] in (19, 20) and gap in (["oh"], ["o"]) and 1 <= second[0] <= 9:
+            found.append(first[0] * 100 + second[0])
+        elif first[0] in (1, 2) and gap in (["thousand"], ["thousand", "and"]) and second[0] <= 99:
+            found.append(first[0] * 1000 + second[0])
+    digits = [CTL_UNITS.index(tok) if tok in CTL_UNITS[:10] else (0 if tok in ("oh", "o") else None) for tok in tokens]
+    for pos in range(max(after + 1, 0), len(tokens) - 3):
+        run = digits[pos:pos + 4]
+        if None not in run:
+            found.append(run[0] * 1000 + run[1] * 100 + run[2] * 10 + run[3])
+    if not found and "thousand" in tokens[max(after + 1, 1):] and tokens[tokens.index("thousand") - 1] == "two":
+        found.append(2000)
+    return [year for year in found if 1900 <= year <= 2100]
+
+
 def ctl_build(year, month, day):
     try:
         return datetime.date(year, month, day)
@@ -95,7 +122,6 @@ def ctl_date(said, call_now, next_weekday="following_week"):
             for index, name in enumerate(CTL_MONTHS):
                 if tok == name or (len(tok) >= 3 and tok != "may" and name.startswith(tok) and tok in (name[:3], name[:4])):
                     month = [index + 1, pos]
-        years = [n[0] for n in numbers if 2000 <= n[0] <= 2100]
         days = [n for n in numbers if 1 <= n[0] <= 31]
         near = []
         if month:
@@ -105,6 +131,8 @@ def ctl_date(said, call_now, next_weekday="following_week"):
                     or (n[2] == month[1] + 2 and tokens[month[1] + 1] == "the")]
         if near:
             pick = near[0]
+            # A stated year is kept whatever it is: a date of birth lies decades before the call.
+            years = ctl_years(tokens, numbers, max(month[1], pick[3] - 1))
             year = years[0] if years else base.year
             day = ctl_build(year, month[0], pick[0])
             if day and not years and day < base:
@@ -153,18 +181,81 @@ def ctl_date(said, call_now, next_weekday="following_week"):
         return ""
     except Exception:
         return ""
+
+
+def ctl_as_day(value):
+    try:
+        return datetime.date.fromisoformat(str(value)[:10])
+    except Exception:
+        return None
+
+
+def ctl_is_business_day(day, weekdays, excluded):
+    """True when the day falls on one of the weekdays (Monday=0) and is not an excluded date."""
+    try:
+        found = ctl_as_day(day)
+        return found is not None and found.weekday() in [int(w) for w in weekdays] and found.isoformat() not in [str(x)[:10] for x in excluded]
+    except Exception:
+        return False
+
+
+def ctl_add_business_days(day, count, weekdays, excluded):
+    """The count-th business day strictly after day, as YYYY-MM-DD; '' when it cannot be worked out."""
+    try:
+        found = ctl_as_day(day)
+        left = int(count)
+        if found is None or left < 1:
+            return ""
+        for step in range(3700):
+            found = found + datetime.timedelta(days=1)
+            if ctl_is_business_day(found.isoformat(), weekdays, excluded):
+                left -= 1
+                if left == 0:
+                    return found.isoformat()
+        return ""
+    except Exception:
+        return ""
+
+
+def ctl_business_day_on_or_after(day, weekdays, excluded):
+    """The day itself when it is a business day, otherwise the next business day."""
+    try:
+        found = ctl_as_day(day)
+        if found is None:
+            return ""
+        if ctl_is_business_day(found.isoformat(), weekdays, excluded):
+            return found.isoformat()
+        return ctl_add_business_days(found.isoformat(), 1, weekdays, excluded)
+    except Exception:
+        return ""
+
+
+def ctl_last_business_day_of_week(day, weekdays, excluded):
+    """The last business day of the Monday-to-Sunday week containing day; '' when that week has none."""
+    try:
+        found = ctl_as_day(day)
+        if found is None:
+            return ""
+        monday = found - datetime.timedelta(days=found.weekday())
+        for back in range(6, -1, -1):
+            candidate = (monday + datetime.timedelta(days=back)).isoformat()
+            if ctl_is_business_day(candidate, weekdays, excluded):
+                return candidate
+        return ""
+    except Exception:
+        return ""
 '''
 
 DATE_APPLY = '''
 try:
-    for ctl_name in %s:
-        ctl_raw = vars.get(ctl_name)
-        if not isinstance(ctl_raw, str) or not ctl_raw.strip() or ctl_raw == vars.get(ctl_name + "_iso"):
+    for ctlv_name in %s:
+        ctlv_raw = vars.get(ctlv_name)
+        if not isinstance(ctlv_raw, str) or not ctlv_raw.strip() or ctlv_raw == vars.get(ctlv_name + "_iso"):
             continue
-        ctl_day = ctl_date(ctl_raw, vars.get("now"))
-        vars[ctl_name + "_said"] = ctl_raw
-        vars[ctl_name + "_iso"] = ctl_day
-        vars[ctl_name] = ctl_day
+        ctlv_day = ctl_date(ctlv_raw, vars.get("now"))
+        vars[ctlv_name + "_said"] = ctlv_raw
+        vars[ctlv_name + "_iso"] = ctlv_day
+        vars[ctlv_name] = ctlv_day
 except Exception:
     pass
 '''
@@ -172,27 +263,27 @@ except Exception:
 STRUCTURED_APPLY = '''
 import json
 try:
-    for ctl_name, ctl_field in %s:
-        ctl_cur = vars.get(ctl_name)
-        if isinstance(ctl_cur, (list, dict)) and ctl_cur:
+    for ctlv_name, ctlv_field in %s:
+        ctlv_cur = vars.get(ctlv_name)
+        if isinstance(ctlv_cur, (list, dict)) and ctlv_cur:
             continue
-        if isinstance(ctl_cur, str) and ctl_cur.strip()[:1] in ("[", "{"):
+        if isinstance(ctlv_cur, str) and ctlv_cur.strip()[:1] in ("[", "{"):
             continue
-        ctl_saved = vars.get(ctl_name + "_json")
-        if isinstance(ctl_saved, str) and ctl_saved.strip()[:1] in ("[", "{"):
-            vars[ctl_name] = ctl_saved
+        ctlv_saved = vars.get(ctlv_name + "_json")
+        if isinstance(ctlv_saved, str) and ctlv_saved.strip()[:1] in ("[", "{"):
+            vars[ctlv_name] = ctlv_saved
             continue
-        ctl_rows = {}
-        ctl_mark = "_response.data." + ctl_field + "."
-        for ctl_key in list(vars.keys()):
-            ctl_text = str(ctl_key)
-            if ctl_mark not in ctl_text:
+        ctlv_rows = {}
+        ctlv_mark = "_response.data." + ctlv_field + "."
+        for ctlv_key in list(vars.keys()):
+            ctlv_text = str(ctlv_key)
+            if ctlv_mark not in ctlv_text:
                 continue
-            ctl_rest = ctl_text.split(ctl_mark, 1)[1].split(".")
-            if len(ctl_rest) == 2 and ctl_rest[0].isdigit():
-                ctl_rows.setdefault(int(ctl_rest[0]), {})[ctl_rest[1]] = vars[ctl_key]
-        if ctl_rows:
-            vars[ctl_name] = json.dumps([ctl_rows[ctl_i] for ctl_i in sorted(ctl_rows)])
+            ctlv_rest = ctlv_text.split(ctlv_mark, 1)[1].split(".")
+            if len(ctlv_rest) == 2 and ctlv_rest[0].isdigit():
+                ctlv_rows.setdefault(int(ctlv_rest[0]), {})[ctlv_rest[1]] = vars[ctlv_key]
+        if ctlv_rows:
+            vars[ctlv_name] = json.dumps([ctlv_rows[ctlv_i] for ctlv_i in sorted(ctlv_rows)])
 except Exception:
     pass
 '''
@@ -201,10 +292,10 @@ STRUCTURED_HOOK = '''
 import json
 try:
     if isinstance(result, dict) and isinstance(result.get("data"), dict):
-        for ctl_name, ctl_field in %s:
-            if isinstance(result["data"].get(ctl_field), (list, dict)):
-                vars[ctl_name] = json.dumps(result["data"][ctl_field])
-                vars[ctl_name + "_json"] = vars[ctl_name]
+        for ctlv_name, ctlv_field in %s:
+            if isinstance(result["data"].get(ctlv_field), (list, dict)):
+                vars[ctlv_name] = json.dumps(result["data"][ctlv_field])
+                vars[ctlv_name + "_json"] = vars[ctlv_name]
 except Exception:
     pass
 '''
@@ -296,12 +387,16 @@ def apply(workflow, contracts):
                     tool["pre_process_code"] = wrap(DATE_HELPERS + DATE_APPLY % json.dumps(bound), pre)
                 elif pre != str(tool.get("pre_process_code") or ""):
                     tool["pre_process_code"] = pre
-    parts = (DATE_HELPERS + DATE_APPLY % json.dumps(dates) if dates else "") + (STRUCTURED_APPLY % json.dumps(structured) if structured else "")
     for node in every:
         if node.get("node_type") != "code":
             continue
         for tool in rows(node.get("pre_actions")):
-            code = tool.get("function", {}).get("parameters", {}).get("properties", {}).get("code", {}) if isinstance(tool, dict) and isinstance(tool.get("function"), dict) else {}
-            if isinstance(code.get("default"), str):
-                code["default"] = wrap(parts, code["default"]) if parts else strip(code["default"])
+            code = tool.get("function", {}).get("parameters", {}).get("properties", {}).get("code", {}) if isinstance(tool.get("function"), dict) else {}
+            if not isinstance(code, dict) or not isinstance(code.get("default"), str):
+                continue
+            own = strip(code["default"])
+            # The helpers travel with every stage that needs them: a stage is its own sandbox.
+            parts = ((DATE_HELPERS if dates or "ctl_" in own else "") + (DATE_APPLY % json.dumps(dates) if dates else "")
+                     + (STRUCTURED_APPLY % json.dumps(structured) if structured else ""))
+            code["default"] = wrap(parts, own) if parts else own
     return guard_loops(workflow)

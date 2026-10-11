@@ -146,20 +146,21 @@ class Archive:
             stream.flush()
             os.fsync(stream.fileno())
 
-    def add(self, spec, parent=None, mutation=None, group=None, **metadata):
-        workflow = spec["workflow"]
-        Redactor().assert_no_secrets(spec)
+    def add(self, source, workflow, parent=None, patch=None, **metadata):
+        """Record a candidate: `source` is what a model edits, `workflow` what Freya runs."""
+        Redactor().assert_no_secrets(source)
         if parent and not self.db.execute("SELECT 1 FROM candidates WHERE id=?", (parent,)).fetchone():
             raise ValueError("Unknown parent")
         candidate_id = "cand_" + uuid.uuid4().hex[:12]
         generation = self.get(parent)["generation"] + 1 if parent else 0
         folder = self.root / "candidates" / candidate_id
         write_json(folder / "workflow.json", workflow, immutable=True)
-        write_json(folder / "proposal.json", spec, immutable=True)
-        if mutation:
-            write_json(folder / "mutation.json", mutation, immutable=True)
+        write_json(folder / "proposal.json", source, immutable=True)
+        if patch:
+            write_json(folder / "mutation.json", patch, immutable=True)
         duplicate = self.db.execute("SELECT id FROM candidates WHERE hash=? LIMIT 1", (digest(workflow),)).fetchone()
-        record = {"candidate_id": candidate_id, "parent_id": parent, "generation": generation, "sibling_group_id": group, "workflow_sha256": digest(workflow), "workflow_snapshot_path": str(folder / "workflow.json"), "created_at": now(), "duplicate_of": duplicate[0] if duplicate else None, **metadata}
+        record = {"candidate_id": candidate_id, "parent_id": parent, "generation": generation, "workflow_sha256": digest(workflow), "source_sha256": digest(source),
+                  "workflow_snapshot_path": str(folder / "workflow.json"), "created_at": now(), "duplicate_of": duplicate[0] if duplicate else None, **metadata}
         with self.db:
             self.db.execute("INSERT INTO candidates VALUES (?,?,?,?,?)", (candidate_id, parent, digest(workflow), generation, encoded(record)))
         self.event("candidate_created", **record)
@@ -171,13 +172,18 @@ class Archive:
             raise ValueError("Unknown candidate " + candidate_id)
         return json.loads(row[0])
 
-    def spec(self, candidate_id):
+    def _snapshot(self, candidate_id, name, key):
         record = self.get(candidate_id)
-        spec = json.loads((Path(record["workflow_snapshot_path"]).parent / "proposal.json").read_text())
-        snapshot = json.loads(Path(record["workflow_snapshot_path"]).read_text())
-        if digest(spec["workflow"]) != record["workflow_sha256"] or digest(snapshot) != record["workflow_sha256"]:
-            raise ValueError("Immutable workflow snapshot was modified")
-        return spec
+        value = json.loads((Path(record["workflow_snapshot_path"]).parent / name).read_text())
+        if digest(value) != record[key]:
+            raise ValueError("Immutable candidate snapshot was modified")
+        return value
+
+    def source(self, candidate_id):
+        return self._snapshot(candidate_id, "proposal.json", "source_sha256")
+
+    def workflow(self, candidate_id):
+        return self._snapshot(candidate_id, "workflow.json", "workflow_sha256")
 
     def checkpoint(self, **pointers):
         write_json(self.root / "champion.json", pointers)
