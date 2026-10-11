@@ -8,6 +8,17 @@ unrelated inherited constraints. Where the documents contradict each other witho
 one holds, mark the rules conflicting and list the question in unresolved; never invent a rule or
 settle a contradiction merely because one paragraph is later. Input variables come from the brief.
 Keep fields concise.
+
+Then derive probes: acceptance tests that pin the rules the customer's own speech can trigger.
+Each probe is one short call: acts are the customer's utterances in order, in plain words; expected
+is the closing bank record the rules demand for that exact call (outcome, reason, and any recorded
+promise or transfer with its values). Cover every rule that changes what the agent records or says
+on a triggerable condition: identity failures, callbacks, refusals, hardship, disputes, plan
+requests, corrections, vague and out-of-range dates, below-floor amounts, deadline pressure, tool
+failure, third parties. One probe per distinct rule behaviour; reuse earlier rules only where the
+call really traverses them. Acts and expectations come only from the rules; never from any practice
+customer you may have seen. The expected values must be the ones the rules compute (floors,
+deadlines, outcomes), not the ones a real customer once gave.
 """
 
 # How to write a workflow or any part of one. Shared by the designer and by every fix.
@@ -142,7 +153,12 @@ Use separate stages for tool boundaries and computations, and no more stages tha
 
 DESIGN = """Design a phone agent for the supplied bank policy and tool contract, as a WorkflowSpec.
 Read the original documents in full; requirements, when supplied, is a checklist extracted from them
-and the documents win where the two differ. The supplied Freya documentation is authoritative for
+and the documents win where the two differ. When requirements carries probes, they are acceptance
+tests: each names customer acts and the closing bank record the finished agent must produce for
+them. Design so that every probe would pass: its expected outcome, reason, promise and transfer
+values must be reachable through explicit routes, extraction values and code checks in your
+workflow — a rule that a probe exercises must be decided by logic, not left to the dialogue
+model's judgement. The supplied Freya documentation is authoritative for
 the platform. Write architecture first, then the complete workflow source.
 
 """ + RULES
@@ -167,6 +183,8 @@ problems lists what must be fixed.
   results. Read the call before the judge's summary. Find the first step where it went wrong (a
   route that did not fire, a value never extracted, a code result, a tool that was not called) and
   fix that stage.
+probes, when present, are acceptance tests derived from the source policy: customer acts and the
+bank record the call must end with. When a failed call broke one, fix toward that expected record.
 Write one fix per distinct cause. In cases list the customers it is for; in problem say what goes
 wrong and in which stage. Do not change what is not shown to be broken.
 

@@ -34,10 +34,27 @@ class Requirement(Record):
     interpretation_status: Literal["resolved", "ambiguous", "conflicting"]
 
 
+class ProbeExpectation(Record):
+    """The bank record a probe call must end with, in the brief's own closing vocabulary."""
+    outcome: str
+    reason: str = ""
+    promises: list[dict[str, Any]] = Field(default_factory=list, max_length=6)
+    transfers: list[dict[str, Any]] = Field(default_factory=list, max_length=3)
+
+
+class Probe(Record):
+    """One acceptance test the analyst derives from the rules: customer acts in order, expected bank record."""
+    rule_ids: list[str] = Field(min_length=1, max_length=8)
+    title: str
+    acts: list[str] = Field(min_length=1, max_length=20)
+    expected: ProbeExpectation
+
+
 class RequirementsBundle(Record):
     requirements: list[Requirement]
     input_variables: list[str]
     unresolved: list[str]
+    probes: list[Probe] = Field(default_factory=list, max_length=60)
 
 
 class WorkflowSpec(Record):

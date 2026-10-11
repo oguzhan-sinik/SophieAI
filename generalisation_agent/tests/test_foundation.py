@@ -158,6 +158,41 @@ def test_render_retry_uses_review_and_still_requires_complete_semantics():
     assert roles.writes == 2
 
 
+def test_render_review_carries_field_level_differences():
+    class DiffRoles(Roles):
+        writes = 0
+        def ask(self, role, purpose, instruction, payload, schema, **kwargs):
+            if role == "synthetic_brief_writer":
+                self.writes += 1
+                if self.writes == 2:
+                    differences = payload["previous_review"]["policy_differences"]
+                    assert any("wrong_answer_limit" in d for d in differences), differences
+                return super().ask(role, purpose, instruction, payload, schema, **kwargs)
+            result = super().ask(role, purpose, instruction, payload, schema, **kwargs)
+            if self.writes == 1:
+                result["policy"]["wrong_answer_limit"] += 1
+            return result
+    p, m = sample_policy(42), sample_mapping()
+    roles = DiffRoles()
+    assert render_checked(p, m, openapi_for(p, m, "fixture"), "clean", roles).startswith("# Synthetic fixture")
+
+
+def test_render_gets_three_attempts():
+    class LateRoles(Roles):
+        writes = 0
+        def ask(self, role, purpose, instruction, payload, schema, **kwargs):
+            if role == "synthetic_brief_writer":
+                self.writes += 1
+            result = super().ask(role, purpose, instruction, payload, schema, **kwargs)
+            if role != "synthetic_brief_writer" and self.writes < 3:
+                result["policy"]["wrong_answer_limit"] += 1
+            return result
+    p, m = sample_policy(42), sample_mapping()
+    roles = LateRoles()
+    assert render_checked(p, m, openapi_for(p, m, "fixture"), "clean", roles).startswith("# Synthetic fixture")
+    assert roles.writes == 3
+
+
 def test_disabled_generation_does_not_call_model(work):
     class NoModel:
         def ask(self, *args, **kwargs): raise AssertionError("Disabled model call")

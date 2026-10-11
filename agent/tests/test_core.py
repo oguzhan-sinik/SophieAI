@@ -64,6 +64,27 @@ def test_rules_keep_their_provenance_and_unclear_ones_do_not_stop_the_build(work
     with pytest.raises(ValueError, match='verbatim'): validate_requirements(bundle, docs)
 
 
+def test_probes_stay_grounded_in_extracted_rules(work, requirements):
+    first = work / 'policy.md'
+    first.write_text('Verify first.\n')
+    docs = source_documents([first])
+    bundle = deepcopy(requirements)
+    rule = bundle['requirements'][0]
+    rule['source'].update(path=str(first), start_line=1, end_line=1, span='Verify first.')
+    bundle['probes'] = [{'rule_ids': ['R1'], 'title': 'Floor accepted', 'acts': ['I can only pay 83 units.', 'Yes, I confirm.'],
+                         'expected': {'outcome': 'promise', 'promises': [{'product': 'p1', 'amount': 83}]}}]
+    checked = validate_requirements(bundle, docs)
+    assert checked['probes'][0]['expected']['outcome'] == 'promise'
+    bundle['probes'][0]['rule_ids'] = ['R404']
+    with pytest.raises(ValueError, match='unknown rules'): validate_requirements(bundle, docs)
+    bundle['probes'][0]['rule_ids'] = ['R1']
+    bundle['probes'][0]['acts'] = ['']
+    with pytest.raises(ValueError, match='empty customer act'): validate_requirements(bundle, docs)
+    bundle['probes'][0]['acts'] = ['Fine.']
+    bundle['probes'][0]['expected']['outcome'] = '  '
+    with pytest.raises(ValueError, match='no expected outcome'): validate_requirements(bundle, docs)
+
+
 def test_unknown_tool_binding_rejected(contracts):
     with pytest.raises(ValueError, match='Unknown argument'):
         tool_from_contract(contracts['operations']['create_promise'], 'CALL on confirmation', {'not_a_field': 'value'})

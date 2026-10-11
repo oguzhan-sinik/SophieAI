@@ -143,6 +143,9 @@ class Builder:
         """The one way a workflow is changed after its design: a patch of small edits to its source."""
         payload = {'documents': [{'path': d['path'], 'text': d['text']} for d in self.documents], 'contracts': self.contracts, 'workflow': source['workflow'],
                    'problems': problems, 'hints': list(hints)[:20], 'history': self.history[-30:], 'wording_only': wording_only}
+        probes = (self.requirements or {}).get('probes') if isinstance(self.requirements, dict) else None
+        if probes:
+            payload['probes'] = probes
         if calls:
             payload['calls'] = calls
         if docs:

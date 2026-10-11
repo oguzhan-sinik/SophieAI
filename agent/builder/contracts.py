@@ -74,6 +74,17 @@ def validate_requirements(bundle, documents):
         visited.add(key)
     for key in ids:
         visit(key)
+    # Probes are derived acceptance tests, not new policy: they may only reference extracted rules,
+    # and their expected record stays structural. A probe that invents a rule is a rejected bundle.
+    if len(bundle.probes) != len({p.title for p in bundle.probes}):
+        raise ValueError("Probes must have unique titles")
+    for probe in bundle.probes:
+        if any(r not in ids for r in probe.rule_ids):
+            raise ValueError(f"Probe cites unknown rules: {probe.title}")
+        if not all(act.strip() for act in probe.acts):
+            raise ValueError(f"Probe has an empty customer act: {probe.title}")
+        if not probe.expected.outcome.strip():
+            raise ValueError(f"Probe has no expected outcome: {probe.title}")
     # An unresolved or ambiguous rule is passed on to the designer as it stands; raw bank material
     # is allowed to be unclear, and refusing to build would leave no phone agent at all.
     # Detect silently omitted numbered rules independently of the analyst.

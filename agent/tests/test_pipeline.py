@@ -170,6 +170,26 @@ def test_rule_extraction_failure_is_not_fatal(work, spec, requirements):
     assert 'requirements' not in seen[-1][1] and 'requirements_unavailable' in (builder.root / 'build_trace.log').read_text()
 
 
+def test_probes_reach_the_designer_and_the_fixer(work, spec, requirements):
+    def probe():
+        return {'rule_ids': ['R1'], 'title': 'Floor accepted', 'acts': ['I can only pay the minimum.'], 'expected': {'outcome': 'promise'}}
+    requirements['probes'] = [probe()]
+    spec['workflow']['nodes']['verify']['max_turn_transition'] = 'end'  # forces one compile-fix round
+    patch = {'fixes': [fix(('set_field', 'verify', 'max_turn_transition', 'close'), problem='verify can end without close_call')]}
+    builder, result, seen = build(work, spec, requirements, [patch], max_simulations=0)
+    designer = next(payload for role, payload in seen if role == 'ADASDesignerAgent')
+    assert designer['requirements']['probes'][0]['title'] == 'Floor accepted'
+    asked = fixes_seen(seen)
+    assert len(asked) == 1 and asked[0]['probes'][0]['title'] == 'Floor accepted'
+
+
+def test_ungrounded_probes_reject_the_whole_bundle(work, spec, requirements):
+    requirements['probes'] = [{'rule_ids': ['R404'], 'title': 'invented', 'acts': ['Hello.'], 'expected': {'outcome': 'promise'}}]
+    builder, result, seen = build(work, spec, requirements, max_simulations=0)
+    assert result['status'] == 'exported' and [role for role, _ in seen] == ['BriefAnalystAgent', 'BriefAnalystAgent', 'ADASDesignerAgent']
+    assert 'requirements' not in seen[-1][1] and 'unknown rules' in (builder.root / 'build_trace.log').read_text()
+
+
 def test_resume_reuses_the_root_without_model_calls(work, spec, requirements):
     first, a, _ = build(work, spec, requirements, max_simulations=0)
     seen = []

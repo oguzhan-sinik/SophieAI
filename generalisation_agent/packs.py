@@ -42,9 +42,21 @@ def model_context(cfg=None, seconds=1800, root=None, *, campaign=False):
     return ADKRoles(cfg, deadline, trace, root), trace, deadline, root
 
 
+def _differences(expected, actual, prefix=""):
+    """Leaf-level field diff of two JSON-like structures, for targeted rewrite feedback."""
+    if isinstance(expected, dict) and isinstance(actual, dict):
+        out = []
+        for key in sorted(set(expected) | set(actual)):
+            out += _differences(expected.get(key), actual.get(key), f"{prefix}{key}.")
+        return out
+    if expected == actual:
+        return []
+    return [f"{prefix[:-1]}: expected {expected!r}, reconstructed {actual!r}"]
+
+
 def render_checked(policy, mapping, api, form, roles, dir=None):
     review = None
-    for attempt in range(2):
+    for attempt in range(3):
         rendered = roles.ask("synthetic_brief_writer", "render synthetic policy",
             "Render every supplied policy fact, operation mapping and core obligation faithfully into realistic bank Markdown. "
             "Preserve the exact spelling and casing of every enum value, band name, code and identifier; quote them verbatim. "
@@ -82,12 +94,14 @@ def render_checked(policy, mapping, api, form, roles, dir=None):
             return text
         review = {"previous_brief": text, "unresolved": checked.unresolved,
                   "missing_core_rules": sorted(set(CORE_RULES) - set(checked.supported_core_rules)),
-                  "policy_matches": checked.policy == policy, "mapping_matches": checked.mapping == mapping}
+                  "policy_matches": checked.policy == policy, "mapping_matches": checked.mapping == mapping,
+                  "policy_differences": _differences(policy.model_dump(mode="json"), checked.policy.model_dump(mode="json")) if checked.policy else ["policy was not reconstructed"],
+                  "mapping_differences": _differences(mapping.model_dump(mode="json"), checked.mapping.model_dump(mode="json")) if checked.mapping else ["mapping was not reconstructed"]}
         if dir: (dir / f"attempt-{attempt + 1}.brief.md").write_text(text + "\n")
         roles.trace.event("synthetic_render_rejected", attempt=attempt + 1, pack=dir.parent.name if dir else None,
                           unresolved=checked.unresolved,
                           policy_matches=checked.policy == policy, mapping_matches=checked.mapping == mapping)
-    raise ValueError("Rendered brief did not preserve all policy semantics after two attempts")
+    raise ValueError("Rendered brief did not preserve all policy semantics after three attempts")
 
 
 def generate_packs(settings, roles, root, seed=42, packs=2, users=10, *, campaign=False):
