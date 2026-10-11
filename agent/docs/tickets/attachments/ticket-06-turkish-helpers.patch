@@ -1,0 +1,185 @@
+diff --git a/agent/builder/runtime.py b/agent/builder/runtime.py
+index 8f405ed..b79ba03 100644
+--- a/agent/builder/runtime.py
++++ b/agent/builder/runtime.py
+@@ -128,6 +128,9 @@ def ctl_date(said, call_now, next_weekday="following_week"):
+         if iso:
+             exact = ctl_build(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+             return exact.isoformat() if exact else ""
++        if ctl_numeric_date(text):
++            return ctl_numeric_date(text)
++        text = str(ctl_tr(said) or "").lower()
+         tokens = re.findall(r"[a-z]+|\\d+", text.replace("-", " "))
+         if not tokens:
+             return ""
+@@ -260,6 +263,160 @@ def ctl_last_business_day_of_week(day, weekdays, excluded):
+         return ""
+ '''
+ 
++TURKISH_HELPERS = r'''
++# Turkish speech. A phrase recognised as Turkish is rewritten into the plain English words the
++# functions above read, so every rule about days and dates is applied once, in one place.
++# Nothing here knows a bank, a product or a policy.
++CTL_TR_FOLD = (("İ", "i"), ("I", "i"), ("ı", "i"), ("Ş", "s"), ("ş", "s"), ("Ğ", "g"), ("ğ", "g"),
++               ("Ü", "u"), ("ü", "u"), ("Ö", "o"), ("ö", "o"), ("Ç", "c"), ("ç", "c"),
++               ("â", "a"), ("î", "i"), ("û", "u"))
++CTL_TR_UNITS = ["sifir", "bir", "iki", "uc", "dort", "bes", "alti", "yedi", "sekiz", "dokuz"]
++CTL_TR_TENS = [["yirmi", 20], ["otuz", 30], ["kirk", 40], ["elli", 50], ["altmis", 60], ["yetmis", 70], ["seksen", 80], ["doksan", 90], ["on", 10]]
++CTL_TR_MONTHS = ["ocak", "subat", "mart", "nisan", "mayis", "haziran", "temmuz", "agustos", "eylul", "ekim", "kasim", "aralik"]
++CTL_TR_DAYS = ["pazartesi", "sali", "carsamba", "persembe", "cumartesi", "cuma", "pazar"]
++CTL_TR_DAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "saturday", "friday", "sunday"]
++# what may follow a number: its possessive or ordinal ending, then a case ending (altisi, altisinda, altinci, besinde)
++CTL_TR_NUMBER_END = r"(?:s?[iu]|[iu]?nc[iu])?(?:n?[dt][ae]n?|n?[ae]|y[ae]|n?[iu]n|[ny]?[iu])?"
++CTL_TR_WORD_END = r"(?:n?[iu]n|[dt][ae]n?|n?[ae]|y[ae]|y?[iu]|s[iu])?"
++
++
++def ctl_fold(text):
++    # Lower case, with Turkish letters written as plain ones, so a transcript with or without them reads the same.
++    folded = str(text or "")
++    for pair in CTL_TR_FOLD:
++        folded = folded.replace(pair[0], pair[1])
++    return folded.lower().replace("̇", "")
++
++
++def ctl_tr_number(tok):
++    # [value, kind, has an ending] for a Turkish number word, else None.
++    words = [[pair[0], pair[1], "ten"] for pair in CTL_TR_TENS]
++    words += [[stem, index, "unit"] for index, stem in enumerate(CTL_TR_UNITS)]
++    words += [["dord", 4, "unit"], ["yuz", 100, "hundred"], ["bin", 1000, "thousand"]]
++    for word in sorted(words, key=lambda entry: -len(entry[0])):
++        if tok == word[0]:
++            return [word[1], word[2], False]
++        if tok.startswith(word[0]) and re.fullmatch(CTL_TR_NUMBER_END, tok[len(word[0]):]):
++            return [word[1], word[2], True]
++    return None
++
++
++def ctl_tr_word(tok, stems):
++    # 1-based position of the month or weekday this token names, with any case ending; 0 if none.
++    for index, stem in enumerate(stems):
++        for form in (stem, stem[:-1] + "g" if stem.endswith("k") else stem):
++            if tok.startswith(form) and re.fullmatch(CTL_TR_WORD_END, tok[len(form):]):
++                return index + 1
++    return 0
++
++
++def ctl_tr_numbers(tokens):
++    # Each run of Turkish number words becomes one [value, has an ending]; every other token stays as it is.
++    out = []
++    i = 0
++    while i < len(tokens):
++        total = 0
++        current = 0
++        ended = False
++        j = i
++        while j < len(tokens) and not ended:
++            number = ctl_tr_number(tokens[j])
++            if number is None:
++                break
++            value = number[0]
++            kind = number[1]
++            if kind == "unit" and (current % 10 or (j > i and value == 0)):
++                break
++            if kind == "ten" and current % 100:
++                break
++            if kind == "unit" or kind == "ten":
++                current += value
++            elif kind == "hundred":
++                current = (current or 1) * 100
++            else:
++                total += (current or 1) * 1000
++                current = 0
++            ended = number[2]
++            j += 1
++        if j > i:
++            out.append([total + current, ended])
++            i = j
++        else:
++            out.append(tokens[i])
++            i += 1
++    return out
++
++
++def ctl_tr(said):
++    # A Turkish phrase about a day or a date, in the English words ctl_date reads. Anything else is returned unchanged.
++    try:
++        raw = str(said or "")
++        folded = ctl_fold(raw)
++        marked = re.sub(r"([0-9]+)\s*['’`]\s*[a-z]+", r" ctlday \1 ", folded)
++        marked = re.sub(r"['’`][a-z]+", " ", marked)
++        tokens = re.findall(r"[a-z]+|[0-9]+", marked)
++        signs = ("bugun", "yarin", "yarindan", "hafta", "haftaya", "gun", "gunu", "ay", "ayin", "sonra", "gelecek", "onumuzdeki", "obur", "ctlday")
++        turkish = folded != raw.lower() or any(
++            tok in signs or ctl_tr_word(tok, CTL_TR_MONTHS) or ctl_tr_word(tok, CTL_TR_DAYS)
++            or (ctl_tr_number(tok) and not tok.startswith("on") and not tok.startswith("bin")) for tok in tokens)
++        if not turkish:
++            return raw
++        items = ctl_tr_numbers(tokens)
++        out = []
++        for pos, item in enumerate(items):
++            before = items[pos - 1] if pos else ""
++            after = items[pos + 1] if pos + 1 < len(items) else ""
++            after2 = items[pos + 2] if pos + 2 < len(items) else ""
++            marked_day = before in ("ayin", "ayi", "ctlday")
++            if isinstance(item, list):
++                # A number is a day of the month when it carries an ending or follows "ayin"; bare, it is just a number.
++                # "onu", "ona", "biri" are also everyday words, so alone they are never a day.
++                everyday = item[1] and item[0] in (1, 10) and not marked_day and not (isinstance(after, str) and ctl_tr_word(after, CTL_TR_MONTHS))
++                if after in ("gun", "gunu", "gune") and after2 == "sonra":
++                    out.append("in " + str(item[0]) + " days")
++                elif after in ("hafta", "haftaya") and after2 == "sonra":
++                    out.append("in " + str(item[0]) + " weeks")
++                elif everyday:
++                    continue
++                elif (item[1] or marked_day) and 1 <= item[0] <= 31:
++                    out.append("the " + str(item[0]) + " th")
++                else:
++                    out.append(str(item[0]))
++            elif item.isdigit():
++                out.append("the " + item + " th" if marked_day and 1 <= int(item) <= 31 else item)
++            elif item in ("ay", "ayin", "ayi", "ctlday"):
++                continue
++            elif ctl_tr_word(item, CTL_TR_MONTHS):
++                out.append(CTL_MONTHS[ctl_tr_word(item, CTL_TR_MONTHS) - 1])
++            elif ctl_tr_word(item, CTL_TR_DAYS):
++                name = CTL_TR_DAY_NAMES[ctl_tr_word(item, CTL_TR_DAYS) - 1]
++                out.append(("this " if before == "bu" else "next " if before in ("gelecek", "haftaya") else "") + name)
++            elif item == "bugun":
++                out.append("today")
++            elif (item == "yarindan" and after == "sonra") or (item == "obur" and after in ("gun", "gunu")):
++                out.append("day after tomorrow")
++            elif item.startswith("yarin") and "day after tomorrow" not in out:
++                out.append("tomorrow")
++        return " ".join(out)
++    except Exception:
++        return str(said or "")
++
++
++def ctl_numeric_date(text):
++    # 14.03.1988 or 14/03/1988, day first unless only the other order is a date. '' if it is not one date.
++    found = re.findall(r"(?<![0-9])([0-9]{1,2})[./]([0-9]{1,2})[./]([0-9]{4})(?![0-9])", str(text or ""))
++    if len(found) != 1:
++        return ""
++    day = int(found[0][0])
++    month = int(found[0][1])
++    if month > 12 and day <= 12:
++        day, month = month, day
++    built = ctl_build(int(found[0][2]), month, day)
++    return built.isoformat() if built else ""
++'''
++
++DATE_HELPERS += TURKISH_HELPERS
++
+ HUMAN_HELPERS = r'''
+ # Text speech state; callers supply completeness/provenance and policy themselves.
+ import json
+@@ -306,6 +463,9 @@ def ctl_identity_date(said):
+         exact = re.findall(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', text)
+         if exact:
+             return datetime.date.fromisoformat(exact[-1]).isoformat()
++        if ctl_numeric_date(text):
++            return ctl_numeric_date(text)
++        text = str(ctl_tr(said) or '').lower()
+         tokens = re.findall(r'[a-z]+|[0-9]+', text)[-60:]
+         for start in range(len(tokens)):
+             part = tokens[start:]

@@ -4,6 +4,7 @@ from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 import time
 import uuid
@@ -14,21 +15,24 @@ if __package__ in {None, ''}:
 
 from .adk import ADKRoles
 from .artifacts import Archive, Trace, digest, now, write_json
-from .config import AGENT, KIT, Config, Deadline, missing_credentials, writable
+from .config import AGENT, BUILDER_ROLES, KIT, Config, Deadline, missing_credentials, writable
 from .contracts import compile_openapi, compile_workflow, source_documents, validate_requirements
-from .freya_adapter import FreyaAdapter, contains_definition, public_suite
+from .freya_adapter import FreyaAdapter, contains_definition, practice_suite, public_suite
 from . import prompts
-from .schemas import Patch, RequirementsBundle, WorkflowSpec
+from .schemas import ContractSpec, Patch, RequirementsBundle, WorkflowSpec
 from .scoring import score, verdicts
+from .sources import case_files, is_api, load_api, read_document
 from .validation import apply_fix, edited_stages, is_wording, validate
 
 FIX_SECONDS = 150        # time a fix call may need; a round is not started with less
+COMPILE_FIXES = 3        # fix calls a design gets for what the static checks and the design review reject
 FIRST_SIMULATION = 240   # assumed length of a simulation until one has been observed
 BROKEN = (ValueError, KeyError, TypeError, AttributeError)
+BIG_CASE = 120_000       # characters of source text above which the designer gets each document once, not twice
 
 
 def source_manifest(documents, api_path):
-    paths = [Path(d['path']) for d in documents] + [api_path]
+    paths = [Path(d['path']) for d in documents] + ([api_path] if api_path else [])
     paths += [KIT / f for f in ('README.md', 'VERSION', 'docs/api.md', 'docs/workflow-format.md', 'docs/tools-and-code.md', 'freya.py', 'tools/run_cases.py', 'tools/score.py')]
     return [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]
 
@@ -54,27 +58,47 @@ def call_records(folder, raw, limit=80):
 
 
 class Builder:
-    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None, evaluation_provider=None, deadline=None, submission_dir=None):
+    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None, evaluation_provider=None, deadline=None, submission_dir=None,
+                 mock_url=None, name=None, notes=(), observer=None, cases=None):
         self.cfg = cfg
         self.deadline = deadline or Deadline(cfg.max_wall_seconds, cfg.reserve)
         self.run_id = time.strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
         self.root = writable(cfg.artifacts / self.run_id)
         self.root.mkdir(parents=True)
         self.documents = source_documents(briefs)
-        self.openapi_path = Path(openapi).resolve()
-        self.contracts = compile_openapi(self.openapi_path)
+        self.mock_url = mock_url
+        self.openapi_path = Path(openapi).resolve() if openapi else None
+        # Without a tool API file the contract is written from the documents, which takes a model call and so a trace.
+        self.contracts = compile_openapi(self.openapi_path, server=mock_url) if self.openapi_path else None
         self.brief_hash = digest([d['text'] for d in self.documents])
-        self.trace = Trace(self.root / 'build_trace.log', {'run_id': self.run_id, 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256']}, cfg.tracing)
+        self.trace = Trace(self.root / 'build_trace.log', {'run_id': self.run_id, 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'] if self.contracts else None}, cfg.tracing)
+        if observer:
+            observer(self.trace)
+        self.trace.event('sources_read', documents=[{'path': d['path'], 'characters': len(d['text'])} for d in self.documents], not_read=list(notes)[:50],
+                         tool_api=str(self.openapi_path) if self.openapi_path else 'written from the documents', mock_url=mock_url)
         self.archive = Archive(self.root)
         self.roles = roles_factory(cfg, self.deadline, self.trace, self.root)
+        if self.contracts is None:
+            self.contracts = self.derive_contract()
+            self.trace.metadata['openapi_hash'] = self.contracts['sha256']
         self.adapter_factory, self.adapter = adapter_factory, None
         self.resume = writable(resume) if resume else None
-        self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions) if cfg.official else (None, [])
+        # Practice cases of the team's own run on the team's own bank, the mock: the organisers' bank knows its thirteen only.
+        self.bank_host = None
+        if cases:
+            if not mock_url:
+                raise ValueError('Practice cases of your own need a bank that knows them: give the address of your mock')
+            self.suite, self.cases = practice_suite(cases, self.documents, public_brief, only, style, cfg.repetitions)
+            self.bank_host = mock_url
+            self.trace.event('practice_suite', cases=len(self.cases), source=str(cases), bank=mock_url, evidence='generated')
+        else:
+            self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions) if cfg.official else (None, [])
         self.evaluation_provider = evaluation_provider
         if evaluation_provider:
             self.suite, self.cases = evaluation_provider.bind(self.suite, self.cases)
-        # One Freya workflow per brief, updated in place on every run.
-        self.slot = 'builder-' + Path(self.documents[-1]['path']).stem
+        # One Freya workflow per brief, updated in place on every run. A case folder gives its name to the build.
+        self.name = re.sub(r'[^A-Za-z0-9._-]+', '-', name or Path(self.documents[-1]['path']).stem).strip('-.') or 'case'
+        self.slot = 'builder-' + self.name
         self.submission_dir = writable(submission_dir or AGENT / 'out')
         self.requirements = None
         self.static = {}     # candidate -> result of the static checks
@@ -88,7 +112,7 @@ class Builder:
         write_json(self.root / 'manifest.json', {'run_id': self.run_id, 'start': self.started, 'config': asdict(cfg), 'sources': source_manifest(self.documents, self.openapi_path), 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'suite': asdict(self.suite) if self.suite else None, 'evaluation_provider': evaluation_provider.manifest() if evaluation_provider else None, 'code_sha256': digest({str(p.relative_to(AGENT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((AGENT / 'builder').rglob('*.py'))})})
         write_json(self.root / 'sources.json', [{'path': d['path'], 'text': d['text']} for d in self.documents], immutable=True)
         write_json(self.root / 'tool_contracts.json', self.contracts, immutable=True)
-        write_json(self.root / 'openapi.input.json', json.loads(self.openapi_path.read_text()), immutable=True)
+        write_json(self.root / 'openapi.input.json', load_api(self.openapi_path), immutable=True)
         for source in (AGENT / 'builder').rglob('*.py'):
             destination = self.root / 'source_code' / source.relative_to(AGENT)
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -102,14 +126,35 @@ class Builder:
     def docs():
         return {name: (KIT / 'docs' / name).read_text() for name in ('workflow-format.md', 'tools-and-code.md')}
 
+    def derive_contract(self):
+        """The tool contract of a case that states its services in documents, not in an OpenAPI file."""
+        if not self.mock_url:
+            raise ValueError('This brief needs its own tool API file: give it after the brief, or with --openapi')
+        errors = []
+        for attempt in range(2):
+            answer = self.roles.ask('ContractAgent', "Write the tool contract from the bank's service documents", prompts.CONTRACT,
+                                    {'documents': [{'path': d['path'], 'text': d['text']} for d in self.documents], 'server': self.mock_url, 'compiler_errors': errors},
+                                    ContractSpec, max_tokens=20000)
+            path = self.root / f'derived.openapi.{attempt + 1}.json'
+            write_json(path, answer['openapi'], immutable=True)
+            try:
+                contracts = compile_openapi(path, server=self.mock_url)
+            except BROKEN as exc:
+                errors = [self.trace.redact(str(exc) if isinstance(exc, ValueError) else f'{type(exc).__name__}: {exc}')[:600]]
+                self.trace.event('contract_rejected', attempt=attempt + 1, message=errors[0])
+                continue
+            self.openapi_path = path
+            self.trace.event('contract_written', path=str(path), operations=sorted(contracts['operations']), unclear=answer.get('notes', [])[:20])
+            return contracts
+        raise ValueError('No usable tool contract could be written from the documents: ' + errors[0])
+
     def extract_rules(self):
         """A checklist for the designer. Useful, never required: raw bank material may not compile cleanly."""
         errors = []
         for attempt in range(2):
             try:
                 proposal = self.roles.ask('BriefAnalystAgent', "Extract the brief's rules with their source lines", prompts.ANALYST,
-                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle,
-                                          max_tokens=24000)
+                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle)
                 requirements = validate_requirements(proposal, self.documents)
                 write_json(self.root / 'requirements.json', requirements, immutable=True)
                 return requirements
@@ -133,11 +178,15 @@ class Builder:
             except (OSError, KeyError, ValueError) as exc:
                 raise ValueError(f'Cannot resume from {self.resume}: {exc}') from exc
         self.requirements = self.extract_rules()
-        payload = {'documents': self.documents, 'contracts': self.contracts, 'runtime_docs': self.docs()}
+        # A folder of documents is sent once: with line numbers when the rule list cites them, plain otherwise.
+        documents = self.documents if sum(len(d['text']) for d in self.documents) <= BIG_CASE else \
+            [{'path': d['path'], 'numbered_text' if self.requirements else 'text': d['numbered_text' if self.requirements else 'text']} for d in self.documents]
+        payload = {'documents': documents, 'contracts': self.contracts, 'runtime_docs': self.docs()}
         if self.requirements:
             payload['requirements'] = self.requirements
-        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec,
-                              max_tokens=32000)
+        # The default allowance (60000): designs of this brief have run to 34000 tokens before any
+        # thinking, and an answer cut off at a lower cap is not JSON, which leaves no agent at all.
+        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec)
 
     def fix(self, purpose, source, problems, hints=(), calls=None, wording_only=False, docs=False):
         """The one way a workflow is changed after its design: a patch of small edits to its source."""
@@ -213,7 +262,7 @@ class Builder:
         workflow, result = self.check(source)
         cid = self.record(source, workflow, result)
         tried, carried = [(cid, workflow, result)], []
-        for attempt in range(2):
+        for attempt in range(COMPILE_FIXES):
             if result['valid']:
                 break
             try:
@@ -271,7 +320,8 @@ class Builder:
         try:
             self.deploy(cid)
             self.simulations += getattr(self.evaluation_provider, 'simulations_per_measure', 1) * self.suite.repetitions
-            raw = self.evaluation_provider.evaluate(self.archive.workflow(cid), self.adapter, folder, self.roles, self.deadline) if self.evaluation_provider else self.adapter.evaluate(self.cases, self.suite, folder)
+            raw = self.evaluation_provider.evaluate(self.archive.workflow(cid), self.adapter, folder, self.roles, self.deadline) if self.evaluation_provider else \
+                self.adapter.evaluate(self.cases, self.suite, folder, **({'bank_host': self.bank_host} if self.bank_host else {}))
         except Exception as exc:
             self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
             saved = folder / 'raw_runner.json'
@@ -292,11 +342,16 @@ class Builder:
         return frozen.complete
 
     def champion(self, root_id):
-        """The best measured candidate, later one on a tie, with its wording-only child when it has one."""
-        complete = [cid for cid, result in self.measured.items() if result['score'].complete and not self.vetoed(cid)]
-        if not complete:
-            return None if self.vetoed(root_id) else root_id
-        best = max(complete, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
+        """The best measured candidate, later one on a tie, with its wording-only child when it has one.
+
+        A vetoed candidate is passed over while another exists. When every tested candidate is vetoed
+        the best of them is still exported, and reported as vetoed: an agent with a known flaw can
+        pass customers, no agent passes none."""
+        complete = [cid for cid, result in self.measured.items() if result['score'].complete]
+        eligible = [cid for cid in complete if not self.vetoed(cid)] or ([] if not self.vetoed(root_id) else complete)
+        if not eligible:
+            return root_id
+        best = max(eligible, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
         return self.wording.get(best, best)
 
     def vetoed(self, cid):
@@ -416,8 +471,6 @@ class Builder:
                     self.trace.event('improvement_stopped', error=type(exc).__name__, message=error)
                 finally:
                     champion = self.champion(root_id)
-                    if champion is None:
-                        raise ValueError('No eligible candidate: calibrated critical failures vetoed all tested candidates; exports retained for inspection')
                     self.adapter.exporting = True
                     workflow = self.archive.workflow(champion)
                     try:
@@ -440,7 +493,10 @@ class Builder:
                         self.trace.event('cached_export_fallback', candidate_id=champion, remote_restored=False, source=self.exports[champion], error=error)
                     if status == 'exported' and self.best_effort and not self.static[champion]['valid']:
                         status = 'exported_best_effort'
-                    write_json(writable(self.submission_dir / (Path(self.documents[-1]['path']).stem + '.workflow.json')), json.loads(Path(exported).read_text()))
+                    if status.startswith('exported') and self.vetoed(champion):
+                        status = 'exported_vetoed'
+                        self.trace.event('vetoed_export', candidate_id=champion, reason='every tested candidate has a calibrated critical failure; the best of them is exported')
+                    write_json(writable(self.submission_dir / (self.name + '.workflow.json')), json.loads(Path(exported).read_text()))
                     self.checkpoint(root_id)
         except (Exception, KeyboardInterrupt) as exc:
             error = self.trace.redact(str(exc) or type(exc).__name__)
@@ -452,8 +508,10 @@ class Builder:
             scored = champion if champion in self.measured else next((cid for cid, child in self.wording.items() if child == champion), None)
             final = self.measured[scored]['score'] if scored else None
             statuses = [entry['status'] for entry in self.history]
+            submitted = self.submission_dir / (self.name + '.workflow.json')
             result = {'run_id': self.run_id, 'workflow_id': deployment.get('workflow_id') if deployment else None, 'agent_id': deployment.get('agent_id') if deployment else None,
                       'candidate_id': champion, 'root_candidate_id': root_id, 'export_path': exported, 'remote_restored': restored,
+                      'submission_path': str(submitted) if exported and submitted.exists() else None, 'trace_path': str(self.root / 'build_trace.log'), 'mock_url': self.mock_url,
                       'export_type': 'local_compiled' if getattr(self.adapter, 'local', False) else 'freya_export',
                       'evaluation_type': final.evidence_type if final else 'unknown', 'strict_pass_rate': final.strict_pass_rate if final else None,
                       'root_score': asdict(self.measured[root_id]['score']) if root_id in self.measured else None, 'final_score': asdict(final) if final else None,
@@ -468,18 +526,12 @@ class Builder:
         return result
 
 
-def inputs(paths, openapi=None):
+def inputs(paths, openapi=None, mock_url=None):
     """Split the command line into the brief documents and the one tool API file that belongs to them.
 
     Every final brief comes with its own tool API. Falling back to the kit's file for an unknown brief
-    would build an agent for the wrong bank without a word, so only the kit's own briefs default to it."""
-    def is_api(path):
-        # Told apart by content: a brief document may be JSON too (a code list).
-        try:
-            document = json.loads(Path(path).read_text())
-        except (OSError, ValueError):
-            return False
-        return isinstance(document, dict) and 'openapi' in document
+    would build an agent for the wrong bank without a word, so only the kit's own briefs default to it.
+    With a mock address and no tool API file the contract is written from the documents (None is returned)."""
     apis = {str(Path(p).resolve()) for p in [*(p for p in paths if is_api(p)), *([openapi] if openapi else [])]}
     briefs = [p for p in paths if not is_api(p)]
     if not briefs:
@@ -487,14 +539,61 @@ def inputs(paths, openapi=None):
     if len(apis) > 1:
         raise ValueError('More than one tool API file given: ' + ', '.join(sorted(apis)))
     if not apis and any(Path(p).resolve().parent != KIT / 'briefs' for p in briefs):
+        if mock_url:
+            return briefs, None
         raise ValueError('This brief needs its own tool API file: give it after the brief, or with --openapi')
     return briefs, apis.pop() if apis else str(KIT / 'tools/openapi.json')
 
 
+def case(arguments, openapi=None, mock_url=None):
+    """What a command line names: documents, a case folder, a tool API file, the address of the team's mock.
+
+    `build.py <case_folder> <mock_url>` is the form of the final: a folder is read whole, the brief first, and a
+    file of a type this builder does not read is noted and left out, never a reason to stop."""
+    urls = [a for a in arguments if re.match(r'https?://', str(a))]
+    if len(urls) + bool(mock_url) > 1:
+        raise ValueError('More than one mock address given')
+    mock_url = mock_url or (urls[0] if urls else None)
+    paths, notes, name = [], [], None
+    for argument in (a for a in arguments if a not in urls):
+        if not Path(argument).is_dir():
+            if not Path(argument).is_file():
+                raise ValueError(f'No such file or folder: {argument}')
+            paths.append(str(argument))
+            continue
+        name = name or Path(argument).resolve().name
+        for path in case_files(argument):
+            if is_api(path):
+                paths.append(str(path))
+                continue
+            text, why = read_document(path)
+            if text is None:
+                notes.append(f'{path.name}: {why}')
+            else:
+                paths.append(str(path))
+    briefs, api = inputs(paths, openapi, mock_url)
+    return {'briefs': briefs, 'openapi': api, 'mock_url': mock_url, 'name': name, 'notes': notes}
+
+
+def echo(trace):
+    """Print the trace as it is written, one line an event, so that `2>&1 | tee trace.log` keeps all of it."""
+    silent = ('run_id', 'brief_hash', 'openapi_hash', 'at', 'event')
+    def line(record):
+        rest = {key: value for key, value in record.items() if key not in silent and value not in (None, '', [], {})}
+        print(record.get('at', ''), record.get('event', ''), json.dumps(rest, ensure_ascii=False, default=str)[:4000] if rest else '', file=sys.stderr, flush=True)
+    for written in trace.path.read_text().splitlines():
+        line(json.loads(written))
+    earlier = trace.observer
+    trace.observer = (lambda record: (earlier(record), line(record))) if earlier else line
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('briefs', nargs='+', help='The brief documents in reading order; the tool API file may be given among them')
+    parser.add_argument('briefs', nargs='+', help='The brief documents in reading order, or a case folder; the tool API file and the address of your mock may be given among them')
     parser.add_argument('--openapi', help="The brief's tool API file. Only the kit's own briefs default to the kit's file")
+    parser.add_argument('--mock-url', help='The https address of your own mock of the bank: every tool of the agent calls it')
+    parser.add_argument('--name', help='A name for the build (Freya slot and export file); default: the case folder, or the last brief')
+    parser.add_argument('--cases', help='Practice cases of your own (written by mock/make_fixtures.py), run against your mock in place of the kit\'s thirteen')
     parser.add_argument('--resume-run', help='Reuse the rules and root design of an earlier run on the same brief and tool API')
     parser.add_argument('--public-brief', choices=['A', 'B'])
     parser.add_argument('--only', help='Comma-separated public case IDs; defines a distinct suite')
@@ -502,13 +601,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         cfg = Config.from_env()
-        missing = missing_credentials(cfg)
+        missing = missing_credentials(cfg, roles=BUILDER_ROLES)
         if missing:
             raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
-        briefs, openapi = inputs(args.briefs, args.openapi)
-        builder = Builder(cfg, briefs, openapi, resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief)
+        given = case(args.briefs, args.openapi, args.mock_url)
+        builder = Builder(cfg, given['briefs'], given['openapi'], resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief,
+                          mock_url=given['mock_url'], name=args.name or given['name'], notes=given['notes'], observer=echo, cases=args.cases)
         result = builder.run()
-    except (ValueError, OSError, KeyError) as exc:
+    except (ValueError, OSError, KeyError, TimeoutError) as exc:
         print(json.dumps({'status': 'invalid_input', 'error': str(exc)}))
         return 2
     print(json.dumps(result))

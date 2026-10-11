@@ -110,6 +110,7 @@ def test_adk_uses_selected_provider_and_preserves_other_routes(monkeypatch, mode
         def __init__(self, **kwargs):
             seen["agent_model"] = kwargs["agent"].model
             seen["output_tokens"] = kwargs["agent"].generate_content_config.max_output_tokens
+            seen["mime"] = kwargs["agent"].generate_content_config.response_mime_type
         async def run_async(self, **kwargs):
             seen["streaming_mode"] = kwargs["run_config"].streaming_mode
             yield SimpleNamespace(usage_metadata=None, content=SimpleNamespace(parts=[SimpleNamespace(text='{"ok":', thought=False)]),
@@ -124,6 +125,8 @@ def test_adk_uses_selected_provider_and_preserves_other_routes(monkeypatch, mode
     assert text == '{"ok":true}' and not usage
     assert seen.pop("streaming_mode") == (StreamingMode.SSE if model == QWEN else StreamingMode.NONE)
     assert seen.pop("output_tokens") == (65536 if model == QWEN else 20)
+    # Every route asks for JSON: Gemini itself in its own config, every other one through LiteLLM.
+    assert seen.pop("mime") == (None if "/" in model else "application/json")
     if model == QWEN:
         assert seen["model"] == "openai/qwen3.8-max-0902"
         assert seen["api_key"] == "qwen-fixture"
@@ -139,5 +142,6 @@ def test_adk_uses_selected_provider_and_preserves_other_routes(monkeypatch, mode
         assert seen["extra_headers"] == {"Modal-Key": "modal-key-fixture", "Modal-Secret": "modal-secret-fixture"}
     elif "/" in model:
         assert seen["model"] == model and "api_base" not in seen and "api_key" not in seen
+        assert seen["response_format"] == {"type": "json_object"} and seen["drop_params"] is True
     else:
         assert seen == {"agent_model": model}

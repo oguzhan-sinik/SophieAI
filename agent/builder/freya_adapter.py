@@ -159,8 +159,12 @@ class FreyaAdapter:
         waits at the moment it starts one, and a build that starts none must not wait at all."""
         with file_lock(AGENT / ".runtime" / "workspace.lock", self.deadline) as held:
             if not held:
-                self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out")
-                raise TimeoutError("Workspace lock unavailable; no deployment or simulation permitted")
+                # No lock, so nothing may be deployed for testing or simulated: the working budget is
+                # ended here, and every such call then refuses. What stays is the export reserve, for
+                # one deployment whose export is compared with the workflow before it is accepted.
+                # Raising instead would throw away a finished design.
+                self.deadline.end = min(self.deadline.end, time.monotonic() + self.deadline.reserve)
+                self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out; only the verified export remains")
             yield self
 
     def validate_remote(self, workflow):
@@ -257,17 +261,29 @@ class FreyaAdapter:
             except Exception:
                 continue
 
-    def evaluate(self, cases, suite, folder, *, persona_specs=None):
-        if suite.evidence_type not in {"official_public", "freya_persona_diagnostic"}:
-            raise ValueError("Freya runner only evaluates official public suites")
+    def evaluate(self, cases, suite, folder, *, persona_specs=None, bank_host=None):
+        """Run the suite once per repetition with the kit's own runner and scorer. `bank_host` is the team's
+        own bank for practice cases of its own: the organisers' bank knows its thirteen customers only."""
+        if suite.evidence_type not in {"official_public", "freya_persona_diagnostic"} and not (suite.evidence_type == "generated" and bank_host):
+            raise ValueError("Freya runner only evaluates official public suites, or cases of your own on a bank of your own")
         if not os.getenv("FREYA_BANK_TEAM_KEY") or len(os.environ["FREYA_BANK_TEAM_KEY"]) < 16:
             raise ValueError("FREYA_BANK_TEAM_KEY must contain at least 16 characters")
         if not self.deployment:
             raise ValueError("No candidate deployed")
         folder = writable(folder)
         folder.mkdir(parents=True, exist_ok=True)
-        scorer = load_module("score", KIT / "tools/score.py")
-        runner = load_module("kit_public_runner", KIT / "tools/run_cases.py")
+        # The kit's scorer reads the bank's address once, when it is loaded.
+        official_host = os.environ.get("FREYA_BANK_HOST")
+        if bank_host:
+            os.environ["FREYA_BANK_HOST"] = str(bank_host).rstrip("/")
+        try:
+            scorer = load_module("score", KIT / "tools/score.py")
+            runner = load_module("kit_public_runner", KIT / "tools/run_cases.py")
+        finally:
+            if bank_host and official_host is None:
+                os.environ.pop("FREYA_BANK_HOST", None)
+            elif bank_host:
+                os.environ["FREYA_BANK_HOST"] = official_host
         ids = {}
         if suite.evidence_type == "official_public" and persona_specs is not None:
             raise ValueError("Custom personas require a diagnostic suite identity")
@@ -345,6 +361,27 @@ class FreyaAdapter:
             self.client.get_call = original_call
             runner.http = original_http
             write_json(folder / "raw_runner.json", self.trace.redact(raw))
+
+
+def practice_suite(path, documents, brief=None, only=None, style="", repetitions=1):
+    """Practice cases of the team's own, in the kit's case shape, to be served by the team's own bank.
+
+    They are never an official result: the evidence is labelled generated. A case carries the brief it is
+    for; with the kit's briefs that is read from the documents, otherwise `brief` says it or every case runs."""
+    cases = json.loads(Path(path).read_text(encoding="utf-8"))
+    known = {str((KIT / "briefs" / f"brief-{tag.lower()}.md").resolve()): tag for tag in ("A", "B")}
+    tag = brief or known.get(documents[-1]["path"])
+    cases = [c for c in cases if (not tag or c.get("brief") == tag) and (not only or c["id"] in only)]
+    if only and set(only) != {c["id"] for c in cases}:
+        raise ValueError("Unknown or mismatched practice case selector")
+    if not cases:
+        raise ValueError(f"No practice case in {path}" + (f" is for brief {tag}" if tag else ""))
+    unready = [c["id"] for c in cases if not c.get("identity")]
+    if unready:
+        raise ValueError(f"Practice cases without the security answers their customers give ({', '.join(unready[:5])}...): write them with mock/make_fixtures.py")
+    suite = Suite(tuple(c["id"] for c in cases), digest({"cases": cases, "runner": (KIT / "tools/run_cases.py").read_text(), "scorer": (KIT / "tools/score.py").read_text(),
+                                                         "policy": [d["text"] for d in documents]}), "generated", repetitions, style)
+    return suite, cases
 
 
 def public_suite(documents, openapi_hash, brief=None, only=None, style="", repetitions=1):

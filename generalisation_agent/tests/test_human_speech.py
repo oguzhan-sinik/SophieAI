@@ -232,7 +232,7 @@ def test_runtime_incomplete_slots_and_product_revision_consent():
     assert ns['ctl_digits']('zero three five eight')=='0358'
     values={}
     assert not ns['ctl_slot'](values,'phone','03','zero three',False,1)
-    assert 'phone' not in values and values['phone_raw']=='zero three'
+    assert values['phone']=='' and values['phone_complete']=='no' and values['phone_raw']=='zero three'
     assert ns['ctl_slot'](values,'phone','0358','five eight',True,2)
     card=ns['ctl_proposal'](values,'card','100.05','2028-12-22')
     loan=ns['ctl_proposal'](values,'loan','20','2028-12-22')
@@ -246,6 +246,19 @@ def test_runtime_incomplete_slots_and_product_revision_consent():
     assert ns['ctl_consent'](values,'loan',changed,True)
     ns['ctl_proposal'](values,'loan','ambiguous','2028-12-22')
     assert not ns['ctl_write_ready'](values,'loan','21','2028-12-22')
+    # A corrected slot overwrites the earlier complete value; a removed key would leave it on the platform.
+    assert not ns['ctl_slot'](values,'phone','','er',False,3,correction=True) and values['phone']=='' and values['phone_revision']=='1'
+    assert ns['ctl_digits']('double four seven one')=='4471' and ns['ctl_digits']('triple oh five')=='0005'
+    assert ns['ctl_digits']('it is four four seven one')=='' and ns['ctl_digits']('four double')==''
+    # With the wanted length: a whole number said for "the last four", or a second answer after a first.
+    assert ns['ctl_digits']('zero seven seven double zero nine double zero four four seven one',4)=='4471'
+    assert ns['ctl_digits']('4471 4472',4)=='4472' and ns['ctl_digits']('four four',4)=='44' and ns['ctl_digits']('0358','4')=='0358'
+    # Damaged state is no consent, and no helper raises on it.
+    for damaged in ('not json','[1]','{"loan": 5}',None):
+        broken={'ctl_proposals':damaged}
+        assert not ns['ctl_write_ready'](broken,'loan','21','2028-12-22') and not ns['ctl_consent'](broken,'loan','1',True)
+        ns['ctl_invalidate'](broken,'loan')
+        assert ns['ctl_proposal'](broken,'loan','21','2028-12-22')=='1' and not ns['ctl_write_ready'](broken,'loan','21','2028-12-22')
 
 
 def test_actor_admission_needs_separate_controls_and_exact_fingerprint():
@@ -551,6 +564,13 @@ def test_campaign_manifests_freeze_composed_plans_and_detect_plan_tampering(work
     ('the fourteenth of March nineteen eighty eight','1988-03-14'),
     ('14 March one nine eight eight','1988-03-14'),('1988-03-14','1988-03-14'),
     ('31 February 1988',''),('14 March 1988 or 1989',''),
+    # Short month names are read as ctl_date reads them; the words of a year are never taken for a day.
+    ('14 Mar 1988','1988-03-14'),('March fourteenth, nineteen eighty eight','1988-03-14'),
+    ('March nineteen eighty eight',''),('March 1988',''),('my date of birth is the 14th of March 1988','1988-03-14'),
+    # A second answer after a rejected one, or a correction: the latest complete date is the answer.
+    ('12 July 1991 21 August 1992','1992-08-21'),('12 July 1991 no sorry 12 June 1991','1991-06-12'),
+    ('4 March 1988 the third of April nineteen eighty eight','1988-04-03'),('1991-07-12 1992-08-21','1992-08-21'),
+    ('12 July 1991 21 August',''),
 ])
 def test_identity_date_never_defaults_or_guesses_birth_year(words,expected):
     namespace={};exec(DATE_HELPERS,namespace)

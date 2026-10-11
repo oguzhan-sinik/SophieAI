@@ -8,15 +8,21 @@ from urllib.parse import urlparse
 from . import runtime
 from .artifacts import digest
 from .schemas import RequirementsBundle
+from .sources import load_api, read_document
+
+# Sent with every tool call to a mock the team runs itself, so the mock can keep two calls apart. The platform
+# drops a field whose placeholder has no value, so the header is absent rather than wrong where it is unknown.
+CALL_HEADER = ("X-Call-Id", "{{call.call_id}}")
 
 
 def source_documents(paths):
     documents = []
     for path in paths:
         path = Path(path).resolve()
-        text = path.read_text()
-        if not text.strip():
-            raise ValueError(f"Empty brief: {path}")
+        # A Markdown brief is read as it is, so that the text is the file's and line numbers are the file's.
+        text, why = (path.read_text(), None) if path.suffix.lower() in (".md", ".txt") else read_document(path)
+        if text is None or not text.strip():
+            raise ValueError(f"Empty brief: {path}" if why in (None, "empty") else f"Cannot read {path}: {why}")
         documents.append({"path": str(path), "text": text, "numbered_text": "\n".join(f"{n}: {line}" for n, line in enumerate(text.splitlines(), 1))})
     if not documents:
         raise ValueError("At least one brief is required")
@@ -90,16 +96,27 @@ def validate_requirements(bundle, documents):
     # Detect silently omitted numbered rules independently of the analyst.
     for path, lines in sources.items():
         covered = {n for r in bundle.requirements if r.source.path == path for n in range(r.source.start_line, r.source.end_line + 1)}
+        if not covered and len(sources) > 2:
+            # A case folder also holds documents that state no rule (example conversations, a list of customers):
+            # a numbered line there is not a numbered requirement.
+            continue
         missing = [i for i, line in enumerate(lines, 1) if re.match(r"^\d+\.\s", line) and i not in covered]
         if missing:
             raise ValueError(f"Uncovered numbered requirements in {path}: {missing}")
     return bundle.model_dump()
 
 
-def compile_openapi(path):
-    spec = json.loads(Path(path).read_text())
-    if not str(spec.get("openapi", "")).startswith("3."):
+def compile_openapi(path, server=None):
+    """The tool contract from an OpenAPI 3 file, JSON or YAML. With `server`, the address of a mock the team
+    runs itself, every operation is called there: the contract's own server and its security do not apply."""
+    spec = load_api(path)
+    if not isinstance(spec, dict) or not str(spec.get("openapi", "")).startswith("3."):
         raise ValueError("Expected OpenAPI 3 document")
+    if server is not None:
+        mock = urlparse(str(server))
+        if mock.scheme != "https" or not mock.hostname or mock.username or mock.password or mock.query or mock.fragment:
+            raise ValueError(f"The mock address must be a plain https URL, not {server!r}")
+        server = str(server).rstrip("/")
 
     def resolve(value, stack=()):
         if isinstance(value, list):
@@ -126,9 +143,14 @@ def compile_openapi(path):
             if not re.fullmatch(r"[A-Za-z_]\w*", name) or name in operations:
                 raise ValueError("Missing/duplicate usable operation ID")
             servers = op.get("servers", path_item.get("servers", resolved.get("servers", [])))
-            if not servers:
-                raise ValueError("Operation has no declared server")
-            url = servers[0]["url"].rstrip("/") + path_name
+            if server is not None:
+                # A bare mock host keeps the path the contract's own server has (/v1), so a contract and its mock agree on it.
+                declared = urlparse(str(servers[0].get("url", ""))).path.rstrip("/") if servers and isinstance(servers[0], dict) else ""
+                url = server + (declared if not urlparse(server).path and "{" not in declared else "") + path_name
+            else:
+                if not servers:
+                    raise ValueError("Operation has no declared server")
+                url = servers[0]["url"].rstrip("/") + path_name
             parsed = urlparse(url)
             if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or "{" in url:
                 raise ValueError("Only explicit HTTPS contract URLs are supported")
@@ -136,6 +158,8 @@ def compile_openapi(path):
             if parameters:
                 raise ValueError(f"{name}: non-body parameters require a supported translator; refusing to guess")
             security = op.get("security", resolved.get("security", []))
+            if server is not None:
+                security = []
             if any(requirement for requirement in security):
                 raise ValueError(f"{name}: credential binding is not configured for this contract")
             content = op.get("requestBody", {}).get("content", {})
@@ -145,9 +169,12 @@ def compile_openapi(path):
             if body.get("type") != "object":
                 raise ValueError(f"{name}: request body must be an object")
             operations[name] = {"name": name, "method": method.upper(), "url": url, "description": op.get("description", op.get("summary", "")), "body": body, "responses": op.get("responses", {}), "security": security}
+            if server is not None:
+                operations[name]["call_header"] = True
     if not operations:
         raise ValueError("OpenAPI declares no supported operations")
-    return {"sha256": digest(spec), "operations": operations}
+    # The same contract served from another address is another contract: practice customers belong to the bank's own host.
+    return {"sha256": digest(spec) if server is None else digest({"spec": spec, "server": server}), "operations": operations}
 
 
 def tool_from_contract(contract, description, bindings=None):
@@ -166,7 +193,8 @@ def tool_from_contract(contract, description, bindings=None):
         "name": contract["name"], "handler": "__function__:api_call", "description": description,
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "default": contract["url"]}, "method": {"type": "string", "default": contract["method"]},
-            "headers": {"type": "object", "properties": {"Content-Type": {"type": "string", "default": "application/json"}}},
+            "headers": {"type": "object", "properties": {"Content-Type": {"type": "string", "default": "application/json"},
+                                                         **({CALL_HEADER[0]: {"type": "string", "default": CALL_HEADER[1]}} if contract.get("call_header") else {})}},
             "connect_retries": {"type": "number", "default": 0}, "body": body}}}}
 
 

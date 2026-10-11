@@ -85,7 +85,11 @@ def main(argv=None):
                 with adapter.workspace():
                     adapter.deploy('synthetic-'+root.name,workflow)
                     evaluator = evaluate_chat if args.backend=='chat' else evaluate_personas
-                    report = evaluator(adapter,cases,customers,roles,root/'live',args.reps)
+                    from agent.builder.config import AGENT
+                    from .progress import mirrored
+                    # The supplied practice scripts are public: show this test in the dashboard as it runs.
+                    with mirrored(root/'live', AGENT/'artifacts'/('synthetic_'+root.name)/'evaluations'/'live'):
+                        report = evaluator(adapter,cases,customers,roles,root/'live',args.reps)
                 from agent.builder.artifacts import write_json
                 from .config import ROOT
                 target = ROOT/'artifacts'/root.name/'report.json'

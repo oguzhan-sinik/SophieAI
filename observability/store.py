@@ -18,6 +18,11 @@ DENY_TOP_LEVEL = {"synthetic", ".env", ".runtime", "__pycache__"}
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
+def _test_name(folder) -> str:
+    """Persona diagnostics replay the practice customers with human speech; they are not the official test."""
+    return "Persona test" if str(folder or "").endswith("_personas") or folder == "live" else "Practice test"
+
+
 def _sha256(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -491,7 +496,7 @@ class Store:
                     if not e.get("repetition"):
                         tests_seen += 1
                     folder = eval_dirs[min(tests_seen, len(eval_dirs)) - 1].name
-                sp = {"span_id": f"seq_{seq}", "kind": "benchmark", "name": "Practice test", "start_at": at,
+                sp = {"span_id": f"seq_{seq}", "kind": "benchmark", "name": _test_name(folder), "start_at": at,
                       "status": "running", "repetition": e.get("repetition") or 0, "evaluation_folder": folder,
                       "children": [], "seq": seq, "derived": True, "detail": e}
                 groups.append(sp)
@@ -515,7 +520,7 @@ class Store:
                 target = groups[-1] if groups else next((s for s in reversed(spans) if s["kind"] == "benchmark"), None)
                 if target is not None:
                     target["passed"], target["total"] = e.get("passed"), e.get("total")
-                    target["name"] = f"Practice test · {e.get('passed')}/{e.get('total')} passed"
+                    target["name"] = f"{_test_name(target.get('evaluation_folder'))} · {e.get('passed')}/{e.get('total')} passed"
             elif kind in ("freya_api", "workflow_export"):
                 label = f"{e.get('method')} {e.get('path')}" if kind == "freya_api" else "export workflow"
                 if groups:
@@ -558,7 +563,7 @@ class Store:
                         sp["simulation"] = sims[sp["repetition"]]
                     if sp.get("passed") is None:
                         sp["passed"], sp["total"] = sum(1 for r in sp["results"] if r.get("pass")), len(sp["results"])
-                        sp["name"] = f"Practice test · {sp['passed']}/{sp['total']} passed"
+                        sp["name"] = f"{_test_name(sp['evaluation_folder'])} · {sp['passed']}/{sp['total']} passed"
                 if (folder / f"calls_{sp['repetition']}.json").is_file():
                     sp["transcripts"] = f"evaluations/{sp['evaluation_folder']}/calls_{sp['repetition']}.json"
                 live_path = folder / f"live_{sp['repetition']}.json"
@@ -568,7 +573,7 @@ class Store:
                     rows = live.get("rows") or []
                     done = [r for r in rows if r.get("state") == "finished"]
                     sp["live"] = {"updated_at": live.get("updated_at"), "rows": rows}
-                    sp["name"] = f"Practice test · {len(done)}/{len(rows)} finished, {sum(1 for r in done if r.get('pass'))} passing"
+                    sp["name"] = f"{_test_name(sp['evaluation_folder'])} · {len(done)}/{len(rows)} finished, {sum(1 for r in done if r.get('pass'))} passing"
                     if (folder / f"live_calls_{sp['repetition']}.json").is_file():
                         sp["transcripts"] = f"evaluations/{sp['evaluation_folder']}/live_calls_{sp['repetition']}.json"
                         sp["transcripts_live"] = True

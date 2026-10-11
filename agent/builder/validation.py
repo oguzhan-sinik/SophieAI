@@ -19,9 +19,77 @@ BLOCKED_NAMES = {"open", "exec", "eval", "compile", "getattr", "setattr", "delat
 SILENT = ("code", "api_request")
 # Stable operation names from the event contract; every field and value comes from the supplied API.
 IDENTITY, PROTECTED = "verify_identity", ("get_account", "create_promise")
+# Values and variable names that stand for a failed or unfinished check. A route that fires on one of
+# them is the way out for a caller who was NOT verified, so it proves nothing.
+NOT_VERIFIED = {"", "false", "no", "0", "none", "null", "failed", "fail", "unverified", "not_verified", "denied", "rejected",
+                "error", "invalid", "wrong", "locked", "blocked", "mismatch", "unknown", "pending", "retry"}
+NEGATIVE_NAME = re.compile(r"fail|wrong|denied|locked|error|reject|invalid|mismatch|unverified|not_verified")
 # What the dialogue model is told and what is spoken as written. Descriptions and routing prompts are
 # not wording: the routing model and the extractor decide by them, so changing one changes routes and values.
 WORDING = {"task_message", "role_message", "system_prompt", "text", "spoken_message", "llm_prompt"}
+
+
+# The review of a design before any customer is called. Each of these is a failure that is certain or
+# has been seen live, that the stage's own `except` hides, and that a simulation would otherwise be the
+# first to show: on a brief without practice customers nothing would show it at all.
+MAX_EXTRACTED = 5     # designs that scored well extract at most 4 values in one stage; one that extracted 9 took 20-40 s a turn
+MAX_CODE_LINES = 120  # their longest code stage has 86 lines; the 243-line one hid two mistakes behind one except
+HELPERS = {f.name: f for f in ast.parse(runtime.DATE_HELPERS).body if isinstance(f, ast.FunctionDef) and f.name.startswith("ctl_")}
+
+
+def _spoken_read(node):
+    """The extraction variable a vars.get('x') or vars['x'] reads, through str()/round() wrappers."""
+    while isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("str", "round", "int", "float") and node.args:
+        node = node.args[0]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and isinstance(node.func.value, ast.Name) \
+            and node.func.value.id == "vars" and len(node.args) == 1 and isinstance(node.args[0], ast.Constant):
+        return node.args[0].value
+    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == "vars" and isinstance(node.slice, ast.Constant):
+        return node.slice.value
+    return None
+
+
+def review_code(compiled, spoken=()):
+    """What is certain to go wrong in a code stage or hook, read from the code itself.
+
+    `compiled` is the code as deployed: the model's own part is reviewed, and the controller helpers
+    count as available only if they were compiled into this very snippet."""
+    try:
+        own, whole = ast.parse(runtime.strip(compiled)), ast.parse(compiled)
+    except (SyntaxError, TypeError, ValueError):
+        return []   # code_errors names what is wrong with code that does not parse
+    found = []
+    present = {f.name for f in ast.walk(whole) if isinstance(f, ast.FunctionDef)}
+    parents = {id(child): parent for parent in ast.walk(own) for child in ast.iter_child_nodes(parent)}
+    for node in ast.walk(own):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name) and node.value.func.id in HELPERS \
+                and any(isinstance(target, (ast.Tuple, ast.List)) for target in node.targets):
+            names = max(len(target.elts) for target in node.targets if isinstance(target, (ast.Tuple, ast.List)))
+            found.append(f"{node.value.func.id} returns one value; it cannot be unpacked into {names} names. Assign it to one name")
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        name = node.func.id
+        if name.startswith("ctl_"):
+            if name not in HELPERS or name not in present:
+                found.append(f"{name} is not defined" + (" here" if name in HELPERS else "; the controller provides " + ", ".join(sorted(n for n in HELPERS if "_tr" not in n))))
+                continue
+            arguments = HELPERS[name].args
+            takes = [a.arg for a in arguments.args]
+            given = takes[:len(node.args)] + [k.arg for k in node.keywords if k.arg]
+            required = takes[:len(takes) - len(arguments.defaults)]
+            if len(node.args) > len(takes) or set(given) - set(takes) or len(given) != len(set(given)) or set(required) - set(given):
+                found.append(f"{name} called with {len(node.args) + len(node.keywords)} arguments; it takes ({', '.join(takes)})")
+        elif name in ("int", "float") and node.args and _spoken_read(node.args[0]) in spoken:
+            # Guarded when an enclosing test names the same variable: `if vars.get('x'): int(vars.get('x'))`.
+            variable, current, guarded = _spoken_read(node.args[0]), node, False
+            while id(current) in parents and not guarded:
+                current = parents[id(current)]
+                guarded = isinstance(current, (ast.If, ast.IfExp, ast.While)) and any(isinstance(n, ast.Constant) and n.value == variable for n in ast.walk(current.test))
+            if not guarded:
+                found.append(f"{name}() is applied to {variable}, which the caller's words fill and which is unset whenever they give no such value (an amount named as "
+                             f"'the full amount' has no number). The conversion then fails and this stage's except closes the call. Test {variable} first and decide what "
+                             f"a missing value means here: the value this stage offered, or a question back")
+    return sorted(set(found))
 
 
 def code_errors(source, hook=False):
@@ -103,20 +171,28 @@ def _leaves(condition):
             yield condition
 
 
-def _is_proof(condition, spoken):
+def _is_proof(condition, spoken, owned=None):
     """A route that can only fire on something the caller cannot simply say: a tool result or a value code derived.
 
     Every alternative of an OR has to be such a test, since one spoken alternative is a way round
-    the others; within an AND one is enough."""
+    the others; within an AND one is enough. With `owned`, the test must be on a variable only the
+    identity tool's own result fills: that is proof wherever in the call the route stands."""
     if not isinstance(condition, dict):
         return False
     if condition.get("conditions"):
-        checks = [_is_proof(child, spoken) for child in condition["conditions"]]
+        checks = [_is_proof(child, spoken, owned) for child in condition["conditions"]]
         return all(checks) if condition.get("logic") == "or" else any(checks)
+    # Proof is `equals` against a value that means verified, on a variable the caller cannot fill by
+    # speaking. Which word a design uses for "verified" is its own choice (true, yes, verified,
+    # all_verified, ...); what is ruled out is what can never mean it: a failed value, a variable that
+    # names the failure, that a variable merely is set, and the transport's status code or counters.
     variable = str(condition.get("variable") or "")
+    if owned is not None and not owned(variable):
+        return False
     return (bool(variable) and variable not in spoken and
             not variable.endswith(("_turns", "_status_code", "_success_count", "_failure_count")) and
-            condition.get("operator") == "equals" and str(condition.get("operand")).lower() in {"true", "verified", "authenticated", "passed"})
+            not NEGATIVE_NAME.search(variable.lower()) and
+            condition.get("operator") == "equals" and str(condition.get("operand")).strip().lower() not in NOT_VERIFIED)
 
 
 def _variable_use(node):
@@ -170,10 +246,17 @@ def validate(workflow, contracts):
         errors.append("Global and regular node names collide")
     edges = {key: [] for key in nodes}
     calls = {key: [] for key in nodes}
+    spoken = {item.get("name") for node in nodes.values() for item in node.get("extraction_schema", [])}
     for key, node in nodes.items():
         def bad(message):
             errors.append(f"{key}: {message}")
         kind = node.get("node_type")
+        if kind == "conversation" and len(node.get("extraction_schema", [])) > MAX_EXTRACTED:
+            # A hint, not an error. Made an error once, it forced an untested rewrite of a 7-of-10 design
+            # that lost customers the design had passed; the rules ask for this shape in the first design.
+            warnings.append(f"{key}: this stage extracts {len(node['extraction_schema'])} values from one reply ({', '.join(str(i.get('name')) for i in node['extraction_schema'])}). Every one is a "
+                f"model call on every turn, so the caller waits, and overlapping values are misread. Extract at most {MAX_EXTRACTED}: what this stage's own routes test and "
+                f"what the next code stage needs from this reply. Give a second question its own stage, and let code derive what follows from the values already extracted")
         if "loop_prompt" in node:
             bad("Live Freya schema rejects loop_prompt; express repeat-turn behavior in task_message")
         if kind not in {"conversation", "api_request", "code", "end_call"}:
@@ -263,6 +346,11 @@ def validate(workflow, contracts):
                     if kind != "code":
                         bad("Code execution is supported only in code nodes")
                     errors.extend(f"{key}: {e}" for e in code_errors(props.get("code", {}).get("default", "")))
+                    errors.extend(f"{key}: {e}" for e in review_code(props.get("code", {}).get("default", ""), spoken))
+                    lines = len(runtime.strip(props.get("code", {}).get("default", "")).splitlines())
+                    if lines > MAX_CODE_LINES:
+                        warnings.append(f"{key}: this code stage has {lines} lines and decides several things behind one except, so one mistake closes the call for every case it handles. "
+                            f"Split it at its decisions into code stages of at most {MAX_CODE_LINES} lines, each setting one status that its own routes test")
                 elif handler == "__function__:api_call":
                     calls[key].append(name)
                     if placement == "tools":
@@ -311,6 +399,7 @@ def validate(workflow, contracts):
                 for hook in ("pre_process_code", "post_process_code"):
                     if tool.get(hook):
                         errors.extend(f"{key}/{hook}: {e}" for e in code_errors(tool[hook], True))
+                        errors.extend(f"{key}/{hook}: {e}" for e in review_code(tool[hook], spoken))
     # Interrupts are routes too; a global handler must not slip past a check.
     for key in normal:
         for target, node in global_nodes.items():
@@ -337,7 +426,13 @@ def validate(workflow, contracts):
         errors.append("Unreachable nodes: " + str(sorted(set(nodes) - reachable)) + "; give each a transition from the stage that should lead to it, or remove it")
     # Identity before account data, read from the routes themselves. Every route to a protected tool
     # must call the identity tool and afterwards branch on something the caller cannot simply say.
-    spoken = {item.get("name") for node in nodes.values() for item in node.get("extraction_schema", [])}
+    # What only the identity tool fills: the variables its stages map from the response, unless code elsewhere writes them too.
+    identity_stages = [key for key, names in calls.items() if IDENTITY in names]
+    elsewhere = set().union(*(_variable_use(node)[0] for key, node in nodes.items() if key not in identity_stages)) if nodes else set()
+    # Only what every identity stage maps: the result of one question alone is not the result of the check.
+    per_stage = [{m.get("variable") for m in nodes[key].get("response_mapping", [])} for key in identity_stages]
+    mapped = (set.intersection(*per_stage) if per_stage else set()) - elsewhere - spoken
+    owned = lambda variable: variable in mapped or any(variable.startswith(stage + "_response.data.") for stage in identity_stages)
     for operation in [op for op in PROTECTED if IDENTITY in contracts["operations"] and any(op in names for names in calls.values())]:
         pending, seen = deque([(initial, None, False, [])] if initial in nodes else []), set()
         while pending:
@@ -347,16 +442,22 @@ def validate(workflow, contracts):
             seen.add((key, checked_at is not None, tested))
             path = path + [key]
             if operation in calls[key] and not tested:
-                route = " > ".join(path[-8:])
+                # A long route is shown by both ends: where it leaves the start of the call says how it got round identity.
+                route = " > ".join(path if len(path) <= 12 else path[:5] + ["..."] + path[-6:])
                 errors.append(f"{key}: {operation} can be reached without a tested identity check, by the route {route}. " + (
-                    f"No stage on that route calls {IDENTITY}." if checked_at is None else
-                    f"After {IDENTITY} in {checked_at} no transition on that route tests its result. Make the way out of {checked_at} (or of the code stage "
-                    f"that reads its response) depend on the {IDENTITY} response: a mapped response variable or a status code derives from it, never on what the caller said."))
+                    f"No stage on that route calls {IDENTITY}. A stage a caller can reach before identity (a help, resume or turn-cap stage) leads "
+                    f"into the stages that follow it: make that transition test, with equals, the result the identity stages map from the tool's response "
+                    f"that means every check passed (not a status code wrote), in an AND with whatever else it tests, "
+                    f"or send it back through the identity stages. Changing {key} or the stage just before it does not close this route." if checked_at is None else
+                    f"After {IDENTITY} in {checked_at} no transition on that route proves its result. Make the way out of {checked_at} (or of the code stage "
+                    f"that reads its response) test, with equals, the value that means verified: a mapped response variable (all_verified equals true) or a status "
+                    f"a code stage derives from the response (equals verified). is_set, an HTTP status code, a success or failure counter, a turn count, a value "
+                    f"that means failed, or anything the caller said does not prove it."))
                 break
             if IDENTITY in calls[key]:
                 checked_at, tested = key, False
             for target, condition in edges[key]:
-                pending.append((target, checked_at, tested or (checked_at is not None and _is_proof(condition, spoken)), path))
+                pending.append((target, checked_at, tested or (checked_at is not None and _is_proof(condition, spoken)) or _is_proof(condition, spoken, owned), path))
     # close_call must be isolated from other bank actions and cannot lead back to one.
     for key, names in calls.items():
         if "close_call" not in names:

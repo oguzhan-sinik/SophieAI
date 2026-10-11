@@ -19,6 +19,26 @@ agent/.venv/bin/python agent/agent_builder.py path/to/brief.md path/to/tool-api.
 A brief that is not one of the kit's own needs its tool API file, given after the brief or with
 `--openapi`; without it the builder stops at once instead of building for the kit's bank.
 
+### The final: a case folder and your own mock
+
+```sh
+agent/.venv/bin/python agent/builder/build.py <case_folder> <mock_url> 2>&1 | tee traces/final.log
+```
+
+- The folder is read whole: `BRIEF.md` first, then `README.md`, then the rest by name. Markdown,
+  text, CSV, JSON, YAML, HTML and XML are read as text, Word and Excel from their own XML, PDF with
+  `pypdf` when it is installed (`agent/.venv/bin/pip install pypdf`), else with a plain reader that
+  manages simple PDFs only. A file of another type is named in the trace and left out.
+- An OpenAPI file in the folder, JSON or YAML, is the tool contract. With none, one model call
+  writes the contract from the documents; it is saved in the run folder as `derived.openapi.N.json`.
+- Every tool URL carries the mock's address. Each tool call also sends the platform's call id in
+  the header `X-Call-Id`, so the mock can keep two calls apart. The mock itself is in `mock/`.
+- The build is named after the folder (`--name` overrides): Freya slot `builder-<name>`, export
+  `agent/out/<name>.workflow.json`. `agent/out/` is git-ignored: add the export with `git add -f`.
+- The trace is echoed to stderr line by line, so the `tee` above holds all of it. The last line of
+  stdout is still the JSON result, with `submission_path` and `trace_path`.
+- A case without practice customers is exported after the static checks; no simulation runs.
+
 Keys go in the kit-root `env.sh` (template `env.example`, git-ignored): `FREYA_API_KEY`,
 `FREYA_BANK_TEAM_KEY` and the model settings. The kit-root `env.example` shows the three
 OpenRouter tiers: `MODEL_TIER_HARD`, `MODEL_TIER_MEDIUM`, and `MODEL_TIER_EASY`. Change those
@@ -66,11 +86,15 @@ configuration, 3 no workflow Freya accepts, 4 export failure.
 2. **Design.** One call writes the workflow *source*: compact, with bank tools as
    `{"bank_operation": ...}` and code stages as plain Python. The controller compiles it:
    it expands the tools from the tool API file, wraps the code, and injects the runtime support
-   (spoken-date resolution against the call's `now`, business-day helpers, a loop guard).
+   (the speech helpers below, business-day helpers, a loop guard).
    Models only ever see and edit the source.
-3. **Compiler fixes.** Static checks and a Freya dry run produce errors that each name the stage
-   to change. Up to two fix calls answer them. If no candidate is clean, the least-flawed one
-   Freya accepts is exported as best effort.
+3. **Compiler fixes and design review.** Static checks and a Freya dry run produce errors that
+   each name the stage to change. The same pass reviews the design for what would otherwise only
+   show in a call: a conversion of a value the caller may not have given and a controller helper
+   called wrongly are errors. A stage that extracts more than five values from one reply and a
+   code stage of more than 120 lines are hints only: forcing a rewrite of a working design lost
+   customers when tried. Up to three fix calls answer the errors. If no candidate is clean, the
+   least-flawed one Freya accepts is exported as best effort.
 4. **Measure.** Where practice customers exist (the kit's Brief A and B), the agent is deployed
    and simulated once; the kit's own runner and scorer give the verdicts.
 5. **Improve.** A chain of rounds. One fix call reads the failed calls step by step and returns
@@ -86,6 +110,26 @@ configuration, 3 no workflow Freya accepts, 4 export failure.
 A brief without practice customers stops after step 3: no speculative edits are made to an agent
 that cannot be tested. `docs/tickets/ticket-02.md` specifies generated practice customers to
 close that gap.
+
+## How callers talk
+
+Final customers talk like people: a number in two parts ("463", then "51"), corrections, other
+things, a question back, amounts and dates in words. The agent's model is not asked to get that
+right on its own. The runtime reads the caller's words, in Turkish and in English:
+
+| Helper | What it does |
+|---|---|
+| `ctl_date` | A day in words against the call's `now`: yarın, bu cuma, ayın yirmi altısı, 6 Kasım, the 26th, next Friday. `''` for a period |
+| `ctl_identity_date` | A date of birth, only when day, month and year were all said |
+| `ctl_digits` | Digits however they were said: one by one, in groups, as numerals; zeros kept |
+| `ctl_collect` | A number given in parts: keeps the parts, joins them, says when it is whole |
+| `ctl_amount` | An amount in words or digits as `1250.50`; `''` for a reference or two amounts |
+
+What follows a correction word (pardon, yani, sorry, I mean) is read first. Extraction types `date`
+and `amount` are the controller's own: the caller's words are captured as said and converted in the
+first code stage after them, with `<name>_said` keeping the words. A code stage carries only the
+helpers it calls; with the whole block in every stage the compiled agent was a megabyte.
+`agent/tests/test_speech.py` is the table of phrases. `docs/tickets/ticket-06.md` has the reasons.
 
 ## What the static checks cover
 

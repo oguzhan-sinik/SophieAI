@@ -161,7 +161,7 @@ def test_identity_is_read_from_the_routes(spec, check):
     nodes['check']['transitions'] = [route('account')]
     error = check(spec)['errors'][0]
     assert 'account: get_account can be reached without a tested identity check, by the route verify > check > account' in error
-    assert 'After verify_identity in check no transition on that route tests its result' in error
+    assert 'After verify_identity in check no transition on that route proves its result' in error and 'equals' in error
     # What the caller says is not proof, and one spoken alternative in an OR is a way round the real test.
     nodes['verify']['extraction_schema'].append({'name': 'said_done', 'type': 'string', 'description': 'Caller says they are verified.', 'min_confidence': 0.7})
     nodes['check']['transitions'] = [route('account', {'logic': 'or', 'conditions': [{'variable': 'said_done', 'operator': 'equals', 'operand': 'yes'}, {'variable': 'all_verified', 'operator': 'equals', 'operand': 'true'}]}), route('close')]
@@ -186,6 +186,30 @@ def test_identity_is_read_from_the_routes(spec, check):
                  promise=action('promise', bank('create_promise', product_id='{{product_id}}', amount='{{amount}}', date='{{day}}'), 'close'))
     nodes['account']['transitions'] = [route('again')]
     assert any('promise: create_promise can be reached' in e and 'After verify_identity in again' in e for e in check(spec)['errors'])
+
+
+def test_a_stage_reached_before_identity_returns_to_the_stages_after_it_only_on_the_tools_own_result(spec, check):
+    # Seen live, 10 of 10 and still flagged: a stage that answers a request for a person and then returns the caller
+    # to where the call was. It can be entered before identity, so the position it remembers proves nothing.
+    nodes = spec['workflow']['nodes']
+    nodes['verify']['transitions'].insert(0, route('resume', equals('dob', 'help')))
+    nodes['resume'] = code_stage('resume', "try:\n    vars['where'] = str(vars.get('where') or 'start')\nexcept Exception:\n    vars['where'] = 'start'\n",
+                                 ('account', equals('where', 'account')), ('verify', None))
+    error = next(e for e in check(spec)['errors'] if 'tested identity check' in e)
+    assert 'by the route verify > resume > account' in error and 'No stage on that route calls verify_identity' in error
+    assert "the result the identity stages map from the tool's response" in error and 'does not close this route' in error
+    # The tool's own mapped result, in an AND with the position, is proof wherever the route stands.
+    both = lambda variable: {'logic': 'or', 'conditions': [{'logic': 'and', 'conditions': [{'variable': 'where', 'operator': 'equals', 'operand': 'account'}, {'variable': variable, 'operator': 'equals', 'operand': 'true'}]}]}
+    nodes['resume']['transitions'][0]['condition'] = both('all_verified')
+    assert check(spec)['valid'], check(spec)['errors']
+    nodes['resume']['transitions'][0]['condition'] = both('check_response.data.all_verified')
+    assert check(spec)['valid'], check(spec)['errors']
+    # A status code wrote, or the tool's variable once code elsewhere writes it too, proves nothing there.
+    nodes['resume']['transitions'][0]['condition'] = both('where_ok')
+    assert any('tested identity check' in e for e in check(spec)['errors'])
+    nodes['resume']['transitions'][0]['condition'] = both('all_verified')
+    nodes['resume']['code'] = "try:\n    vars['all_verified'] = 'true'\nexcept Exception:\n    vars['where'] = 'start'\n"
+    assert any('tested identity check' in e for e in check(spec)['errors'])
 
 
 def test_bank_tools_are_run_by_the_engine_never_offered_to_the_dialogue_model(spec, check):
@@ -226,6 +250,78 @@ def test_code_gate():
     assert not code_errors("try:\n    vars['x'] = 'known'\nexcept Exception:\n    vars['x'] = 'unknown'")
     for source in ['import os', "open('/etc/passwd')", "eval('1')", 'import datetime\ndatetime.datetime.now()', "config['url'] = 'https://evil.invalid'"]:
         assert code_errors('try:\n    ' + source.replace('\n', '\n    ') + '\nexcept Exception:\n    pass')
+
+
+def test_a_misused_controller_helper_is_a_compile_error_not_a_silent_failure(spec, contracts, check):
+    # Seen live: the result of ctl_slot unpacked into two names. The stage's own except swallowed the
+    # TypeError, identity stayed 'incomplete' for every caller, and nothing showed before a simulation.
+    def stage(body):
+        source = deepcopy(spec)
+        source['workflow']['nodes']['check']['transitions'] = [route('prepare')]
+        source['workflow']['nodes']['prepare'] = code_stage('prepare', "try:\n    " + body + "\n    vars['identity'] = 'verified' if str(vars.get('all_verified')).lower() == 'true' else 'failed'\nexcept Exception:\n    vars['identity'] = 'failed'\n",
+                                                            ('account', equals('identity', 'verified')), ('close', None))
+        return [e for e in check(source)['errors'] if 'ctl_' in e]
+    assert stage("done = ctl_slot(vars, 'dob', 'x', 'x', True, 1)") == []
+    assert stage("day = ctl_identity_date(vars.get('dob_words'))") == []
+    assert stage("day = ctl_date(said=vars.get('d'), call_now=vars.get('now'))") == []
+    assert 'returns one value' in stage("revision, complete = ctl_slot(vars, 'dob', 'x', 'x', True, 1)")[0]
+    assert 'called with 2 arguments; it takes (values, name, value, raw, complete, turn, correction)' in stage("done = ctl_slot(vars, 'dob')")[0]
+    assert 'ctl_parse_date is not defined' in stage("day = ctl_parse_date(vars.get('dob_words'))")[0]
+    # Seen live: a hook that called a helper. A hook carries the helpers it calls, as a code stage does, before or after the call.
+    hooked = deepcopy(spec)
+    tool = hooked['workflow']['nodes']['close']['pre_actions'][0]
+    tool['pre_process_code'] = "try:\n    vars['n'] = ctl_digits('one')\nexcept Exception:\n    vars['n'] = ''\n"
+    tool['post_process_code'] = "try:\n    ctl_invalidate(vars, 'p1')\nexcept Exception:\n    pass\n"
+    assert check(hooked)['valid'], check(hooked)['errors']
+    compiled = compile_workflow(hooked['workflow'], contracts)[0]
+    assert compile_workflow(compiled, contracts)[0] == compiled
+    built = compiled['nodes']['close']['pre_actions'][0]
+    for hook, value in (('pre_process_code', {'n': '1'}), ('post_process_code', {'ctl_proposals': '{}'})):
+        scope = {'vars': {}, 'config': {}, 'result': {}}
+        exec(built[hook], scope, scope)
+        assert scope['vars'] == value and built[hook].count(runtime.START) == 1
+    tool['pre_process_code'] = "try:\n    vars['n'] = ctl_parse_digits('one')\nexcept Exception:\n    vars['n'] = ''\n"
+    assert any('close/pre_process_code: ctl_parse_digits is not defined' in e for e in check(hooked)['errors'])
+
+
+def test_the_design_review_finds_what_would_only_show_in_a_call(spec, check):
+    # Seen live, 7 of 10: 'the full amount' was extracted as an exact amount without a number, the code converted
+    # the missing number, and the stage's own except closed two customers as a service error.
+    def judged(body, extracted=('amount_said',)):
+        source = deepcopy(spec)
+        source['workflow']['nodes']['verify']['extraction_schema'] += [{'name': name, 'type': 'string', 'description': 'What the caller said.', 'min_confidence': 0.7} for name in extracted]
+        source['workflow']['nodes']['check']['transitions'] = [route('prepare')]
+        source['workflow']['nodes']['prepare'] = code_stage('prepare', "try:\n" + body + "\n    vars['identity'] = 'verified' if str(vars.get('all_verified')).lower() == 'true' else 'failed'\nexcept Exception:\n    vars['identity'] = 'failed'\n",
+                                                            ('account', equals('identity', 'verified')), ('close', None))
+        result = check(source)
+        return result['errors'] + ['hint: ' + w for w in result['warnings'] if 'this stage extracts' in w or 'this code stage has' in w]
+    assert any('prepare: int() is applied to amount_said' in e and 'Test amount_said first' in e for e in judged("    cents = int(vars.get('amount_said'))"))
+    assert any('float() is applied to amount_said' in e for e in judged("    if vars.get('kind') == 'exact':\n        cents = float(str(vars.get('amount_said')))"))
+    # A test of the same value, a fallback, or a value code set itself is not a finding.
+    assert judged("    if vars.get('amount_said'):\n        cents = int(vars.get('amount_said'))") == []
+    assert judged("    cents = int(vars.get('amount_said') or 0)") == []
+    assert judged("    cents = int(vars.get('offer_cents'))") == []
+    # One reply read for nine values kept callers waiting 20 to 40 seconds a turn; five is the limit.
+    assert judged("    pass", extracted=('a', 'b', 'c', 'd')) == []
+    crowded = judged("    pass", extracted=('a', 'b', 'c', 'd', 'e'))
+    # Both shape findings are hints: they never block a design or force a rewrite of one that works.
+    assert len(crowded) == 1 and 'hint: verify: this stage extracts 6 values from one reply (dob, a, b, c, d, e)' in crowded[0] and 'at most 5' in crowded[0]
+    # A code stage that decides everything hides every mistake behind one except.
+    assert judged("\n".join("    vars['v%d'] = '%d'" % (n, n) for n in range(110))) == []
+    long = judged("\n".join("    vars['v%d'] = '%d'" % (n, n) for n in range(130)))
+    assert len(long) == 1 and 'hint: prepare: this code stage has 134 lines' in long[0] and 'at most 120 lines' in long[0]
+
+
+def test_one_malformed_fix_does_not_cost_the_whole_patch():
+    from builder.schemas import Patch
+    good = fix(('set_field', 'verify', 'task_message', 'Ask.'), problem='good')
+    big = fix(*[('set_field', 'verify', 'task_message', f'Ask {n}.') for n in range(9)], problem='nine edits')
+    slip = {'problem': 'an edit given as text', 'cases': [], 'edits': ['value_note_unused']}
+    empty = {'problem': 'no edits', 'cases': [], 'edits': []}
+    patch = Patch.model_validate_json(json.dumps({'fixes': [good, slip, big, empty, 'not a fix']})).model_dump()
+    assert [f['problem'] for f in patch['fixes']] == ['good', 'nine edits']
+    assert len(Patch.model_validate({'fixes': [good] * 40}).fixes) == 30
+    with pytest.raises(ValueError): Patch.model_validate({'fixes': 'none'})
 
 
 # ------------------------------------------------------------------ fixes
@@ -302,6 +398,35 @@ def test_a_provider_error_gets_one_more_try_and_then_fails_like_a_bad_answer(wor
     left = scripted(TimeoutError('too slow'), {'ok': True})
     with pytest.raises(TimeoutError): roles.ask('R', 'p', 'i', {}, None)
     assert left == [{'ok': True}]  # a timeout is not retried: the time is gone
+    # Seen live: the key could pay for 35151 tokens of the 60000 asked for. The second try asks for what it can pay.
+    asked = []
+    def short_of_credit(role, purpose, instruction, payload, schema, max_tokens):
+        asked.append(max_tokens)
+        if len(asked) == 1: raise RuntimeError('This request requires more credits, or fewer max_tokens. You requested up to 60000 tokens, but can only afford 35151.')
+        return {'ok': True}
+    roles._request = short_of_credit
+    assert roles.ask('R', 'p', 'i', {}, None) == {'ok': True} and asked == [60000, 34651]
+
+
+def test_every_route_asks_for_json_and_a_plain_build_needs_only_its_own_keys(monkeypatch):
+    from builder.adk import openai_strict_schema, openrouter_litellm_kwargs
+    from builder.config import BUILDER_ROLES, missing_credentials
+    from builder.schemas import Patch, RequirementsBundle, WorkflowSpec
+    from pydantic import BaseModel
+    monkeypatch.setenv('OPENROUTER_API_KEY', 'openrouter-fixture')
+    class Flat(BaseModel):
+        ok: bool
+    # A schema strict mode can express is enforced as a schema; every other answer is still forced to be JSON.
+    assert openrouter_litellm_kwargs('openrouter/any/model', Flat, 30)['response_format']['json_schema']['strict'] is True
+    for schema in (RequirementsBundle, WorkflowSpec, Patch):
+        assert not openai_strict_schema(schema.model_json_schema())
+        assert openrouter_litellm_kwargs('openrouter/any/model', schema, 30)['response_format'] == {'type': 'json_object'}
+    # The three roles of a plain build run on the builder model: the key of an unused tier is not demanded.
+    for name in ('FREYA_API_KEY', 'FREYA_BANK_TEAM_KEY', 'MODAL_BASE_URL', 'MODAL_KEY', 'MODAL_SECRET'): monkeypatch.setenv(name, 'fixture-value-0123456789')
+    for name in ('OPENROUTER_API_KEY', 'MODEL_TIER_HARD', 'MODEL_TIER_MEDIUM', 'MODEL_TIER_EASY', 'ROLE_MODELS'): monkeypatch.setenv(name, '')
+    modal = Config(builder_model='modal/Qwen/served')
+    assert missing_credentials(modal, roles=BUILDER_ROLES) == [] and missing_credentials(modal) == ['OPENROUTER_API_KEY']
+    assert missing_credentials(Config(builder_model='openrouter/any/model'), roles=BUILDER_ROLES) == ['OPENROUTER_API_KEY']
 
 
 def test_a_lock_that_never_comes_free_costs_the_budget_not_the_export(work):
@@ -439,8 +564,12 @@ def test_runtime_prelude_resolves_dates_and_is_idempotent(spec, contracts):
     w['nodes']['verify']['extraction_schema'] = [{'name': 'pay_day', 'type': 'date', 'description': 'Day offered.', 'min_confidence': 0.7}]
     w['nodes']['check']['pre_actions'][0]['bindings']['answer'] = '{{pay_day}}'
     w['nodes']['verify']['transitions'][0]['condition']['conditions'][0]['variable'] = 'pay_day'
-    w['nodes']['calc'] = code_stage('calc', "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n", ('close', None))
+    w['nodes']['account']['transitions'] = [route('calc')]
+    w['nodes']['calc'] = code_stage('calc', "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n", ('later', None))
+    w['nodes']['later'] = code_stage('later', "try:\n    vars['again'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['again'] = ''\n", ('close', None))
     once = compile_workflow(w, contracts)[0]
+    # The words are converted in the first code stage after the one that extracted them; the next one finds the day.
+    assert runtime.START not in once['nodes']['later']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
     assert compile_workflow(once, contracts)[0] == once
     item = once['nodes']['verify']['extraction_schema'][0]
     assert item['type'] == 'string' and runtime.SAID in item['description'] and runtime.SINGLE_DAY in item['description']
@@ -501,6 +630,17 @@ def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contract
     assert guard['description'] == runtime.GUARD and guard['target_node'] == 'close'
     assert guard['condition'] == {'variable': 'verify.total_turns', 'operator': 'greater_than', 'operand': 20}
     assert check(spec)['valid']
+
+
+def test_a_design_names_its_own_verified_value_but_a_failed_one_is_never_proof(spec, check):
+    # The words two live designs used, one of which scored 10 of 10. The check must not demand its own vocabulary.
+    for variable, operand in (('phone_status_route', 'all_verified'), ('identity_verified', 'yes'), ('all_verified', 'True'), ('identity', 'verified'), ('id_state', 'ok')):
+        spec['workflow']['nodes']['check']['transitions'][0]['condition'] = {'logic': 'or', 'conditions': [{'variable': variable, 'operator': 'equals', 'operand': operand}]}
+        assert check(spec)['valid'], (variable, operand, check(spec)['errors'])
+    # The way out for a caller who was not verified proves nothing, whatever it is called.
+    for variable, operand in (('identity_failed', 'yes'), ('identity', 'failed'), ('identity', 'no'), ('all_verified', 0), ('verify_error', 'timeout'), ('identity', '')):
+        spec['workflow']['nodes']['check']['transitions'][0]['condition'] = {'logic': 'or', 'conditions': [{'variable': variable, 'operator': 'equals', 'operand': operand}]}
+        assert any('tested identity check' in error for error in check(spec)['errors']), (variable, operand)
 
 
 def test_negative_identity_and_transport_success_are_not_verification(spec, check):

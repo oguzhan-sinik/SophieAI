@@ -54,6 +54,8 @@ def roles(spec, requirements, patches, seen):
         def ask(self, role, purpose, instruction, payload, schema, max_tokens=None):
             self.calls += 1
             seen.append((role, deepcopy(payload)))
+            # Designs have run to 34000 tokens; a cap below the default cuts them off and leaves no agent.
+            assert role != 'ADASDesignerAgent' or max_tokens is None or max_tokens >= 60000
             if role == 'BriefAnalystAgent':
                 bundle = deepcopy(requirements)
                 doc = payload['documents'][0]
@@ -137,7 +139,7 @@ def test_unusable_patches_are_reported_back_and_the_least_flawed_design_ships(wo
     garbled = {'fixes': [fix(('set_field', 'nowhere', 'task_message', 'x'), problem='wrong stage')]}
     builder, result, seen = build(work, spec, requirements, [garbled, {'fixes': []}], max_simulations=0)
     asked = fixes_seen(seen)
-    assert len(asked) == 2 and "Your fix 'wrong stage' was not applied" in asked[1]['problems']['compiler'][0] and 'no such stage' in asked[1]['problems']['compiler'][0]
+    assert len(asked) == 3 and "Your fix 'wrong stage' was not applied" in asked[1]['problems']['compiler'][0] and 'no such stage' in asked[1]['problems']['compiler'][0]
     assert result['status'] == 'exported_best_effort' and result['best_effort_root'] and result['candidate_id'] == result['root_candidate_id']
     assert kinds(builder) == ['design']
 
@@ -149,10 +151,10 @@ def test_design_that_freya_rejects_is_never_pinned(work, spec, requirements):
         def deploy(self, slot, workflow):
             raise AssertionError('A rejected design must not be deployed')
     reword = lambda n: {'fixes': [fix(('set_workflow_field', '', 'system_prompt', f'Follow the input policy. Attempt {n}.'))]}
-    builder, result, seen = build(work, spec, requirements, [reword(1), reword(2)], freya=RejectingFreya)
+    builder, result, seen = build(work, spec, requirements, [reword(1), reword(2), reword(3)], freya=RejectingFreya)
     assert result['status'] == 'failed' and not result['export_path'] and not (builder.root / 'pinned_root.json').exists()
     asked = fixes_seen(seen)
-    assert len(asked) == 2 and 'Freya dry-run rejected' in asked[0]['problems']['compiler'][0]
+    assert len(asked) == 3 and 'Freya dry-run rejected' in asked[0]['problems']['compiler'][0]
 
 
 def test_a_dry_run_that_gets_no_answer_is_not_a_rejection(work, spec, requirements):

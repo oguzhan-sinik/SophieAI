@@ -444,15 +444,16 @@ function benchmarkHtml(sp){
   const rows=sp.results||[]; if(!rows.length) return `<div class="warnbox">${sp.status==="running"?"Simulation still running — per-customer progress appears within a few seconds.":"No per-customer results were recorded for this test."}</div>`;
   const pass=rows.filter(r=>r.pass).length, sim=sp.simulation||{};
   return `<h3 class="sec">Result: ${pass} of ${rows.length} customers handled</h3>
-  <div class="scorebar">${rows.map(r=>`<i class="${r.pass?"p":"f"}" style="width:${100/rows.length}%" title="${esc(r.id)}"></i>`).join("")}</div>
+  <div class="scorebar">${rows.map(r=>`<i class="${r.pass?"p":"f"}" style="width:${100/rows.length}%${r.pass==null?";background:var(--unk)":""}" title="${esc(r.id)}"></i>`).join("")}</div>
   ${kvTable([["simulation",sim.id],["platform status",sim.status],["took",sim.seconds!=null?Math.round(sim.seconds)+"s":null],
     ["median slowest agent turn",sim.median_slowest_turn!=null?sim.median_slowest_turn.toFixed(1)+"s":null]])}
   <div class="meta" style="margin:8px 0 4px">${sp.transcripts?"Click a customer to read the conversation and tool calls.":"Transcripts were not captured for this test (runs made before this view existed)."}</div>
   <table class="cases">${rows.map(r=>`<tr class="case" data-case="${esc(r.id)}">
-      <td><span class="badge ${r.pass?"b-ok":"b-bad"}">${r.pass?"PASS":"FAIL"}</span></td>
-      <td class="mono">${esc(r.id)}</td><td>${esc(r.family||"")}<div class="meta">${esc(r.level||"")}</div></td>
+      <td><span class="badge ${r.pass?"b-ok":r.pass==null?"b-unk":"b-bad"}">${r.pass?"PASS":r.pass==null?"UNDECIDED":"FAIL"}</span></td>
+      <td class="mono">${esc(r.id)}</td><td>${esc(r.family||"")}<div class="meta">${esc(r.level||"")}${r.profile?" · "+esc(r.profile):""}</div></td>
       <td>${(r.tools||[]).map(x=>`<span class="chip">${esc(x)}</span>`).join("")||`<span class="meta">no tool calls</span>`}
-        ${(r.failed||[]).map(f=>`<div class="why">✗ ${esc(f)}</div>`).join("")}</td>
+        ${(r.failed||[]).map(f=>`<div class="why">✗ ${esc(f)}</div>`).join("")}
+        ${(r.unknown||[]).map(f=>`<div class="why" style="color:var(--unk)">? ${esc(f)}</div>`).join("")}</td>
       <td class="meta">${esc((r.ended||"").replace(/-/g," "))}${r.slowest_turn_s!=null?`<br>slowest turn ${r.slowest_turn_s}s`:""}</td></tr>
     <tr class="talkrow" data-for="${esc(r.id)}" style="display:none"><td colspan="5"></td></tr>`).join("")}</table>`;
 }
