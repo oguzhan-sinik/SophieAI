@@ -52,6 +52,17 @@ def doubleword_litellm_kwargs(model, schema, timeout, reasoning_effort="low"):
                 "name": schema.__name__, "schema": schema.model_json_schema()}}}
 
 
+def openrouter_litellm_kwargs(model, schema, timeout):
+    """Route openrouter/<model id> through OpenRouter's OpenAI-compatible endpoint."""
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        raise KeyError("Missing OpenRouter setting: OPENROUTER_API_KEY")
+    return {"model": "openai/" + model[len("openrouter/"):], "api_base": "https://openrouter.ai/api/v1",
+            "api_key": key, "timeout": timeout, "num_retries": 0,
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": schema.__name__, "schema": schema.model_json_schema()}}}
+
+
 def qwencloud_litellm_kwargs(model, schema, timeout):
     """Use QwenCloud's thinking default through its OpenAI-compatible API."""
     key = os.getenv("DASHSCOPE_API_KEY", "").strip()
@@ -124,6 +135,8 @@ class ADKRoles:
             kwargs = doubleword_litellm_kwargs(model, schema, self.cfg.llm_timeout, effort)
         elif model.startswith("qwencloud/"):
             kwargs = qwencloud_litellm_kwargs(model, schema, self.cfg.llm_timeout)
+        elif model.startswith("openrouter/"):
+            kwargs = openrouter_litellm_kwargs(model, schema, self.cfg.llm_timeout)
         elif "/" in model:
             kwargs = {"model": model, "timeout": self.cfg.llm_timeout, "num_retries": 0}
         if "/" in model:

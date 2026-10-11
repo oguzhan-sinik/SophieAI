@@ -76,7 +76,7 @@ class Config:
                    artifacts=writable(AGENT / os.getenv("ARTIFACTS_DIR", "artifacts")))
 
 
-PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "doubleword/": ("DOUBLEWORD_API_KEY",), "qwencloud/": ("DASHSCOPE_API_KEY",), "anthropic/": ("ANTHROPIC_API_KEY",),
+PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "doubleword/": ("DOUBLEWORD_API_KEY",), "qwencloud/": ("DASHSCOPE_API_KEY",), "openrouter/": ("OPENROUTER_API_KEY",), "anthropic/": ("ANTHROPIC_API_KEY",),
                  "gemini/": ("GOOGLE_API_KEY",), "gemini-": ("GOOGLE_API_KEY",), "openai/": ("OPENAI_API_KEY",)}
 
 
