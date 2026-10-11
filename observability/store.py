@@ -128,7 +128,7 @@ class Store:
         manifest = self._cache.get(d / "manifest.json", _load_json) or {}
         report = self._cache.get(d / "report.json", _load_json) or {}
         trace = self.trace_events(run_id)
-        started = manifest.get("start") or report.get("start")
+        started = manifest.get("start") or report.get("start") or next((e.get("at") for e in trace if e.get("event") == "run_start"), None)
         ended = report.get("end")
         last_ev = trace[-1]["at"] if trace else started
         status = report.get("status") or ("completed" if ended else "interrupted")
@@ -587,7 +587,7 @@ class Store:
                         if p.is_file():
                             sp.setdefault("artifacts", {})[suffix] = f"model_calls/{p.name}"
                 if sp["status"] == "running":
-                    sp["status"] = "interrupted"
+                    sp["status"] = "running" if self.run_summary(run_id)["status"] == "running" else "interrupted"
 
         # durations where both ends recorded
         from datetime import datetime

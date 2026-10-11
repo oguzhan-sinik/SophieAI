@@ -52,9 +52,9 @@ def call_records(folder, raw, limit=80):
 
 
 class Builder:
-    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None):
+    def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None, evaluation_provider=None, deadline=None, submission_dir=None):
         self.cfg = cfg
-        self.deadline = Deadline(cfg.max_wall_seconds, cfg.reserve)
+        self.deadline = deadline or Deadline(cfg.max_wall_seconds, cfg.reserve)
         self.run_id = time.strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
         self.root = writable(cfg.artifacts / self.run_id)
         self.root.mkdir(parents=True)
@@ -68,9 +68,12 @@ class Builder:
         self.adapter_factory, self.adapter = adapter_factory, None
         self.resume = writable(resume) if resume else None
         self.suite, self.cases = public_suite(self.documents, self.contracts['sha256'], public_brief, only, style, cfg.repetitions) if cfg.official else (None, [])
+        self.evaluation_provider = evaluation_provider
+        if evaluation_provider:
+            self.suite, self.cases = evaluation_provider.bind(self.suite, self.cases)
         # One Freya workflow per brief, updated in place on every run.
         self.slot = 'builder-' + Path(self.documents[-1]['path']).stem
-        self.submission_dir = AGENT / 'out'
+        self.submission_dir = writable(submission_dir or AGENT / 'out')
         self.requirements = None
         self.static = {}     # candidate -> result of the static checks
         self.measured = {}   # candidate -> its simulation result, in the order measured
@@ -80,7 +83,7 @@ class Builder:
         self.simulations, self.slowest, self.best_effort = 0, 0.0, False
         self.started = now()
         self.start_clock = time.monotonic()
-        write_json(self.root / 'manifest.json', {'run_id': self.run_id, 'start': self.started, 'config': asdict(cfg), 'sources': source_manifest(self.documents, self.openapi_path), 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'suite': asdict(self.suite) if self.suite else None, 'code_sha256': digest({str(p.relative_to(AGENT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((AGENT / 'builder').rglob('*.py'))})})
+        write_json(self.root / 'manifest.json', {'run_id': self.run_id, 'start': self.started, 'config': asdict(cfg), 'sources': source_manifest(self.documents, self.openapi_path), 'brief_hash': self.brief_hash, 'openapi_hash': self.contracts['sha256'], 'suite': asdict(self.suite) if self.suite else None, 'evaluation_provider': evaluation_provider.manifest() if evaluation_provider else None, 'code_sha256': digest({str(p.relative_to(AGENT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((AGENT / 'builder').rglob('*.py'))})})
         write_json(self.root / 'sources.json', [{'path': d['path'], 'text': d['text']} for d in self.documents], immutable=True)
         write_json(self.root / 'tool_contracts.json', self.contracts, immutable=True)
         write_json(self.root / 'openapi.input.json', json.loads(self.openapi_path.read_text()), immutable=True)
@@ -244,7 +247,7 @@ class Builder:
     def simulation_fits(self, extra=0):
         """Never start a simulation that cannot finish inside the build budget."""
         return bool(self.suite) and self.simulations + self.suite.repetitions <= self.cfg.max_simulations and \
-            self.deadline.remaining() >= extra + 1.2 * (self.slowest or FIRST_SIMULATION) * self.suite.repetitions
+            self.deadline.remaining() >= extra + 1.2 * (self.slowest or (self.evaluation_provider.seconds_per_repetition if self.evaluation_provider else FIRST_SIMULATION)) * self.suite.repetitions
 
     def deploy(self, cid):
         """Publish a candidate and keep a verified export of it, so a later outage cannot leave the build with nothing."""
@@ -260,7 +263,7 @@ class Builder:
         try:
             self.deploy(cid)
             self.simulations += self.suite.repetitions
-            raw = self.adapter.evaluate(self.cases, self.suite, folder)
+            raw = self.evaluation_provider.evaluate(self.archive.workflow(cid), self.adapter, folder, self.roles, self.deadline) if self.evaluation_provider else self.adapter.evaluate(self.cases, self.suite, folder)
         except Exception as exc:
             self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])
             saved = folder / 'raw_runner.json'
@@ -273,16 +276,23 @@ class Builder:
         findings = {row['id']: row.get('failed', []) for rows in raw.get('all_rows', []) for row in rows if row.get('pass') is not True}
         # The evidence stays with the candidate it was observed on: a fix is only ever shown calls of the workflow it edits.
         self.measured[cid] = {'score': frozen, 'verdicts': verdicts(raw, self.suite), 'visited': visited, 'failed_calls': failed, 'findings': findings}
+        if self.evaluation_provider and hasattr(self.evaluation_provider, 'feedback'):
+            feedback = self.evaluation_provider.feedback(digest(self.archive.workflow(cid)))
+            for key in ('verdicts', 'visited', 'failed_calls', 'findings'):
+                self.measured[cid][key].update(feedback.get(key, {}))
         self.checkpoint(cid)
         return frozen.complete
 
     def champion(self, root_id):
         """The best measured candidate, later one on a tie, with its wording-only child when it has one."""
-        complete = [cid for cid, result in self.measured.items() if result['score'].complete]
+        complete = [cid for cid, result in self.measured.items() if result['score'].complete and not self.vetoed(cid)]
         if not complete:
-            return root_id
+            return None if self.vetoed(root_id) else root_id
         best = max(complete, key=lambda cid: (self.measured[cid]['score'].passed, complete.index(cid)))
         return self.wording.get(best, best)
+
+    def vetoed(self, cid):
+        return bool(self.evaluation_provider and self.evaluation_provider.vetoed(digest(self.archive.workflow(cid))))
 
     def checkpoint(self, root_id):
         self.archive.checkpoint(champion_id=self.champion(root_id), active_deployment_id=self.adapter.deployment if self.adapter else None)
@@ -297,13 +307,15 @@ class Builder:
         barren = 0
         while not all(known.values()):
             simulate = self.simulation_fits(FIX_SECONDS)
+            if not simulate and self.evaluation_provider:
+                break
             if not simulate:
                 # No simulation fits any more. Wording can still be committed, onto what will be exported.
                 if self.deadline.remaining() < FIX_SECONDS:
                     break
                 base = self.champion(root_id)
                 known, calls, findings = evidence(base)
-            failed = [case for case, ok in known.items() if not ok]
+            failed = [case for case, ok in known.items() if not ok and (ok is not None or not self.evaluation_provider)]
             if not failed:
                 break
             source = self.archive.source(base)
@@ -332,7 +344,7 @@ class Builder:
             barren = 0
             wording = is_wording(source, fixed)
             child = self.record(fixed, workflow, result, parent=base, patch={'fixes': applied}, kind='wording' if wording else 'fixes')
-            if wording and base in self.measured:
+            if wording and base in self.measured and not self.evaluation_provider:
                 # Decided for this build: a change to what the agent is told or says is committed onto a
                 # measured agent without spending a simulation on it. Nothing new is learned without a
                 # simulation, so this is where improving ends.
@@ -396,16 +408,18 @@ class Builder:
                     self.trace.event('improvement_stopped', error=type(exc).__name__, message=error)
                 finally:
                     champion = self.champion(root_id)
+                    if champion is None:
+                        raise ValueError('No eligible candidate: calibrated critical failures vetoed all tested candidates; exports retained for inspection')
                     self.adapter.exporting = True
                     workflow = self.archive.workflow(champion)
                     try:
                         self.adapter.deploy(self.slot, workflow)
                         exported = self.adapter.export(workflow, self.root / 'champion.workflow.json')
-                        restored = True
+                        restored = not getattr(self.adapter, "local", False)
                     except Exception as exc:
                         # Freya is unreachable. A measured candidate was exported when it was deployed:
                         # submit that verified file, and say plainly that the live workflow was not restored.
-                        measured = [cid for cid in self.measured if cid in self.exports]
+                        measured = [cid for cid in self.measured if cid in self.exports and self.measured[cid]['score'].complete and not self.vetoed(cid)]
                         fallback = champion if champion in self.exports else max(measured, key=lambda cid: self.measured[cid]['score'].passed) if measured else None
                         if not fallback:
                             raise
@@ -432,8 +446,10 @@ class Builder:
             statuses = [entry['status'] for entry in self.history]
             result = {'run_id': self.run_id, 'workflow_id': deployment.get('workflow_id') if deployment else None, 'agent_id': deployment.get('agent_id') if deployment else None,
                       'candidate_id': champion, 'root_candidate_id': root_id, 'export_path': exported, 'remote_restored': restored,
+                      'export_type': 'local_compiled' if getattr(self.adapter, 'local', False) else 'freya_export',
                       'evaluation_type': final.evidence_type if final else 'unknown', 'strict_pass_rate': final.strict_pass_rate if final else None,
                       'root_score': asdict(self.measured[root_id]['score']) if root_id in self.measured else None, 'final_score': asdict(final) if final else None,
+                      'synthetic_evidence': self.evaluation_provider.manifest() if self.evaluation_provider else None,
                       'wording_untested': bool(champion) and champion not in self.measured and scored is not None,
                       'status': status if exported else 'failed', 'best_effort_root': self.best_effort, 'error': error, 'start': self.started, 'end': now(),
                       'seconds': round(time.monotonic() - self.start_clock, 2), 'simulations': self.simulations, 'candidates': len(self.static),

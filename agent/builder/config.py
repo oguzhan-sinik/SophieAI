@@ -1,4 +1,4 @@
-"""Validated configuration; every writable path is constrained to agent/."""
+"""Validated configuration; writable paths stay inside the two builder directories."""
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -6,12 +6,13 @@ import time
 
 AGENT = Path(__file__).resolve().parents[1]
 KIT = AGENT.parent
+GENERALISATION = KIT / "generalisation_agent"
 
 
 def writable(path):
     path = Path(path).resolve()
-    if not path.is_relative_to(AGENT):
-        raise ValueError(f"Output must stay inside {AGENT}: {path}")
+    if not any(path.is_relative_to(root) for root in (AGENT, GENERALISATION)):
+        raise ValueError(f"Output must stay inside {AGENT} or {GENERALISATION}: {path}")
     return path
 
 
@@ -47,6 +48,7 @@ class Config:
     official: bool = True
     tracing: bool = True
     artifacts: Path = AGENT / "artifacts"
+    runtime: Path = AGENT / ".runtime"
 
     def __post_init__(self):
         if not 30 <= self.max_wall_seconds <= 1800:
@@ -59,6 +61,7 @@ class Config:
         if self.max_simulations < 0:
             raise ValueError("Simulation budget cannot be negative")
         writable(self.artifacts)
+        writable(self.runtime)
 
     @classmethod
     def from_env(cls):
@@ -73,7 +76,7 @@ class Config:
                    artifacts=writable(AGENT / os.getenv("ARTIFACTS_DIR", "artifacts")))
 
 
-PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "anthropic/": ("ANTHROPIC_API_KEY",),
+PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "doubleword/": ("DOUBLEWORD_API_KEY",), "qwencloud/": ("DASHSCOPE_API_KEY",), "anthropic/": ("ANTHROPIC_API_KEY",),
                  "gemini/": ("GOOGLE_API_KEY",), "gemini-": ("GOOGLE_API_KEY",), "openai/": ("OPENAI_API_KEY",)}
 
 

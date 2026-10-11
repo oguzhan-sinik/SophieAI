@@ -120,7 +120,7 @@ def compact_call(call):
 class FreyaAdapter:
     def __init__(self, cfg, deadline, trace):
         self.cfg, self.deadline, self.trace = cfg, deadline, trace
-        self.runtime = writable(AGENT / ".runtime")
+        self.runtime = writable(cfg.runtime)
         self.runtime.mkdir(exist_ok=True)
         if not os.getenv("FREYA_API_KEY"):
             raise ValueError("FREYA_API_KEY is required for real deployment")
@@ -157,9 +157,10 @@ class FreyaAdapter:
 
         Nothing here waits for a simulation an earlier build left running. The kit client already
         waits at the moment it starts one, and a build that starts none must not wait at all."""
-        with file_lock(self.runtime / "workspace.lock", self.deadline) as held:
+        with file_lock(AGENT / ".runtime" / "workspace.lock", self.deadline) as held:
             if not held:
                 self.trace.event("workspace_lock_unavailable", reason="another build held it until this build's budget ran out")
+                raise TimeoutError("Workspace lock unavailable; no deployment or simulation permitted")
             yield self
 
     def validate_remote(self, workflow):

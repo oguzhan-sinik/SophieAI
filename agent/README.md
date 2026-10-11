@@ -25,6 +25,32 @@ Modal (`MODAL_BASE_URL`, `MODAL_KEY`, `MODAL_SECRET`); any LiteLLM model name wo
 `BUILDER_MODEL`. The builder names any missing key and exits with code 2 before doing any work.
 Settings resolve as process environment > `agent/.env` > root `.env` > root `env.sh` > defaults.
 
+QwenCloud is selected in the environment templates and the local `env.sh`. Add
+`DASHSCOPE_API_KEY` to `env.sh`; `BUILDER_MODEL=qwencloud/qwen3.8-max-0902` routes the
+exact model ID to `https://maas.qwencloudapi.com/compatible-mode/v1` (override with
+`QWENCLOUD_BASE_URL`). Requests stream with `enable_thinking=true` and the provider's
+default reasoning budget for every role. Each QwenCloud call allows at least 65,536 total
+completion tokens, including reasoning, within the existing call/build timeouts.
+Only the final answer enters JSON validation;
+dashboard observations publish progress and token usage. QwenCloud documents its
+[compatible API](https://docs.qwencloud.com/api-reference/chat/openai-chat) and
+[structured outputs](https://docs.qwencloud.com/developer-guides/text-generation/structured-output).
+Existing provider settings remain available by changing `BUILDER_MODEL`.
+
+Doubleword is an optional provider through the same ADK/LiteLLM client. Put your key in
+`DOUBLEWORD_API_KEY` in `env.sh`; `DOUBLEWORD_BASE_URL` defaults to `https://api.doubleword.ai/v1`.
+Select it for a test run without changing the saved provider selection:
+
+```sh
+GENERALISATION_ENABLED=true BUILDER_MODEL=doubleword/zai-org/GLM-5.3-Flash python3 -m generalisation_agent generate --seed 42 --packs 2 --users 10
+```
+
+The `doubleword/` prefix is
+local routing metadata; the API receives `zai-org/GLM-5.3-Flash`. Requests use Doubleword's
+[OpenAI-compatible structured outputs](https://docs.doubleword.ai/inference-api/tool-calling).
+Existing Modal, OpenAI, Anthropic and Gemini settings remain available. No extra SDK is needed.
+Doubleword brief writing/checking uses medium reasoning effort; other roles use low effort.
+
 Options: `--only PUB-01,PUB-03` and `--style pieces` select practice customers and how they
 talk; `--resume-run agent/artifacts/<run_id>` reuses that run's rules and first design.
 

@@ -13,6 +13,9 @@ python3 -m observability.serve --artifacts-dir agent/artifacts
 `--artifacts-dir` defaults to `$OBS_ARTIFACTS_DIR` → `$ARTIFACTS_DIR` → `agent/artifacts`.
 Non-loopback bind is refused (ticket §10).
 
+Synthetic runs appear as `synthetic_<run>` in the same picker. Their progress traces expose
+model-call timing and token usage; prompts, responses and holdout evidence stay private.
+
 Offline demo (no Freya/LLM/credentials):
 
 ```bash

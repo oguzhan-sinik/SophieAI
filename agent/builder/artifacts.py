@@ -70,6 +70,7 @@ class Trace:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.redact = Redactor()
         self.metadata = metadata
+        self.observer = None
         self.remote = None
         self.stack = []
         if remote and os.getenv("LANGSMITH_API_KEY"):
@@ -88,6 +89,9 @@ class Trace:
             stream.write(encoded(record) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+
+        if self.observer:
+            self.observer(record)
 
     @contextmanager
     def span(self, name, **values):
