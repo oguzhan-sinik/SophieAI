@@ -10,9 +10,36 @@ settle a contradiction merely because one paragraph is later. Input variables co
 Keep fields concise.
 """
 
+CONTRACT = """Write the OpenAPI 3.0 document of the bank services a phone agent calls during a call, from the
+supplied bank documents. They describe those services in prose, tables or examples, in any language.
+One operation for each service the documents describe as callable during a call, and no other.
+operationId is the service's name exactly as documented. The HTTP method and path are the documented
+ones; where the documents give none, POST and the path /<operationId>. requestBody: an object
+schema with every documented field, its type, its allowed values as enum, format date for calendar
+dates, and required for the fields documented as mandatory. responses.200: an object schema with
+every documented response field and its type; a documented list of objects is an array with its
+item fields. Put each field's documented meaning in its description, in the documents' own words.
+servers: one entry with the supplied server URL. No security schemes and no path, query or header
+parameters: a documented value passed in the path or the query is written as a body field of the
+same name. Invent nothing: no operation, field, value or default the documents do not state.
+compiler_errors lists what was wrong with your previous answer; correct exactly that.
+List in notes what the documents leave unclear about a service.
+"""
+
 # How to write a workflow or any part of one. Shared by the designer and by every fix.
 RULES = """All money, dates, enums, names, attempts and outcomes must come from the source documents or
-from live bank responses. Call now is the date anchor; never the host or system clock.
+from live bank responses. Call now is the date anchor; never the host or system clock. Documents that
+list single customers, accounts or example conversations show the data and the way people speak:
+nothing about one customer (a name, a number, an amount, a date) is written into the workflow.
+
+LANGUAGE. The agent speaks the language the source documents are written in and their example
+conversations use. Every spoken line is in that language: fixed tts text, terminal messages and
+whatever a task_message tells the agent to say; system_prompt names the language and keeps the agent
+in it. Stage names, variable names, enum values, tool fields and outcome codes keep the exact
+spelling the sources and the contract give them and are never translated. Every example in these
+rules is English and only an illustration: never copy its wording, write what it stands for in the
+language of the call. Extraction descriptions say, for each value, what the caller says for it in
+that language. The controller helpers read English and Turkish.
 
 WORKFLOW SOURCE. You write a compact source; the controller compiles it for the platform.
 Stages are conversation, api_request, code and end_call nodes under workflow.nodes, each with a name
@@ -34,8 +61,9 @@ Omit unused keys. Never write URLs, headers, request schemas, type or config: th
 them from the contract and sets zero retries. customer_id is bound automatically. Product ids come
 only from account data. Every other required field needs a binding to a variable that an extraction
 or a code stage has set; a payment or callback day is bound to its date-typed extraction
-variable and a security date to the variable a code stage set with ctl_identity_date, never to
-free text. Post hooks may add a truthful
+variable, an amount to a variable a code stage set as a number, a security number to the variable
+ctl_collect completed and a security date to the variable a code stage set with ctl_identity_date,
+never to free text. Post hooks may add a truthful
 what_to_do_next to result['data'] and read or write vars; they never change what a tool returned.
 
 Code stage: {"name":"...","node_type":"code","code":"<Python source>","transitions":[...]}.
@@ -80,7 +108,11 @@ verified: a mapped response variable (all_verified equals true), the flattened
 <stage>_response.data.* value, or a status that a code stage derives from that response (equals
 verified). is_set, an HTTP status code, a success or failure counter, a turn count and a test for a
 failed result are not proof. What the caller says is never proof of identity: no alternative of
-such a route may test an extracted value.
+such a route may test an extracted value. A stage that can be entered both before and after identity
+(one that answers a question or a request for a person and then returns the caller to where the call
+was) leads back into the stages after identity only on a transition that tests the identity tool's
+own mapped result (all_verified equals true), in an AND with the remembered position; a remembered
+position alone is not proof, and neither is a status code wrote somewhere else.
 
 TOOL RESULTS. response_mapping stores scalar fields only. For a list or object field (for example
 the account's product list) still declare the mapping; the controller delivers that variable to code
@@ -92,16 +124,45 @@ built from values that may be empty. An engine-run call
 flattens its result under <stage name>_response.data.*, a model-called tool under
 <tool name>_response.data.*; prefer mapped variables in routes.
 
-HUMAN SPEECH. Callers split answers across turns, ask questions, correct themselves and mention
-unrelated numbers/dates. Spread what follows over stages, one question per conversation stage and
-one decision per code stage; never build one stage that handles every kind of reply. Keep one pending slot, its ordered fragments, raw words, completeness,
-source turn and revision. Never pad missing digits or guess a birth year. Security dates need an
-explicit year; capture partial security dates as strings, clarify, and assemble before verification.
-Ask only for the missing part. Answer questions safely, then resume; a question, tangent or brief
-acknowledgement is not consent or a refusal. Latest explicit self-correction wins. Clarify ambiguous
-product references; never copy a loan correction onto the card. Preserve known amount while asking
-for an uncertain date. Do not extract the first date/money from an unrelated story.
-The runtime also provides ctl_digits(said) (ordered digit words, preserves zeros),
+HUMAN SPEECH. Callers talk like people, and the customers this agent is tested with do all five of
+the things below. Spread what follows over stages, one question per conversation stage and one
+decision per code stage; never build one stage that handles every kind of reply.
+1. A number in two parts ("463", then "51"). The stage that asks for a number extracts only what
+this reply says of it, as a string of the caller's own words: digits or words, never completed and
+never joined with an earlier part by the extraction model. A code stage passes those words to
+ctl_collect(vars, name, said, count), count being the length the source states. It joins the parts
+in order, keeps zeros, and returns the number only when it is whole. While <name>_complete is no the
+agent asks for the rest only and no tool is called. <name>_heard no means this reply held no digits
+(a question, a hold): answer or wait, then ask again; it is not a wrong answer and costs no attempt.
+Where the source states no length, ask for the whole number in one piece. A date in two parts (day
+and month, then the year) is kept the same way: join the words of the parts in order and call
+ctl_identity_date on them; it returns '' until day, month and year are all there. Never pad missing
+digits or guess a year. Ask only for the missing part.
+2. Corrections ("the 21st, sorry, the 20th"). The last value said is the value. The helpers read
+what follows a correction word first, so give them the caller's whole reply. A correction to a value
+that was read back or agreed makes the old agreement void: new read-back, new explicit yes. "Yes,
+but ..." is a correction, not a yes. Clarify ambiguous product references; never copy a loan
+correction onto the card. Preserve a known amount while asking for an uncertain date.
+3. Other things. A caller tells a story with a number or a day in it (what was paid last week, a
+wedding on the 30th). It is not an answer: extract nothing from it, reply in one short line, ask the
+pending question again. Only what the caller proposes in answer to this stage's question is a value.
+4. A question back ("why do you need that?", "which account?", "are you a robot?"). Every stage
+that asks something has a reply value for a question; it gets one safe line of answer and then the
+same question again. A question, a hold ("one moment") and a bare acknowledgement ("ok", "I see")
+are none of answer, refusal or consent, and they use up no attempt of any kind.
+5. Amounts and dates in words ("four hundred and fifty-five", "the twenty-second of October").
+Never let the extraction model do arithmetic on spoken words or turn words into a calendar date.
+Declare a day as extraction type date and an amount as extraction type amount: the controller
+captures the caller's words and converts them before any code runs (DATES AND AMOUNTS below).
+A reply cut off mid-sentence gives what it completes: keep that, ask only for what is missing.
+A value that holds the caller's own words (not one of a list) gets min_confidence 0.4 at most: a
+long string of copied words scores low, a discarded capture looks to the stage like silence, and the
+code checks the words anyway. The task_message of a stage that asks again names the thing asked for
+in full each time ("the date of birth"), never only "the missing part".
+The runtime provides ctl_digits(said, count=0) (digits in order however they were said: one by one,
+in groups, as numerals; zeros kept; '' when another word is among them),
+ctl_collect(vars, name, said, count) (above),
+ctl_amount(said) (an amount in words or digits as text like 1250.50, '' when there is no single amount),
 ctl_identity_date(said) (complete identity date only, never substitutes a year),
 ctl_slot(vars,name,value,raw,complete,turn,correction=False) (an incomplete value becomes '' and
 <name>_complete becomes no: route on <name>_complete equals yes, never on is_set),
@@ -114,8 +175,8 @@ including "yes, but...", invalidates old consent. Require ctl_write_ready plus s
 before each write. These helpers do not enforce the bank's policy. For grouped consent check every
 named member's current revision and source permission; no blanket yes for other products.
 
-DATES. The controller provides these functions inside every code stage; use them and never write
-your own calendar loop or spoken-date parser. weekdays is the list of business weekdays with
+DATES AND AMOUNTS. The controller provides these functions inside every code stage; use them and
+never write your own calendar loop, spoken-date parser or number-word parser. weekdays is the list of business weekdays with
 Monday=0 and excluded the list of non-business ISO dates, both always taken from the source:
   ctl_is_business_day(day, weekdays, excluded) -> True/False
   ctl_add_business_days(day, count, weekdays, excluded) -> the count-th business day after day
@@ -135,6 +196,13 @@ extracts the date there, routes a vague answer through its own listed value, and
 before any is_set route on the date. Treat '' as not given and follow the source rule for a missing
 or vague day; never substitute a default silently. Where the source prescribes its own reading of a
 phrase, call ctl_date on <name>_said in code. Do not use platform date placeholders.
+An amount the caller gives is declared as extraction type amount (the controller's own type). It is
+captured as the caller's words and, before any code stage or bound tool call, replaced by the number
+as text with two decimals (1250.50), with <name>_said keeping the words; or by '' when the words
+hold no single amount: a reference without a number (the full amount, the minimum), two amounts, or
+a split that can be read two ways. Code tests it before float(). A reference is settled from what
+the stage offered; '' without a reference is one question back for the amount in one piece. Amount
+words given over two turns are joined in order and passed to ctl_amount.
 
 OFFERS AND WRITES. Never replace a value the customer gave without their agreement. When code must
 change or reject a day or an amount, it sets a status variable and the proposed alternative and
@@ -142,7 +210,9 @@ routes to a conversation stage that states the reason and offers the alternative
 its own route, tested before the generic success route. When the customer accepts an offered
 alternative, the accepting route first passes a code stage that copies the offered value into the
 variable the check reads; routing an acceptance straight back into the check changes nothing and
-loops. Only an accepted value reaches the read-back and the write. A read-back states exactly the
+loops. Only an accepted value reaches the read-back and the write. An acceptance that repeats the
+offered values ("I accept 540 on the 27th") is an acceptance when the values equal the offer:
+compare them in code, do not treat it as a new proposal. A read-back states exactly the
 variables the write tool is bound to. A stage that speaks after a check receives the outcome through
 variables in its task_message and never confirms what the check rejected. Say that something is
 recorded, booked or transferred only in the stage after the tool that did it succeeded; in every
@@ -151,7 +221,14 @@ it: before that event the agent does not say that word at all, not even about so
 because a checker looks for the word itself. Where the source also asks for an earlier sentence
 that would use it (a notice that the call is recorded, when "recorded" is reserved for a
 successful write), keep the meaning and change the words: "we are recording this call". After a failed write, apologise in neutral words. Retry a write
-only where the source permits it and the failure is known.
+only where the source permits it and the failure is known. A caller may ask or assume that
+something was recorded ("you have noted it, haven't you?"): the answer comes from the tool's result
+variable only. system_prompt says, in the language of the call, that the agent never states that
+something was recorded, booked, sent or transferred unless the instructions of the current stage
+say the tool confirmed it.
+A stage that needs no answer does not wait for one: after a line that asks nothing (a confirmation,
+a goodbye) its last transition is always and leads on, so any reply moves the call. Every value in
+enum_values either has a transition or is meant to keep the caller in the stage.
 
 Keep explicit state for confirmation before writes, corrections, per-product attempts, retry limits
 and duplicate prevention. Speak or move on after every tool result.

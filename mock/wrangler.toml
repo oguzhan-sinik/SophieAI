@@ -1,0 +1,12 @@
+name = "freya-bank-mock"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+
+# One Durable Object for each call: its state is the call's, and a read sees the write before it.
+[[durable_objects.bindings]]
+name = "SESSION"
+class_name = "Session"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Session"]

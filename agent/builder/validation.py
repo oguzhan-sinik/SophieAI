@@ -71,8 +71,7 @@ def review_code(compiled, spoken=()):
         name = node.func.id
         if name.startswith("ctl_"):
             if name not in HELPERS or name not in present:
-                found.append(f"{name} is not defined" + (" here: the controller compiles its helpers into code stages, and into a hook only where a date is bound; do this work in a code stage"
-                                                         if name in HELPERS else "; the controller provides " + ", ".join(sorted(HELPERS))))
+                found.append(f"{name} is not defined" + (" here" if name in HELPERS else "; the controller provides " + ", ".join(sorted(n for n in HELPERS if "_tr" not in n))))
                 continue
             arguments = HELPERS[name].args
             takes = [a.arg for a in arguments.args]
@@ -172,21 +171,24 @@ def _leaves(condition):
             yield condition
 
 
-def _is_proof(condition, spoken):
+def _is_proof(condition, spoken, owned=None):
     """A route that can only fire on something the caller cannot simply say: a tool result or a value code derived.
 
     Every alternative of an OR has to be such a test, since one spoken alternative is a way round
-    the others; within an AND one is enough."""
+    the others; within an AND one is enough. With `owned`, the test must be on a variable only the
+    identity tool's own result fills: that is proof wherever in the call the route stands."""
     if not isinstance(condition, dict):
         return False
     if condition.get("conditions"):
-        checks = [_is_proof(child, spoken) for child in condition["conditions"]]
+        checks = [_is_proof(child, spoken, owned) for child in condition["conditions"]]
         return all(checks) if condition.get("logic") == "or" else any(checks)
     # Proof is `equals` against a value that means verified, on a variable the caller cannot fill by
     # speaking. Which word a design uses for "verified" is its own choice (true, yes, verified,
     # all_verified, ...); what is ruled out is what can never mean it: a failed value, a variable that
     # names the failure, that a variable merely is set, and the transport's status code or counters.
     variable = str(condition.get("variable") or "")
+    if owned is not None and not owned(variable):
+        return False
     return (bool(variable) and variable not in spoken and
             not variable.endswith(("_turns", "_status_code", "_success_count", "_failure_count")) and
             not NEGATIVE_NAME.search(variable.lower()) and
@@ -424,6 +426,13 @@ def validate(workflow, contracts):
         errors.append("Unreachable nodes: " + str(sorted(set(nodes) - reachable)) + "; give each a transition from the stage that should lead to it, or remove it")
     # Identity before account data, read from the routes themselves. Every route to a protected tool
     # must call the identity tool and afterwards branch on something the caller cannot simply say.
+    # What only the identity tool fills: the variables its stages map from the response, unless code elsewhere writes them too.
+    identity_stages = [key for key, names in calls.items() if IDENTITY in names]
+    elsewhere = set().union(*(_variable_use(node)[0] for key, node in nodes.items() if key not in identity_stages)) if nodes else set()
+    # Only what every identity stage maps: the result of one question alone is not the result of the check.
+    per_stage = [{m.get("variable") for m in nodes[key].get("response_mapping", [])} for key in identity_stages]
+    mapped = (set.intersection(*per_stage) if per_stage else set()) - elsewhere - spoken
+    owned = lambda variable: variable in mapped or any(variable.startswith(stage + "_response.data.") for stage in identity_stages)
     for operation in [op for op in PROTECTED if IDENTITY in contracts["operations"] and any(op in names for names in calls.values())]:
         pending, seen = deque([(initial, None, False, [])] if initial in nodes else []), set()
         while pending:
@@ -433,9 +442,13 @@ def validate(workflow, contracts):
             seen.add((key, checked_at is not None, tested))
             path = path + [key]
             if operation in calls[key] and not tested:
-                route = " > ".join(path[-8:])
+                # A long route is shown by both ends: where it leaves the start of the call says how it got round identity.
+                route = " > ".join(path if len(path) <= 12 else path[:5] + ["..."] + path[-6:])
                 errors.append(f"{key}: {operation} can be reached without a tested identity check, by the route {route}. " + (
-                    f"No stage on that route calls {IDENTITY}." if checked_at is None else
+                    f"No stage on that route calls {IDENTITY}. A stage a caller can reach before identity (a help, resume or turn-cap stage) leads "
+                    f"into the stages that follow it: make that transition test, with equals, the result the identity stages map from the tool's response "
+                    f"that means every check passed (not a status code wrote), in an AND with whatever else it tests, "
+                    f"or send it back through the identity stages. Changing {key} or the stage just before it does not close this route." if checked_at is None else
                     f"After {IDENTITY} in {checked_at} no transition on that route proves its result. Make the way out of {checked_at} (or of the code stage "
                     f"that reads its response) test, with equals, the value that means verified: a mapped response variable (all_verified equals true) or a status "
                     f"a code stage derives from the response (equals verified). is_set, an HTTP status code, a success or failure counter, a turn count, a value "
@@ -444,7 +457,7 @@ def validate(workflow, contracts):
             if IDENTITY in calls[key]:
                 checked_at, tested = key, False
             for target, condition in edges[key]:
-                pending.append((target, checked_at, tested or (checked_at is not None and _is_proof(condition, spoken)), path))
+                pending.append((target, checked_at, tested or (checked_at is not None and _is_proof(condition, spoken)) or _is_proof(condition, spoken, owned), path))
     # close_call must be isolated from other bank actions and cannot lead back to one.
     for key, names in calls.items():
         if "close_call" not in names:

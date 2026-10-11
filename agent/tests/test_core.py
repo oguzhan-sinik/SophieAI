@@ -167,6 +167,30 @@ def test_identity_is_read_from_the_routes(spec, check):
     assert any('promise: create_promise can be reached' in e and 'After verify_identity in again' in e for e in check(spec)['errors'])
 
 
+def test_a_stage_reached_before_identity_returns_to_the_stages_after_it_only_on_the_tools_own_result(spec, check):
+    # Seen live, 10 of 10 and still flagged: a stage that answers a request for a person and then returns the caller
+    # to where the call was. It can be entered before identity, so the position it remembers proves nothing.
+    nodes = spec['workflow']['nodes']
+    nodes['verify']['transitions'].insert(0, route('resume', equals('dob', 'help')))
+    nodes['resume'] = code_stage('resume', "try:\n    vars['where'] = str(vars.get('where') or 'start')\nexcept Exception:\n    vars['where'] = 'start'\n",
+                                 ('account', equals('where', 'account')), ('verify', None))
+    error = next(e for e in check(spec)['errors'] if 'tested identity check' in e)
+    assert 'by the route verify > resume > account' in error and 'No stage on that route calls verify_identity' in error
+    assert "the result the identity stages map from the tool's response" in error and 'does not close this route' in error
+    # The tool's own mapped result, in an AND with the position, is proof wherever the route stands.
+    both = lambda variable: {'logic': 'or', 'conditions': [{'logic': 'and', 'conditions': [{'variable': 'where', 'operator': 'equals', 'operand': 'account'}, {'variable': variable, 'operator': 'equals', 'operand': 'true'}]}]}
+    nodes['resume']['transitions'][0]['condition'] = both('all_verified')
+    assert check(spec)['valid'], check(spec)['errors']
+    nodes['resume']['transitions'][0]['condition'] = both('check_response.data.all_verified')
+    assert check(spec)['valid'], check(spec)['errors']
+    # A status code wrote, or the tool's variable once code elsewhere writes it too, proves nothing there.
+    nodes['resume']['transitions'][0]['condition'] = both('where_ok')
+    assert any('tested identity check' in e for e in check(spec)['errors'])
+    nodes['resume']['transitions'][0]['condition'] = both('all_verified')
+    nodes['resume']['code'] = "try:\n    vars['all_verified'] = 'true'\nexcept Exception:\n    vars['where'] = 'start'\n"
+    assert any('tested identity check' in e for e in check(spec)['errors'])
+
+
 def test_bank_tools_are_run_by_the_engine_never_offered_to_the_dialogue_model(spec, check):
     nodes = spec['workflow']['nodes']
     nodes['verify']['tools'] = [bank('verify_identity', {'all_verified': 'all_verified'})]
@@ -222,10 +246,21 @@ def test_a_misused_controller_helper_is_a_compile_error_not_a_silent_failure(spe
     assert 'returns one value' in stage("revision, complete = ctl_slot(vars, 'dob', 'x', 'x', True, 1)")[0]
     assert 'called with 2 arguments; it takes (values, name, value, raw, complete, turn, correction)' in stage("done = ctl_slot(vars, 'dob')")[0]
     assert 'ctl_parse_date is not defined' in stage("day = ctl_parse_date(vars.get('dob_words'))")[0]
-    # A hook has the helpers only when the controller compiled them in; a call that would not resolve is named too.
+    # Seen live: a hook that called a helper. A hook carries the helpers it calls, as a code stage does, before or after the call.
     hooked = deepcopy(spec)
-    hooked['workflow']['nodes']['close']['pre_actions'][0]['pre_process_code'] = "try:\n    vars['n'] = ctl_digits('one')\nexcept Exception:\n    vars['n'] = ''\n"
-    assert any('close/pre_process_code: ctl_digits is not defined' in e for e in check(hooked)['errors'])
+    tool = hooked['workflow']['nodes']['close']['pre_actions'][0]
+    tool['pre_process_code'] = "try:\n    vars['n'] = ctl_digits('one')\nexcept Exception:\n    vars['n'] = ''\n"
+    tool['post_process_code'] = "try:\n    ctl_invalidate(vars, 'p1')\nexcept Exception:\n    pass\n"
+    assert check(hooked)['valid'], check(hooked)['errors']
+    compiled = compile_workflow(hooked['workflow'], contracts)[0]
+    assert compile_workflow(compiled, contracts)[0] == compiled
+    built = compiled['nodes']['close']['pre_actions'][0]
+    for hook, value in (('pre_process_code', {'n': '1'}), ('post_process_code', {'ctl_proposals': '{}'})):
+        scope = {'vars': {}, 'config': {}, 'result': {}}
+        exec(built[hook], scope, scope)
+        assert scope['vars'] == value and built[hook].count(runtime.START) == 1
+    tool['pre_process_code'] = "try:\n    vars['n'] = ctl_parse_digits('one')\nexcept Exception:\n    vars['n'] = ''\n"
+    assert any('close/pre_process_code: ctl_parse_digits is not defined' in e for e in check(hooked)['errors'])
 
 
 def test_the_design_review_finds_what_would_only_show_in_a_call(spec, check):
@@ -342,6 +377,14 @@ def test_a_provider_error_gets_one_more_try_and_then_fails_like_a_bad_answer(wor
     left = scripted(TimeoutError('too slow'), {'ok': True})
     with pytest.raises(TimeoutError): roles.ask('R', 'p', 'i', {}, None)
     assert left == [{'ok': True}]  # a timeout is not retried: the time is gone
+    # Seen live: the key could pay for 35151 tokens of the 60000 asked for. The second try asks for what it can pay.
+    asked = []
+    def short_of_credit(role, purpose, instruction, payload, schema, max_tokens):
+        asked.append(max_tokens)
+        if len(asked) == 1: raise RuntimeError('This request requires more credits, or fewer max_tokens. You requested up to 60000 tokens, but can only afford 35151.')
+        return {'ok': True}
+    roles._request = short_of_credit
+    assert roles.ask('R', 'p', 'i', {}, None) == {'ok': True} and asked == [60000, 34651]
 
 
 def test_every_route_asks_for_json_and_a_plain_build_needs_only_its_own_keys(monkeypatch):
@@ -500,8 +543,12 @@ def test_runtime_prelude_resolves_dates_and_is_idempotent(spec, contracts):
     w['nodes']['verify']['extraction_schema'] = [{'name': 'pay_day', 'type': 'date', 'description': 'Day offered.', 'min_confidence': 0.7}]
     w['nodes']['check']['pre_actions'][0]['bindings']['answer'] = '{{pay_day}}'
     w['nodes']['verify']['transitions'][0]['condition']['conditions'][0]['variable'] = 'pay_day'
-    w['nodes']['calc'] = code_stage('calc', "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n", ('close', None))
+    w['nodes']['account']['transitions'] = [route('calc')]
+    w['nodes']['calc'] = code_stage('calc', "try:\n    vars['seen'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['seen'] = ''\n", ('later', None))
+    w['nodes']['later'] = code_stage('later', "try:\n    vars['again'] = str(vars.get('pay_day'))\nexcept Exception:\n    vars['again'] = ''\n", ('close', None))
     once = compile_workflow(w, contracts)[0]
+    # The words are converted in the first code stage after the one that extracted them; the next one finds the day.
+    assert runtime.START not in once['nodes']['later']['pre_actions'][0]['function']['parameters']['properties']['code']['default']
     assert compile_workflow(once, contracts)[0] == once
     item = once['nodes']['verify']['extraction_schema'][0]
     assert item['type'] == 'string' and runtime.SAID in item['description'] and runtime.SINGLE_DAY in item['description']

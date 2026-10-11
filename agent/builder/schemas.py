@@ -46,6 +46,12 @@ class WorkflowSpec(Record):
     architecture: str = Field(description="A short rationale: the stages, what decides each route, and where each bank tool is called.")
 
 
+class ContractSpec(Record):
+    """The bank's services as an OpenAPI 3 document, written from documents that describe them in prose."""
+    openapi: dict[str, Any]
+    notes: list[str] = Field(default_factory=list, description="What the documents leave unclear about a service.")
+
+
 class Edit(Record):
     op: Literal["set_field", "set_stage", "remove_stage", "set_workflow_field"]
     stage: str = Field(default="", description="The stage the edit is for. Empty for set_workflow_field.")

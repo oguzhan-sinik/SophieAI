@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import uuid
 
 from .artifacts import digest, write_json
@@ -142,7 +143,9 @@ class ADKRoles:
     def ask(self, role, purpose, instruction, payload, schema, max_tokens=60000):
         """One answer that fits the schema. An answer that does not fit and a provider error each get
         one more try; a second failure is a ValueError whatever went wrong, so callers handle one kind.
-        A timeout is never retried here: the time is gone, and the caller knows what still fits."""
+        A timeout is never retried here: the time is gone, and the caller knows what still fits.
+        A provider that refuses the request for its size and names what the key can still pay for gets the
+        second try at that size: a shorter answer may do, and no answer is certain to be no agent."""
         for attempt in range(2):
             try:
                 return self._request(role, purpose, instruction, payload, schema, max_tokens)
@@ -153,7 +156,10 @@ class ADKRoles:
                     if isinstance(exc, ValueError):
                         raise
                     raise ValueError(f"{role} model call failed twice: {type(exc).__name__}: {self.trace.redact(str(exc))[:300]}") from exc
-                self.trace.event("structured_output_retry", role=role, error=type(exc).__name__)
+                afford = re.search(r"can only afford (\d+)", str(exc))
+                if afford and int(afford.group(1)) >= 4000:
+                    max_tokens = min(max_tokens, int(afford.group(1)) - 500)
+                self.trace.event("structured_output_retry", role=role, error=type(exc).__name__, **({"max_tokens": max_tokens} if afford else {}))
 
     def _request(self, role, purpose, instruction, payload, schema, max_tokens):
         model = self.cfg.role_model(role)
