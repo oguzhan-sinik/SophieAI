@@ -123,6 +123,23 @@ stage sets is tested by that stage's own transitions, and a stage is never enter
 built from values that may be empty. An engine-run call
 flattens its result under <stage name>_response.data.*, a model-called tool under
 <tool name>_response.data.*; prefer mapped variables in routes.
+A mapping path starts at data. and then follows the answer's own structure: where the service's
+answer is itself an object with parts ({"data": {...}, "result": {...}}), its fields are mapped as
+data.data.<field> and data.result.<field>. A request whose fields sit inside objects is shown in the
+contract as one level of fields: bind each by its name, the controller sends it in its documented
+place. A value every call starts with (a customer number, the call's now) is a variable from the
+first stage on: bind it as {{its name}}, spelled as the sources spell it.
+A call that fails leaves no result. When the service answers with an HTTP error status (404, 500)
+or not in time, no response field is mapped and no post hook runs. What the engine sets then is
+<stage name>_status_code (the HTTP status, for example 404; not set after a timeout),
+<stage name>_response.message (the error answer as text; code can look for a documented error code
+in it) and <stage name>_failure_count. So the routes out of a tool stage test success first, on a
+mapped value that only a good answer carries; then, where the sources tell kinds of failure apart
+(a documented "not found" answer says something about the customer, a 500 or no answer is a broken
+service), one route for each documented status, <stage name>_status_code equals 404; and last the
+always route, which is every other failure. Nothing that must happen after a failure is written in
+a post hook. Before a call is tried again, a code stage clears the variables its earlier try mapped
+and counts the tries itself.
 
 HUMAN SPEECH. Callers talk like people, and the customers this agent is tested with do all of
 the things below. Spread what follows over stages, one question per conversation stage and one
@@ -261,11 +278,13 @@ enum_values either has a transition or is meant to keep the caller in the stage.
 Keep explicit state for confirmation before writes, corrections, per-product attempts, retry limits
 and duplicate prevention. Speak or move on after every tool result.
 
-CLOSING. close_call runs in its own api_request stage, as its only tool, followed by an end stage.
-Every end stage is reached only through a close stage and nothing after close can reach a bank tool.
-Work out the outcome and reason from the source policy and the results before closing. If the source
-requires a goodbye before close, speak it in the close stage's on_enter tts; the terminal can then
-use message_mode none. If the source forbids notes on transfers, defer all notes until the call can
+CLOSING. Where the contract has an operation that closes the call (close_call), it runs in its own
+api_request stage, as its only tool, followed by an end stage; every end stage is then reached only
+through a close stage and nothing after close can reach a bank tool. Work out the outcome and reason
+from the source policy and the results before closing. If the source requires a goodbye before
+close, speak it in the close stage's on_enter tts; the terminal can then use message_mode none.
+Where the contract has no such operation, a call ends in an end stage that speaks the last sentence
+the sources give for that ending, word for word, as its custom terminal message. If the source forbids notes on transfers, defer all notes until the call can
 no longer end in a transfer.
 
 Use separate stages for tool boundaries and computations. Prefer several small stages to one large
@@ -276,6 +295,22 @@ DESIGN = """Design a phone agent for the supplied bank policy and tool contract,
 Read the original documents in full; requirements, when supplied, is a checklist extracted from them
 and the documents win where the two differ. The supplied Freya documentation is authoritative for
 the platform. Write architecture first, then the complete workflow source.
+
+Always return the complete workflow: an empty or withheld workflow is no agent at all, and the bank
+is then answered by nobody. Bank material is written by several people over months and is never
+complete. None of the following is a reason to hold the workflow back; build what the sources do
+say and name the open point in architecture:
+- An ending the sources describe as a hand-over (to a menu, to a person, to another step) with no
+  service for it: whoever runs the line routes the call after it ends. The agent says the sentence
+  the sources give for that ending and the call ends in an end stage.
+- A check the sources want but no service answers (whether a right is used up, a limit reached):
+  the agent offers what the sources let it offer and the service's own answer decides; where a
+  service refuses or fails, the sources' sentence for that follows.
+- Sources that disagree: the later document wins over the earlier one, a decision in a mail or a
+  meeting over the document it corrects.
+- A data file shown only in part: it is test data. Its first records show the shape of every
+  record, and no design needs the rest.
+- A rule below that names an operation this contract does not have: it does not apply.
 
 """ + RULES
 

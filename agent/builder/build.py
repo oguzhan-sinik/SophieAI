@@ -150,6 +150,11 @@ class Builder:
 
     def extract_rules(self):
         """A checklist for the designer. Useful, never required: raw bank material may not compile cleanly."""
+        if sum(len(d['text']) for d in self.documents) > BIG_CASE:
+            # Seen on a folder of 175,000 characters: the list was not ready after eight minutes, a quarter of
+            # the build, and the designer then read the documents without it anyway.
+            self.trace.event('requirements_unavailable', reason='a case this large goes to the designer directly; listing its rules first takes the time the design needs')
+            return None
         errors = []
         for attempt in range(2):
             try:

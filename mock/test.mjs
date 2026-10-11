@@ -111,7 +111,7 @@ assert.equal(r.ok, false);
 r = await call('open_vault', { customer_id: C });
 assert.equal(r.status, 404);
 r = await get('/health');
-assert.equal(r.services.length, 7);
+assert.equal(r.services.length, 14);          // the practice bank and the statement services
 assert.equal(r.customers, 53);
 
 // The kit runner's two routes: a fresh customer for a case, and what its call left behind.

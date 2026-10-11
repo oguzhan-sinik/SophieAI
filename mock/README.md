@@ -14,6 +14,30 @@ What ships here is the kit's practice contract with the 53 practice cases of
 `public-plus-adversarial-53.json` (the kit's thirteen and forty more), as a working example. All of
 it is synthetic.
 
+## The final case: statement and debt services
+
+`src/statement.js` serves the seven services of the bank's contract of 1 October 2026 (`cards.list`,
+`cards.balance`, `statement.week.get`, `statement.week.decide`, `statement.week.change`,
+`contact.email.get`, `statement.pdf.send`) under any path prefix, so `/voice/v1/cards.list` works.
+Every answer is looked up in `src/statement-data.js`, which `make_statement_data.py` writes from the
+bank's `test-customers.json`, and is returned as listed, status code and delay included. Nothing is
+computed or remembered. A customer, card or week that is not listed gets the service's 404 from the
+contract, or a 400 where the contract has none.
+
+```bash
+python3 mock/make_statement_data.py "<case folder>/test-environment/test-customers.json"
+```
+
+```bash
+node mock/test-statement.mjs "<case folder>/test-environment/test-customers.json"
+```
+
+```bash
+python3 mock/smoke_statement.py https://freya-bank-mock.<your-subdomain>.workers.dev "<case folder>/test-environment/test-customers.json"
+```
+
+`GET /__recent` shows the last 200 requests to these services with the status each got.
+
 ## Test it here
 
 ```bash

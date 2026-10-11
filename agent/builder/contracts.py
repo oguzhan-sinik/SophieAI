@@ -128,9 +128,10 @@ def compile_openapi(path, server=None):
         for method, op in path_item.items():
             if method not in {"get", "post", "put", "patch", "delete"}:
                 continue
-            name = op.get("operationId") or path_name.rstrip("/").rsplit("/", 1)[-1]
+            # A tool is called by a plain name: a service named cards.list is the tool cards_list, on its documented path.
+            name = re.sub(r"\W+", "_", str(op.get("operationId") or path_name.rstrip("/").rsplit("/", 1)[-1])).strip("_")
             if not re.fullmatch(r"[A-Za-z_]\w*", name) or name in operations:
-                raise ValueError("Missing/duplicate usable operation ID")
+                raise ValueError(f"Operation {op.get('operationId') or path_name!r} has no usable, unique name: give each operation its own operationId made of letters, digits and underscores")
             servers = op.get("servers", path_item.get("servers", resolved.get("servers", [])))
             if server is not None:
                 # A bare mock host keeps the path the contract's own server has (/v1), so a contract and its mock agree on it.
@@ -158,12 +159,38 @@ def compile_openapi(path, server=None):
             if body.get("type") != "object":
                 raise ValueError(f"{name}: request body must be an object")
             operations[name] = {"name": name, "method": method.upper(), "url": url, "description": op.get("description", op.get("summary", "")), "body": body, "responses": op.get("responses", {}), "security": security}
+            flat, nest = flatten_body(body)
+            if nest:
+                # The designer binds each field by its own name; the request is sent in the documented shape.
+                operations[name].update(body=flat, nest=nest)
             if server is not None:
                 operations[name]["call_header"] = True
     if not operations:
         raise ValueError("OpenAPI declares no supported operations")
     # The same contract served from another address is another contract: practice customers belong to the bank's own host.
     return {"sha256": digest(spec) if server is None else digest({"spec": spec, "server": server}), "operations": operations}
+
+
+def flatten_body(body):
+    """A request body with objects inside objects ({"data": {"customerNo": ...}}) as one level of fields, and
+    where each field belongs: ({leaf schema}, {field: [path]}). ({}, {}) for a body that is one level already."""
+    leaves = []
+
+    def walk(schema, path, needed):
+        for key, prop in (schema.get("properties") or {}).items():
+            if isinstance(prop, dict) and prop.get("type") == "object" and isinstance(prop.get("properties"), dict) and prop["properties"]:
+                walk(prop, path + [key], needed and key in schema.get("required", []))
+            else:
+                leaves.append((path + [key], prop if isinstance(prop, dict) else {}, key in schema.get("required", [])))
+
+    walk(body, [], True)
+    if all(len(path) == 1 for path, _, _ in leaves):
+        return {}, {}
+    last = [path[-1] for path, _, _ in leaves]
+    names = ["_".join(path) if last.count(path[-1]) > 1 else path[-1] for path, _, _ in leaves]
+    flat = {"type": "object", "properties": {name: deepcopy(prop) for name, (_, prop, _) in zip(names, leaves)},
+            "required": [name for name, (_, _, required) in zip(names, leaves) if required]}
+    return flat, {name: path for name, (path, _, _) in zip(names, leaves)}
 
 
 def tool_from_contract(contract, description, bindings=None):
@@ -178,7 +205,11 @@ def tool_from_contract(contract, description, bindings=None):
         elif key in bindings:
             prop["default"] = bindings[key]
         prop.setdefault("description", f"Value of {key} from the caller or preceding tool result, never invented.")
-    return {"type": "function", "config": {"timeoutMs": 12000, "maxRetries": 0}, "function": {
+    if contract.get("nest"):
+        # A request with objects inside objects is sent as one template, each bound field in its documented place.
+        body = {"type": "object", "default": runtime.nested_values(contract, {key: prop["default"] for key, prop in body["properties"].items() if "default" in prop})}
+    # A service documented as slow still answers: the limit is above the slowest answer a bank lists, and nothing is retried.
+    return {"type": "function", "config": {"timeoutMs": 30000, "maxRetries": 0}, "function": {
         "name": contract["name"], "handler": "__function__:api_call", "description": description,
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string", "default": contract["url"]}, "method": {"type": "string", "default": contract["method"]},

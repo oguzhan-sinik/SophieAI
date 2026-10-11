@@ -12,6 +12,10 @@
 //   POST <any prefix>/practice/sessions          {"case": "<case id>"} opens a fresh customer for the case
 //   GET  <any prefix>/practice/ledger/<customer> what that customer's call left behind
 //
+// The final case's statement services (statement.js) are served next to the practice bank:
+//   POST <any prefix>/<statement service>   e.g. /voice/v1/cards.list; the answer is looked up, nothing is remembered
+//   GET  /__recent                          the last requests to those services, with the status each got
+//
 // One call, one state. A workflow built with a mock address sends the platform's call id in the
 // header X-Call-Id, and each call then has its own Durable Object: two calls for the same customer
 // never share a strike or a promise, and a read always sees the write before it. Without the
@@ -19,6 +23,7 @@
 
 import { Refused, customerField, ledger, newSession, operations, startsCall } from './bank.js';
 import customers from './customers.js';
+import { answer as statementAnswer, services as statementServices } from './statement.js';
 
 const IDLE_MS = 30 * 60 * 1000;      // a call left open this long is over
 const CLOSED_MS = 20 * 1000;         // nothing is accepted after a call closed; this long after it, a request is a new call
@@ -39,12 +44,23 @@ const stub = (env, name) => env.SESSION.get(env.SESSION.idFromName(name));
 const ask = (env, name, path, body) => stub(env, name).fetch('https://session/' + path, { method: 'POST', body: JSON.stringify(body || {}) });
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const parts = new URL(request.url).pathname.split('/').filter(Boolean);
     const last = parts[parts.length - 1] || '';
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: HEADERS });
     if (request.method === 'GET' && (parts.length === 0 || last === 'health')) {
-      return json({ ok: true, services: Object.keys(operations), customers: Object.keys(customers).length });
+      return json({ ok: true, services: [...statementServices, ...Object.keys(operations)], customers: Object.keys(customers).length });
+    }
+    if (request.method === 'GET' && last === '__recent') return ask(env, 'recent', '__recent');
+    if (statementServices.includes(last)) {
+      if (request.method !== 'POST') return json({ ok: false, error: 'send a POST with a JSON body' }, 405);
+      const body = await request.json().catch(() => null);
+      const found = statementAnswer(last, body);
+      // What the agent sent and what it got, kept for looking at afterwards; never a reason to answer late or not at all.
+      const note = ask(env, 'recent', '__recent', { add: { at: new Date().toISOString(), service: last, path: new URL(request.url).pathname, body, status: found.status } }).catch(() => {});
+      if (ctx && ctx.waitUntil) ctx.waitUntil(note);
+      if (found.delaySeconds && !env.NO_DELAY) await new Promise((resolve) => setTimeout(resolve, found.delaySeconds * 1000));
+      return json(found.body, found.status);
     }
     if (parts.length >= 2 && parts[parts.length - 2] === '__ledger' && request.method === 'GET') {
       const index = await (await ask(env, 'index|' + last, '__index')).json();
@@ -106,6 +122,15 @@ export class Session {
       return json({ calls });
     }
     if (path === '__ledger') return json((await storage.get('session')) || { calls: [] });
+    if (path === '__recent') {
+      // This object is the list of the last requests to the statement services.
+      const recent = (await storage.get('recent')) || [];
+      if (input.add) {
+        recent.push(input.add);
+        await storage.put('recent', recent.slice(-200));
+      }
+      return json({ requests: recent.slice(-200) });
+    }
     if (path === '__reset') {
       await storage.deleteAll();
       return json({ ok: true });

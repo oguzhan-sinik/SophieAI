@@ -1250,8 +1250,11 @@ import json
 try:
     if isinstance(result, dict) and isinstance(result.get("data"), dict):
         for ctlv_name, ctlv_field in %s:
-            if isinstance(result["data"].get(ctlv_field), (list, dict)):
-                vars[ctlv_name] = json.dumps(result["data"][ctlv_field])
+            ctlv_at = result["data"]
+            for ctlv_part in ctlv_field.split("."):
+                ctlv_at = ctlv_at.get(ctlv_part) if isinstance(ctlv_at, dict) else None
+            if isinstance(ctlv_at, (list, dict)):
+                vars[ctlv_name] = json.dumps(ctlv_at)
                 vars[ctlv_name + "_json"] = vars[ctlv_name]
 except Exception:
     pass
@@ -1280,6 +1283,32 @@ def guard_loops(workflow):
         node["transitions"].insert(0, {"target_node": target, "description": GUARD,
                                        "condition": {"variable": key + ".total_turns", "operator": "greater_than", "operand": limit}})
     return workflow
+
+
+def nested_values(contract, values):
+    """Field values placed where the documented request has them."""
+    shaped = {}
+    for name, path in contract["nest"].items():
+        if name in values:
+            at = shaped
+            for part in path[:-1]:
+                at = at.setdefault(part, {})
+            at[path[-1]] = values[name]
+    return shaped
+
+
+def bound_fields(contract, body):
+    """What each field of a compiled tool's request is bound to, for either shape of request: {field: default}."""
+    if not contract.get("nest"):
+        return {field: prop["default"] for field, prop in (body.get("properties") or {}).items() if isinstance(prop, dict) and "default" in prop}
+    found = {}
+    for name, path in contract["nest"].items():
+        at = body.get("default")
+        for part in path:
+            at = at.get(part) if isinstance(at, dict) else None
+        if at is not None:
+            found[name] = at
+    return found
 
 
 def strip(code):
@@ -1393,13 +1422,20 @@ def apply(workflow, contracts):
                 contract = contracts["operations"].get(function.get("name"))
                 if not contract:
                     continue
-                schema = contract["responses"].get("200", {}).get("content", {}).get("application/json", {}).get("schema", {}).get("properties", {})
+                schema = contract["responses"].get("200", {}).get("content", {}).get("application/json", {}).get("schema", {})
+
+                def kind(field):
+                    # The type of a result field, also of one inside an object of the result (data.cards).
+                    at = schema
+                    for part in field.split("."):
+                        at = (at.get("properties") or {}).get(part, {}) if isinstance(at, dict) else {}
+                    return at.get("type") if isinstance(at, dict) else None
                 mappings = tool.get("response_mapping") if placement == "tools" else node.get("response_mapping")
                 pairs = []
                 for mapping in rows(mappings):
                     path, variable = str(mapping.get("path", "")), mapping.get("variable")
                     field = path[len("data."):]
-                    if path.startswith("data.") and "." not in field and variable and schema.get(field, {}).get("type") in ("array", "object"):
+                    if path.startswith("data.") and field and variable and kind(field) in ("array", "object"):
                         pairs.append([variable, field])
                 structured += [p for p in pairs if p not in structured]
                 # A hook is its own sandbox too: it carries the helpers it calls, like a code stage.
@@ -1411,8 +1447,8 @@ def apply(workflow, contracts):
                 elif post != str(tool.get("post_process_code") or "").rstrip():
                     tool["post_process_code"] = post
                 # A day or an amount bound straight into a request must be converted before the request is built.
-                body = function.get("parameters", {}).get("properties", {}).get("body", {}).get("properties", {})
-                bound = lambda names: [name for name in names if any("{{" + name + "}}" in str(prop.get("default", "")) for prop in body.values() if isinstance(prop, dict))]
+                body = json.dumps(function.get("parameters", {}).get("properties", {}).get("body", {}))
+                bound = lambda names: [name for name in names if "{{" + name + "}}" in body]
                 pre = strip(tool.get("pre_process_code"))
                 blocks = (DATE_APPLY % json.dumps(bound(dates)) if bound(dates) else "") + (AMOUNT_APPLY % json.dumps(bound(amounts)) if bound(amounts) else "")
                 if blocks or called(pre):

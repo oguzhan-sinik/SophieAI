@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 
 from .artifacts import digest, write_json
@@ -160,6 +161,9 @@ class ADKRoles:
                 if afford and int(afford.group(1)) >= 4000:
                     max_tokens = min(max_tokens, int(afford.group(1)) - 500)
                 self.trace.event("structured_output_retry", role=role, error=type(exc).__name__, **({"max_tokens": max_tokens} if afford else {}))
+                if "RateLimit" in type(exc).__name__ or "Retry shortly" in str(exc):
+                    # The provider asks for ten seconds; a second try at once is refused the same way.
+                    time.sleep(12)
 
     def _request(self, role, purpose, instruction, payload, schema, max_tokens):
         model = self.cfg.role_model(role)

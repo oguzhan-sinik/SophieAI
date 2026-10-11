@@ -417,9 +417,15 @@ def validate(workflow, contracts):
                     body = props.get("body", {})
                     expected = contract["body"]
                     properties = body.get("properties", {})
-                    if "default" in body or set(properties) != set(expected.get("properties", {})):
+                    if contract.get("nest"):
+                        # A request with objects inside objects is one template; its bound fields are read back from their places.
+                        bound = runtime.bound_fields(contract, body)
+                        if set(body) - {"type", "default"} or runtime.nested_values(contract, bound) != body.get("default"):
+                            bad("Body must be the contract's request template, with nothing but its documented fields")
+                        properties = {field: {**schema, **({"default": bound[field]} if field in bound else {})} for field, schema in expected.get("properties", {}).items()}
+                    elif "default" in body or set(properties) != set(expected.get("properties", {})):
                         bad("Body fields must match contract leaf schemas")
-                    if set(body.get("required", [])) != set(expected.get("required", [])):
+                    elif set(body.get("required", [])) != set(expected.get("required", [])):
                         bad("Required body fields differ from contract")
                     missing = [field for field in expected.get("required", []) if "default" not in properties.get(field, {})]
                     if placement == "pre_actions" and missing:

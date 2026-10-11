@@ -15,6 +15,8 @@ TEXT = {"", ".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".json
 MARKUP = {".html", ".htm", ".xml", ".svg", ".drawio"}
 FIRST = ("brief.md", "readme.md")      # the order the organisers give: the brief, then what each file is
 MAX_CHARS = 150_000                    # one document; a case's documents are pages, not books
+DATA = {".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml"}
+MAX_DATA_CHARS = 24_000                # a file of records shows its shape in its first records; the rest is more of the same
 MAX_ROWS = 300                         # one sheet
 W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
@@ -192,8 +194,9 @@ def read_document(path):
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return None, "empty"
-    if len(text) > MAX_CHARS:
-        text = text[:MAX_CHARS] + f"\n[{len(text) - MAX_CHARS} more characters of this document are not shown]"
+    limit = MAX_DATA_CHARS if suffix in DATA else MAX_CHARS
+    if len(text) > limit:
+        text = text[:limit] + f"\n[{len(text) - limit} more characters of this {'data file' if suffix in DATA else 'document'} are not shown" + ("; they are more records of the same shape, test data that no design needs in full]" if suffix in DATA else "]")
     return text, None
 
 
