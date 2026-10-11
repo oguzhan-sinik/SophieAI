@@ -52,15 +52,43 @@ def doubleword_litellm_kwargs(model, schema, timeout, reasoning_effort="low"):
                 "name": schema.__name__, "schema": schema.model_json_schema()}}}
 
 
+def openai_strict_schema(schema, strict_ok=True):
+    """OpenAI structured outputs require every property in `required` and no open objects.
+    Optional pydantic fields become required-but-nullable; the model returns null for them.
+    Returns False (with the schema untouched from then on) if it hits a free-form map:
+    OpenAI strict mode cannot express one, and forcing additionalProperties: false would
+    make the model return an empty dict there. Callers then skip response_format."""
+    if isinstance(schema, dict):
+        if schema.get("type") == "object":
+            if "properties" in schema:
+                schema["required"] = list(schema["properties"])
+                schema["additionalProperties"] = False
+            elif strict_ok:
+                strict_ok = False
+        for value in schema.values():
+            if not openai_strict_schema(value, strict_ok):
+                return False
+    elif isinstance(schema, list):
+        for value in schema:
+            if not openai_strict_schema(value, strict_ok):
+                return False
+    return strict_ok
+
+
 def openrouter_litellm_kwargs(model, schema, timeout):
-    """Route openrouter/<model id> through OpenRouter's OpenAI-compatible endpoint."""
+    """Route openrouter/<model id> through OpenRouter's OpenAI-compatible endpoint.
+    Schemas with free-form maps skip response_format: the prompt carries the schema and
+    the caller pydantic-validates the answer, so enforcement is belt-and-braces anyway."""
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if not key:
         raise KeyError("Missing OpenRouter setting: OPENROUTER_API_KEY")
-    return {"model": "openai/" + model[len("openrouter/"):], "api_base": "https://openrouter.ai/api/v1",
-            "api_key": key, "timeout": timeout, "num_retries": 0,
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": schema.__name__, "schema": schema.model_json_schema()}}}
+    kwargs = {"model": "openai/" + model[len("openrouter/"):], "api_base": "https://openrouter.ai/api/v1",
+              "api_key": key, "timeout": timeout, "num_retries": 0}
+    json_schema = schema.model_json_schema()
+    if openai_strict_schema(json_schema):
+        kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+            "name": schema.__name__, "strict": True, "schema": json_schema}}
+    return kwargs
 
 
 def qwencloud_litellm_kwargs(model, schema, timeout):
