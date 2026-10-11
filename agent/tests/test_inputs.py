@@ -126,7 +126,7 @@ def test_with_a_mock_address_every_tool_calls_the_mock(spec, folder):
     with pytest.raises(ValueError): compile_openapi(folder / 'secured.json')
 
 
-def build(work, spec, requirements, given, seen, contract_answers=(), scenarios=None):
+def build(work, spec, requirements, given, seen, contract_answers=(), scenarios=None, **more):
     answers = list(contract_answers)
     base = roles(spec, requirements, [], seen)
     class Roles(base):
@@ -139,7 +139,7 @@ def build(work, spec, requirements, given, seen, contract_answers=(), scenarios=
                 return {'scenarios': scenarios or []}     # these documents describe no example call unless a test gives some
             return super().ask(role, purpose, instruction, payload, schema, max_tokens)
     builder = Builder(Config(artifacts=work, tracing=False), given['briefs'], given['openapi'], roles_factory=Roles, adapter_factory=FakeFreya,
-                      mock_url=given['mock_url'], name=given['name'], notes=given['notes'], observer=echo)
+                      mock_url=given['mock_url'], name=given['name'], notes=given['notes'], observer=echo, **more)
     builder.submission_dir = work / 'out'
     return builder, builder.run()
 
@@ -315,3 +315,20 @@ def test_example_calls_become_test_callers_and_are_scored_from_the_judges_verdic
     record = json.loads((tmp_path / 'evaluation' / 'calls_0.json').read_text())['Example-1-one-card']
     assert record['turns'][-1]['error'] == 'API request failed: 404'       # a failed call is part of what happened
     assert score(raw, suite).passed == 0 and score(raw, suite).complete
+
+
+def test_a_build_can_go_on_from_the_best_version_of_an_earlier_run(work, spec, requirements, folder):
+    given = case([str(folder), MOCK])
+    first, result = build(work, spec, requirements, given, [])
+    assert result['status'] == 'exported'
+    # The earlier run's exported version is where the next one starts: no design call, the same source.
+    seen = []
+    second, again = build(work, spec, requirements, given, seen, resume=first.root, resume_best=True)
+    assert again['status'] == 'exported' and not [role for role, _ in seen if role == 'ADASDesignerAgent']
+    resumed = [json.loads(line) for line in Path(again['trace_path']).read_text().splitlines() if '"root_resumed"' in line]
+    assert resumed and resumed[0]['best_version'] == result['candidate_id']
+    source = lambda run, candidate: json.loads((run.root / 'candidates' / candidate / 'proposal.json').read_text())
+    assert source(second, again['root_candidate_id']) == source(first, result['candidate_id'])
+    # Without the flag it is the earlier run's first design, as before.
+    third, plain = build(work, spec, requirements, given, [], resume=first.root)
+    assert 'best_version' not in next(json.loads(line) for line in Path(plain['trace_path']).read_text().splitlines() if '"root_resumed"' in line)

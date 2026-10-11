@@ -62,9 +62,10 @@ def call_records(folder, raw, limit=80):
 
 class Builder:
     def __init__(self, cfg, briefs, openapi, *, roles_factory=ADKRoles, adapter_factory=FreyaAdapter, resume=None, only=None, style='', public_brief=None, evaluation_provider=None, deadline=None, submission_dir=None,
-                 mock_url=None, name=None, notes=(), observer=None, cases=None, rule_list=True):
+                 mock_url=None, name=None, notes=(), observer=None, cases=None, rule_list=True, resume_best=False):
         self.cfg = cfg
         self.rule_list = rule_list
+        self.resume_best = resume_best
         self.deadline = deadline or Deadline(cfg.max_wall_seconds, cfg.reserve)
         self.run_id = time.strftime('%Y%m%dT%H%M%S') + '_' + uuid.uuid4().hex[:8]
         self.root = writable(cfg.artifacts / self.run_id)
@@ -287,8 +288,14 @@ class Builder:
                 if saved['brief_hash'] != self.brief_hash or saved['openapi_hash'] != self.contracts['sha256']:
                     raise ValueError('its brief or tool API differs from this run')
                 self.requirements = saved.get('requirements')
-                self.trace.event('root_resumed', source=str(self.resume))
-                return WorkflowSpec.model_validate(saved['spec']).model_dump()
+                spec, best = saved['spec'], None
+                if self.resume_best:
+                    # Go on from the version the earlier run exported, its best measured one: starting again from
+                    # its first design means earning every repair a second time before any new one.
+                    best = json.loads((self.resume / 'report.json').read_text())['candidate_id']
+                    spec = json.loads((self.resume / 'candidates' / best / 'proposal.json').read_text())
+                self.trace.event('root_resumed', source=str(self.resume), **({'best_version': best} if best else {}))
+                return WorkflowSpec.model_validate(spec).model_dump()
             except (OSError, KeyError, ValueError) as exc:
                 raise ValueError(f'Cannot resume from {self.resume}: {exc}') from exc
         self.requirements = self.extract_rules()
@@ -708,6 +715,7 @@ def main(argv=None):
     parser.add_argument('--cases', help='Practice cases of your own (written by mock/make_fixtures.py), run against your mock in place of the kit\'s thirteen')
     parser.add_argument('--no-rule-list', action='store_true', help='Skip listing the rules first: the designer reads the documents directly (faster on a large folder)')
     parser.add_argument('--resume-run', help='Reuse the rules and root design of an earlier run on the same brief and tool API')
+    parser.add_argument('--resume-best', action='store_true', help='With --resume-run: go on from the version that run exported, its best measured one, in place of its first design')
     parser.add_argument('--public-brief', choices=['A', 'B'])
     parser.add_argument('--only', help='Comma-separated public case IDs; defines a distinct suite')
     parser.add_argument('--style', default='', choices=['', 'pieces', 'corrects', 'talkative', 'asks_back', 'in_words'])
@@ -719,7 +727,7 @@ def main(argv=None):
             raise ValueError("Missing credentials (set them in env.sh): " + ", ".join(missing))
         given = case(args.briefs, args.openapi, args.mock_url)
         builder = Builder(cfg, given['briefs'], given['openapi'], resume=args.resume_run, only=args.only.split(',') if args.only else None, style=args.style, public_brief=args.public_brief,
-                          mock_url=given['mock_url'], name=args.name or given['name'], notes=given['notes'], observer=echo, cases=args.cases, rule_list=not args.no_rule_list)
+                          mock_url=given['mock_url'], name=args.name or given['name'], notes=given['notes'], observer=echo, cases=args.cases, rule_list=not args.no_rule_list, resume_best=args.resume_best)
         result = builder.run()
     except (ValueError, OSError, KeyError, TimeoutError) as exc:
         print(json.dumps({'status': 'invalid_input', 'error': str(exc)}))
