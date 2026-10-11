@@ -106,8 +106,11 @@ thinking enabled and SSE streaming; its numeric usage appeared in the dashboard.
 The subsequent two-pack generation attempt spent all 12,000 completion tokens on reasoning
 in its first writer call and returned no answer. Its retry was interrupted and the run marked
 failed. ADK maps `max_output_tokens` to the shared `max_completion_tokens` limit. The user
-approved a minimum 65,536-token total limit for QwenCloud retries; synthetic users have not yet been exercised
-through a QwenCloud-generated workflow.
+approved a minimum 65,536-token total limit for QwenCloud retries. A fresh attempt with that
+limit timed out in the first writer call after 480 seconds; no packs were accepted and
+synthetic users have not yet been exercised through a QwenCloud-generated workflow.
+The next reasoning/timing decision is pending. Dashboard run:
+`synthetic_20261011T034512_f74ff6fb`.
 
 A live Doubleword request through ADK/LiteLLM returned valid structured output using `zai-org/GLM-5.3-Flash`. Brief writing/checking uses medium reasoning; other Doubleword roles use low reasoning. Live generation exposed truncated outputs, ambiguous mapping/enum schema descriptions and conditional-rule interpretation failures. Mapping descriptions and bounded rewrite feedback were corrected; generation still fails closed when independent semantic checks disagree. No complete two-pack rehearsal or Freya deployment has been verified. The pinned Docker image was restored for the current local testing session.
 
