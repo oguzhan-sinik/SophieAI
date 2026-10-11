@@ -29,9 +29,9 @@ def test_qwencloud_thinking_endpoint_and_schema(monkeypatch, base):
     assert kwargs["api_base"] == "https://maas.qwencloudapi.com/compatible-mode/v1"
     assert kwargs["api_key"] == "fixture-dashscope-key"
     assert kwargs["timeout"] == 25 and kwargs["num_retries"] == 0
-    assert kwargs["extra_body"] == {"enable_thinking": True}
+    assert kwargs["extra_body"] == {"enable_thinking": False}
     assert "reasoning_effort" not in kwargs
-    assert kwargs["response_format"]["json_schema"]["schema"] == Reply.model_json_schema()
+    assert kwargs["response_format"] == {"type": "json_object"}
 
 
 def test_missing_qwencloud_key_never_falls_back(monkeypatch):
@@ -41,6 +41,7 @@ def test_missing_qwencloud_key_never_falls_back(monkeypatch):
         qwencloud_litellm_kwargs(QWEN, Reply, 25)
     monkeypatch.setenv("FREYA_API_KEY", "freya-fixture")
     monkeypatch.setenv("FREYA_BANK_TEAM_KEY", "bank-fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-fixture")
     assert missing_credentials(Config(builder_model=QWEN)) == ["DASHSCOPE_API_KEY"]
     monkeypatch.setenv("DASHSCOPE_API_KEY", "qwen-fixture")
     assert missing_credentials(Config(builder_model=QWEN)) == []
@@ -73,6 +74,7 @@ def test_missing_doubleword_key_fails_without_using_other_provider_key(monkeypat
         doubleword_litellm_kwargs(MODEL, Reply, 25)
     monkeypatch.setenv("FREYA_API_KEY", "freya-fixture")
     monkeypatch.setenv("FREYA_BANK_TEAM_KEY", "bank-fixture")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-fixture")
     assert missing_credentials(Config(builder_model=MODEL)) == ["DOUBLEWORD_API_KEY"]
     monkeypatch.setenv("DOUBLEWORD_API_KEY", "doubleword-fixture")
     for key in ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET", "OPENAI_API_KEY"):
@@ -125,7 +127,7 @@ def test_adk_uses_selected_provider_and_preserves_other_routes(monkeypatch, mode
     if model == QWEN:
         assert seen["model"] == "openai/qwen3.8-max-0902"
         assert seen["api_key"] == "qwen-fixture"
-        assert seen["extra_body"] == {"enable_thinking": True}
+        assert seen["extra_body"] == {"enable_thinking": False}
         assert "reasoning_effort" not in seen
     elif model == MODEL:
         assert seen["model"] == "openai/zai-org/GLM-5.3-Flash"

@@ -33,7 +33,7 @@ def work():
 
 
 class Roles:
-    cfg = SimpleNamespace(builder_model="fixture")
+    cfg = SimpleNamespace(builder_model="fixture", models={"hard": "fixture"})
     trace = SimpleNamespace(event=lambda *args, **kwargs: None)
 
     def __init__(self, mismatch=False):
@@ -122,6 +122,20 @@ def test_render_mismatch_is_not_admitted():
     p, m = sample_policy(42), sample_mapping()
     with pytest.raises(ValueError, match="preserve"):
         render_checked(p, m, openapi_for(p, m, "fixture"), "clean", Roles(mismatch=True))
+
+
+def test_render_attempts_are_inspectable(work):
+    from agent.builder.artifacts import Trace
+    p, m = sample_policy(42), sample_mapping()
+    roles = Roles()
+    roles.trace = Trace(work / "trace.log", {}, remote=False)
+    renders = work / "pack-x" / "renders"
+    render_checked(p, m, openapi_for(p, m, "fixture"), "clean", roles, renders)
+    check = json.loads((renders / "attempt-1.check.json").read_text())
+    assert check["policy_matches"] and not check["unresolved"]
+    assert (renders / "final.brief.md").read_text().startswith("# Synthetic fixture")
+    events = [json.loads(line)["event"] for line in roles.trace.path.read_text().splitlines() if line.strip()]
+    assert "synthetic_render_accepted" in events
 
 
 def test_render_retry_uses_review_and_still_requires_complete_semantics():

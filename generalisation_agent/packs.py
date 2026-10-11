@@ -29,22 +29,25 @@ Closure: a transfer wins when transfer_wins is true; otherwise a recorded promis
 Thank the caller and say goodbye, then exactly one close_call as the last tool action. Never call another tool after closing."""
 
 
-def model_context(cfg=None, seconds=1800, root=None):
+def model_context(cfg=None, seconds=1800, root=None, *, campaign=False):
     cfg = cfg or Config.from_env()
+    if seconds < 30:
+        raise ValueError("Test budget must be at least thirty seconds")
     root = confined(root or ROOT / "private" / (time.strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:8]))
     root.mkdir(parents=True, exist_ok=False)
-    deadline = Deadline(min(seconds, cfg.max_wall_seconds), min(cfg.reserve, seconds - 1))
+    deadline = Deadline(seconds if campaign else min(seconds, cfg.max_wall_seconds), min(cfg.reserve, seconds - 1))
     trace = Trace(root / "build_trace.log", {"component": "generalisation", "model": cfg.builder_model}, remote=False)
     from .progress import publish_progress
     publish_progress(trace)
     return ADKRoles(cfg, deadline, trace, root), trace, deadline, root
 
 
-def render_checked(policy, mapping, api, form, roles):
+def render_checked(policy, mapping, api, form, roles, dir=None):
     review = None
     for attempt in range(2):
         rendered = roles.ask("synthetic_brief_writer", "render synthetic policy",
             "Render every supplied policy fact, operation mapping and core obligation faithfully into realistic bank Markdown. "
+            "Preserve the exact spelling and casing of every enum value, band name, code and identifier; quote them verbatim. "
             "Do not include JSON, an answer key, synthetic customer cases, or generator instructions. "
             "For raw format use emails, dated memos, tables and enum lists in one Markdown file, with explicit authority and effective dates. "
             "There must be no unresolved conflict. For clean format use a concise numbered specification. "
@@ -59,27 +62,39 @@ def render_checked(policy, mapping, api, form, roles):
         reading = roles.ask("synthetic_brief_checker", "independent semantic check",
             "Independently reconstruct the policy and operation mappings only from this brief and API. Do not infer missing rules. "
             "List unsupported/ambiguous facts in unresolved and return policy=null if a complete supported policy cannot be reconstructed. "
+            "unresolved is only for brief statements that contradict the API or each other, or whose absence makes a policy field or "
+            "mapping unreconstructable. Details the policy schema never carried (effective dates, presence-confirmation phrasing, "
+            "behaviour outside the declared bands/enums) are not unresolved. "
             "Report supported_core_rules using only the supplied ids for obligations actually stated. "
             "An accurately stated conditional obligation is supported even when this policy makes its condition inactive; "
             "inactivity is not an unresolved ambiguity. Never count a merely named or omitted obligation as supported. "
             "This is a check of source contents, not a request to rewrite them.",
             {"brief": text, "api": api, "core_rule_ids": CORE_RULES, "core_rule_meanings": RULE_TEXT}, RenderedReading, max_tokens=12000)
         checked = RenderedReading.model_validate(reading)
+        if dir:
+            write_json(dir / f"attempt-{attempt + 1}.check.json", {
+                "unresolved": checked.unresolved, "supported_core_rules": sorted(checked.supported_core_rules),
+                "policy_matches": checked.policy == policy, "mapping_matches": checked.mapping == mapping,
+                "reconstructed_policy": checked.policy.model_dump(mode="json") if checked.policy else None}, immutable=True)
         if (not checked.unresolved and checked.policy == policy and checked.mapping == mapping and set(checked.supported_core_rules) == set(CORE_RULES)):
+            if dir: (dir / "final.brief.md").write_text(text + "\n")
+            roles.trace.event("synthetic_render_accepted", attempt=attempt + 1, pack=dir.parent.name if dir else None)
             return text
         review = {"previous_brief": text, "unresolved": checked.unresolved,
                   "missing_core_rules": sorted(set(CORE_RULES) - set(checked.supported_core_rules)),
                   "policy_matches": checked.policy == policy, "mapping_matches": checked.mapping == mapping}
-        roles.trace.event("synthetic_render_rejected", attempt=attempt + 1, unresolved=checked.unresolved,
+        if dir: (dir / f"attempt-{attempt + 1}.brief.md").write_text(text + "\n")
+        roles.trace.event("synthetic_render_rejected", attempt=attempt + 1, pack=dir.parent.name if dir else None,
+                          unresolved=checked.unresolved,
                           policy_matches=checked.policy == policy, mapping_matches=checked.mapping == mapping)
     raise ValueError("Rendered brief did not preserve all policy semantics after two attempts")
 
 
-def generate_packs(settings, roles, root, seed=42, packs=2, users=10):
+def generate_packs(settings, roles, root, seed=42, packs=2, users=10, *, campaign=False):
     settings.require("briefs")
     if packs != 2:
         raise ValueError("The approved initial rehearsal has exactly two packs")
-    if not 1 <= users <= 10:
+    if not (users == 30 if campaign else 1 <= users <= 10):
         raise ValueError("User count must be between one and ten")
     root = confined(root)
     run_id = root.name
@@ -90,24 +105,34 @@ def generate_packs(settings, roles, root, seed=42, packs=2, users=10):
         policy, mapping = sample_policy(seed, index), sample_mapping(index)
         api = openapi_for(policy, mapping, pack_id)
         form, split = ("clean", "development") if index == 0 else ("raw", "holdout")
-        text = render_checked(policy, mapping, api, form, roles)
         inputs = public / "packs" / pack_id
         private = root / "packs" / pack_id
+        renders = private / "renders"
+        renders.mkdir(parents=True, exist_ok=True)
+        text = render_checked(policy, mapping, api, form, roles, renders)
         inputs.mkdir(parents=True, exist_ok=False)
         (inputs / "brief.md").write_text(text + "\n")
         write_json(inputs / "openapi.json", api, immutable=True)
         compile_openapi(inputs / "openapi.json")
         write_json(private / "policy.json", policy.model_dump(mode="json"), immutable=True)
         write_json(private / "mapping.json", mapping.model_dump(), immutable=True)
-        cases = customers_for(policy, seed * 100 + index, users) if settings.users else []
+        cases = customers_for(policy, seed * 100 + index, users, campaign=campaign) if settings.users else []
         write_json(private / "users.json", [c.model_dump(mode="json") for c in cases], immutable=True)
+        roles.trace.event("synthetic_users_generated", pack=pack_id, case_count=len(cases),
+                          coverage=sorted({c.family for c in cases}),
+                          cases=[{"id": c.id, "family": c.family, "style": c.style, "third_party": c.third_party,
+                                  "actions": [g.action for g in c.goals], "faults": [f.mode for f in c.faults],
+                                  "wrong_answers": sorted(c.wrong_answers)} for c in cases])
         manifest = {"version": VERSION, "id": pack_id, "split": split, "format": form, "seed": seed,
                     "settings": settings.manifest(), "builder_model": roles.cfg.builder_model,
                     "brief": str(inputs / "brief.md"), "openapi": str(inputs / "openapi.json"),
                     "brief_sha256": hashlib.sha256((inputs / "brief.md").read_bytes()).hexdigest(),
                     "api_sha256": digest(api), "policy_sha256": digest(policy.model_dump(mode="json")),
                     "mapping_sha256": digest(mapping.model_dump()), "users_sha256": digest([c.model_dump(mode="json") for c in cases]),
-                    "case_count": len(cases), "complete_pack": bool(cases),
+                    "case_count": len(cases), "complete_pack": bool(cases), "campaign": campaign,
+                    "behaviour_plan_sha256": digest([c.plan.model_dump(mode='json') for c in cases]),
+                    "profiles": sorted({c.plan.profile for c in cases}),
+                    "planned_behaviours": sorted({e.id for c in cases for e in c.plan.events}),
                     "coverage": sorted({c.family for c in cases})}
         write_json(inputs / "manifest.json", manifest, immutable=True)
         write_json(private / "manifest.json", manifest, immutable=True)
@@ -122,6 +147,8 @@ def generate_packs(settings, roles, root, seed=42, packs=2, users=10):
 def load_pack(manifest_path):
     path = confined(manifest_path)
     manifest = json.loads(path.read_text())
+    if manifest.get("version") != VERSION:
+        raise ValueError("Pack version changed; regenerate packs before evaluating the revised harness")
     if not path.is_relative_to(ROOT / "artifacts") or path.name != "manifest.json" or path.parent.parent.name != "packs":
         raise ValueError("Expected an artifact pack manifest")
     if manifest["id"] != path.parent.name:
@@ -135,6 +162,7 @@ def load_pack(manifest_path):
         raise ValueError("Pack inputs must belong to their own manifest directory")
     values = {"policy_sha256": digest(policy.model_dump(mode="json")), "mapping_sha256": digest(mapping.model_dump()),
               "users_sha256": digest([c.model_dump(mode="json") for c in users]),
+              "behaviour_plan_sha256": digest([c.plan.model_dump(mode="json") for c in users]),
               "api_sha256": digest(json.loads(api_path.read_text())), "brief_sha256": hashlib.sha256(brief_path.read_bytes()).hexdigest()}
     if any(manifest.get(key) != value for key, value in values.items()):
         raise ValueError("Pack inputs or sealed expectations changed after generation")

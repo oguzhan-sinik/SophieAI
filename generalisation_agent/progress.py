@@ -5,8 +5,11 @@ from agent.builder.artifacts import encoded, write_json
 from agent.builder.config import AGENT, writable
 
 EVENTS = {"run_start", "run_end", "ADKModelCall_start", "ADKModelCall_end",
-          "ADKModelCall_error", "model_usage", "structured_output_retry"}
-FIELDS = {"at", "event", "component", "model", "role", "call_id", "status", "error"}
+          "ADKModelCall_error", "model_usage", "structured_output_retry",
+          "synthetic_render_accepted", "synthetic_render_rejected",
+          "synthetic_users_generated", "synthetic_packs_generated"}
+FIELDS = {"at", "event", "component", "model", "role", "call_id", "status", "error",
+          "pack", "attempt", "case_count"}
 TOKEN_FIELDS = {"cached_content_token_count", "candidates_token_count", "prompt_token_count",
                 "thoughts_token_count", "total_token_count"}
 

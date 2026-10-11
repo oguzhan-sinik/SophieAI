@@ -17,7 +17,7 @@ class Suite:
             raise ValueError("Suite needs unique cases and positive repetitions")
         # official_public: the kit's practice customers on the kit's bank. generated: customers the
         # builder wrote itself, which are never reported as an official result.
-        if self.evidence_type not in {"official_public", "generated"}:
+        if self.evidence_type not in {"official_public", "generated", "freya_chat_diagnostic", "freya_persona_diagnostic"}:
             raise ValueError("Unknown evidence type")
 
     @property
@@ -59,11 +59,11 @@ def score(raw, suite):
     """A missing result cannot pass, and an incomplete suite has no pass rate."""
     all_rows = raw.get("all_rows", [])
     by_case = verdicts(raw, suite)
-    observed = sum(type(row.get("pass")) is bool for rows in all_rows[:suite.repetitions] for row in rows if row.get("id") in by_case)
+    observed = sum(type(row.get("pass")) is bool and not row.get("unknown") for rows in all_rows[:suite.repetitions] for row in rows if row.get("id") in by_case)
     shape = len(all_rows) == suite.repetitions and all(len(rows) == len(suite.case_ids) and {r.get("id") for r in rows} == set(suite.case_ids) for rows in all_rows)
     total = len(suite.case_ids) * suite.repetitions
     outcomes = list(by_case.values())
-    unknown = outcomes.count(None)
+    unknown = sum(verdict is None or any(row.get("unknown") for rows in all_rows[:suite.repetitions] for row in rows if row.get("id") == case_id) for case_id, verdict in by_case.items())
     complete = bool(shape and observed == total and unknown == 0)
     return ScoreRecord(suite.key, suite.suite_hash, suite.evidence_type, suite.repetitions, len(outcomes), outcomes.count(True), outcomes.count(False), unknown,
                        outcomes.count(True) / len(outcomes) if complete else None, observed / total,

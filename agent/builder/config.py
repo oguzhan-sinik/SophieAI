@@ -1,5 +1,5 @@
 """Validated configuration; writable paths stay inside the two builder directories."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import time
@@ -36,6 +36,37 @@ def boolean(name, default):
     return value == "true"
 
 
+# TICKET-05: role -> model tier. Hard roles decide what is built and feed
+# calibration; medium roles are bounded independent checks; easy roles are
+# short, high-volume per-turn calls where the cheap model saves the most.
+TIER_ROLES = {
+    "hard": ("BriefAnalystAgent", "ADASDesignerAgent", "FixAgent", "synthetic_source_analyst"),
+    "medium": ("synthetic_brief_writer", "synthetic_brief_checker", "synthetic_transcript_judge",
+               "synthetic_transcript_reviewer", "synthetic_customer_validator",
+               "synthetic_transcript_validator", "synthetic_live_judge", "synthetic_live_reviewer"),
+    "easy": ("synthetic_customer_listener", "synthetic_customer",
+             "proxy_router", "proxy_dialogue", "proxy_extractor"),
+}
+TIER_DEFAULTS = {"medium": "openrouter/openai/gpt-6-luna-pro",
+                 "easy": "openrouter/deepseek/deepseek-v4.1-flash"}
+
+
+def role_tier(role):
+    return next((tier for tier, roles in TIER_ROLES.items() if role in roles), "hard")
+
+
+def tier_models(builder_model):
+    """Resolved {tier or role: model}. MODEL_TIER_* replaces a tier; ROLE_MODELS pins one role."""
+    models = {"hard": os.getenv("MODEL_TIER_HARD", "").strip() or builder_model}
+    for tier, default in TIER_DEFAULTS.items():
+        models[tier] = os.getenv("MODEL_TIER_" + tier.upper(), "").strip() or default
+    for pair in filter(None, os.getenv("ROLE_MODELS", "").split(",")):
+        role, _, model = pair.partition("=")
+        if role.strip() and model.strip():
+            models[role.strip()] = model.strip()
+    return models
+
+
 @dataclass(frozen=True)
 class Config:
     builder_model: str = "modal/Qwen/Qwen3.8-2.4T-A95B"
@@ -49,6 +80,7 @@ class Config:
     tracing: bool = True
     artifacts: Path = AGENT / "artifacts"
     runtime: Path = AGENT / ".runtime"
+    role_models: dict = field(default=None)
 
     def __post_init__(self):
         if not 30 <= self.max_wall_seconds <= 1800:
@@ -71,9 +103,18 @@ class Config:
         values = {k: int(os.getenv(v, str(getattr(cls, k)))) for k, v in ints.items()}
         if os.getenv("FREYA_MAX_CONCURRENT_SIMULATIONS", "1") != "1":
             raise ValueError("Freya permits exactly one simulation at a time")
-        return cls(**values, builder_model=os.getenv("BUILDER_MODEL") or cls.builder_model,
+        builder_model = os.getenv("BUILDER_MODEL") or cls.builder_model
+        return cls(**values, builder_model=builder_model, role_models=tier_models(builder_model),
                    official=boolean("EVAL_ENABLE_OFFICIAL_PUBLIC", True), tracing=boolean("LANGSMITH_TRACING", True),
                    artifacts=writable(AGENT / os.getenv("ARTIFACTS_DIR", "artifacts")))
+
+    @property
+    def models(self):
+        return self.role_models or tier_models(self.builder_model)
+
+    def role_model(self, role):
+        models = self.models
+        return models.get(role) or models[role_tier(role)]
 
 
 PROVIDER_KEYS = {"modal/": ("MODAL_BASE_URL", "MODAL_KEY", "MODAL_SECRET"), "doubleword/": ("DOUBLEWORD_API_KEY",), "qwencloud/": ("DASHSCOPE_API_KEY",), "openrouter/": ("OPENROUTER_API_KEY",), "anthropic/": ("ANTHROPIC_API_KEY",),
@@ -84,7 +125,7 @@ def missing_credentials(cfg):
     """Names (never values) of required keys that are unset for this configuration."""
     need = {"FREYA_API_KEY", "FREYA_BANK_TEAM_KEY"}
     for prefix, keys in PROVIDER_KEYS.items():
-        if cfg.builder_model.startswith(prefix):
+        if any(model.startswith(prefix) for model in set(cfg.models.values())):
             need |= set(keys)
     return sorted(key for key in need if not os.getenv(key, "").strip())
 

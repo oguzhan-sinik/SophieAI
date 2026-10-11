@@ -17,7 +17,7 @@ END = "# controller: end of runtime prelude"
 SAID = ("If the customer states a complete calendar date including its year, give it as YYYY-MM-DD. Otherwise give the customer's own final "
         "words for the day exactly as said (for example: tomorrow, this Friday, the 26th, 6 November) and do not work out a calendar date yourself.")
 # Words are captured, so without this a period would count as a given day in every `is_set` route.
-SINGLE_DAY = ("Fill this only when the words name one single day. A period or a condition (for example: next week, the week after next, "
+SINGLE_DAY = ("Extract only the date for the current requested slot; ignore dates of appointments, other products or unrelated stories. A correction replaces the previous date. Fill this only when the words name one single day. A period or a condition (for example: next week, the week after next, "
               "end of the month, in a few days, when my salary comes) is not a day: leave this variable out entirely.")
 
 # Pure calendar arithmetic. Interpretation of ambiguous wording is a parameter, never a constant:
@@ -245,6 +245,116 @@ def ctl_last_business_day_of_week(day, weekdays, excluded):
     except Exception:
         return ""
 '''
+
+HUMAN_HELPERS = r'''
+# Text speech state; callers supply completeness/provenance and policy themselves.
+import json
+
+
+def ctl_digits(said):
+    tokens = re.findall(r'[a-z]+|[0-9]+', str(said or '').lower())
+    parts = []
+    for token in tokens:
+        if token.isdigit():
+            parts.append(token)
+        elif token in CTL_UNITS[:10]:
+            parts.append(str(CTL_UNITS.index(token)))
+        elif token in ('oh', 'o'):
+            parts.append('0')
+        elif token not in ('and',):
+            return ''
+    return ''.join(parts)
+
+
+def ctl_identity_date(said):
+    """Identity has no default year: require one explicitly spoken birth/security year."""
+    text = str(said or '').lower()
+    exact = re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', text.strip())
+    if exact:
+        try:
+            return datetime.date.fromisoformat(text.strip()).isoformat()
+        except Exception:
+            return ''
+    tokens = re.findall(r'[a-z]+|[0-9]+', text)
+    numbers = ctl_numbers(tokens)
+    months = [i for i,t in enumerate(tokens) if t in CTL_MONTHS]
+    if len(months) != 1:
+        return ''
+    years = set(ctl_years(tokens, numbers, months[0]))
+    if len(years) != 1:
+        return ''
+    year = next(iter(years))
+    return ctl_date(text, str(year) + '-01-01')
+
+
+def ctl_slot(values, name, value, raw, complete, turn, correction=False):
+    """Incomplete/revised speech clears the routable value, retains raw provenance."""
+    values[name + '_raw'] = str(raw or '')
+    values[name + '_turn'] = str(turn)
+    values[name + '_complete'] = 'yes' if complete and value not in (None, '') else 'no'
+    if correction:
+        values[name + '_revision'] = str(int(values.get(name + '_revision', '0')) + 1)
+    if values[name + '_complete'] == 'yes':
+        values[name] = str(value)
+    else:
+        values.pop(name, None)
+    return values[name + '_complete'] == 'yes'
+
+
+def ctl_cents(amount):
+    """Canonical numeric money only; ambiguous words are clarified by extraction."""
+    text = str(amount).strip()
+    if not re.fullmatch(r'[0-9]+(?:\.[0-9]{1,2})?', text):
+        return ''
+    parts = text.split('.')
+    cents = int(parts[0]) * 100 + int((parts[1] if len(parts) > 1 else '').ljust(2, '0'))
+    return str(cents) if cents > 0 else ''
+
+
+def ctl_proposal(values, product, amount, day):
+    """Each changed tuple creates a revision and invalidates only its own consent."""
+    try:
+        records = json.loads(values.get('ctl_proposals', '{}'))
+        cents = ctl_cents(amount)
+        parsed = datetime.date.fromisoformat(str(day)).isoformat()
+        if not cents or not product:
+            ctl_invalidate(values, product)
+            return ''
+        old = records.get(product, {})
+        if old.get('cents') != cents or old.get('date') != parsed:
+            records[product] = {'cents':cents, 'date':parsed, 'revision':old.get('revision', 0)+1, 'agreed':0}
+        values['ctl_proposals'] = json.dumps(records)
+        return str(records[product]['revision'])
+    except Exception:
+        # A malformed correction must not leave old consent usable.
+        ctl_invalidate(values, product)
+        return ''
+
+
+def ctl_invalidate(values, product):
+    records = json.loads(values.get('ctl_proposals', '{}'))
+    if product in records:
+        records[product]['agreed'] = 0
+    values['ctl_proposals'] = json.dumps(records)
+
+
+def ctl_consent(values, product, revision, explicit):
+    records = json.loads(values.get('ctl_proposals', '{}'))
+    proposal = records.get(product, {})
+    matched = explicit is True and str(proposal.get('revision', '')) == str(revision)
+    if matched:
+        proposal['agreed'] = proposal['revision']
+        values['ctl_proposals'] = json.dumps(records)
+    return matched
+
+
+def ctl_write_ready(values, product, amount, day):
+    proposal = json.loads(values.get('ctl_proposals', '{}')).get(product, {})
+    return bool(proposal.get('revision') and proposal.get('agreed') == proposal.get('revision')
+                and proposal.get('cents') == ctl_cents(amount) and proposal.get('date') == str(day))
+'''
+
+DATE_HELPERS += HUMAN_HELPERS
 
 DATE_APPLY = '''
 try:

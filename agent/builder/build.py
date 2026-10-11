@@ -43,6 +43,8 @@ def call_records(folder, raw, limit=80):
             call = recorded.get(row.get('id'))
             if not isinstance(call, dict):
                 continue
+            # Simulator agendas/validator inputs are private, never repair instructions.
+            call = {key: value for key, value in call.items() if key != 'actor_quality'}
             turns = call.get('turns', [])
             visited.setdefault(row['id'], set()).update(turn['node'] for turn in turns if turn.get('node'))
             if row.get('pass') is not True and row['id'] not in failed:
@@ -106,7 +108,8 @@ class Builder:
         for attempt in range(2):
             try:
                 proposal = self.roles.ask('BriefAnalystAgent', "Extract the brief's rules with their source lines", prompts.ANALYST,
-                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle)
+                                          {'documents': self.documents, 'contracts': self.contracts, 'compiler_errors': errors}, RequirementsBundle,
+                                          max_tokens=24000)
                 requirements = validate_requirements(proposal, self.documents)
                 write_json(self.root / 'requirements.json', requirements, immutable=True)
                 return requirements
@@ -133,7 +136,8 @@ class Builder:
         payload = {'documents': self.documents, 'contracts': self.contracts, 'runtime_docs': self.docs()}
         if self.requirements:
             payload['requirements'] = self.requirements
-        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec)
+        return self.roles.ask('ADASDesignerAgent', 'Design the phone agent workflow from the brief', prompts.DESIGN, payload, WorkflowSpec,
+                              max_tokens=32000)
 
     def fix(self, purpose, source, problems, hints=(), calls=None, wording_only=False, docs=False):
         """The one way a workflow is changed after its design: a patch of small edits to its source."""
@@ -246,7 +250,8 @@ class Builder:
 
     def simulation_fits(self, extra=0):
         """Never start a simulation that cannot finish inside the build budget."""
-        return bool(self.suite) and self.simulations + self.suite.repetitions <= self.cfg.max_simulations and \
+        units = getattr(self.evaluation_provider, 'simulations_per_measure', 1)
+        return bool(self.suite) and self.simulations + units * self.suite.repetitions <= self.cfg.max_simulations and \
             self.deadline.remaining() >= extra + 1.2 * (self.slowest or (self.evaluation_provider.seconds_per_repetition if self.evaluation_provider else FIRST_SIMULATION)) * self.suite.repetitions
 
     def deploy(self, cid):
@@ -262,7 +267,7 @@ class Builder:
         raw = {'all_rows': []}
         try:
             self.deploy(cid)
-            self.simulations += self.suite.repetitions
+            self.simulations += getattr(self.evaluation_provider, 'simulations_per_measure', 1) * self.suite.repetitions
             raw = self.evaluation_provider.evaluate(self.archive.workflow(cid), self.adapter, folder, self.roles, self.deadline) if self.evaluation_provider else self.adapter.evaluate(self.cases, self.suite, folder)
         except Exception as exc:
             self.trace.event('benchmark_incomplete', candidate_id=cid, error=type(exc).__name__, message=self.trace.redact(str(exc))[:300])

@@ -48,7 +48,13 @@ class DockerCode:
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise Unsupported("Docker runtime unavailable") from exc
         if result.returncode:
-            raise Unsupported(f"Docker/image unavailable; prepare with docker pull {self.image}")
+            # Some containerd stores lose the digest ref while the image stays runnable; verify the
+            # exact pinned digest by actually resolving it with --pull=never, never a different image.
+            probe = subprocess.run(["docker", "run", "--rm", "--pull=never", "--network=none", self.image,
+                                    "python", "-I", "-B", "-S", "-c", "pass"],
+                                   capture_output=True, text=True, timeout=self.deadline.timeout(30))
+            if probe.returncode:
+                raise Unsupported(f"Docker/image unavailable; prepare with docker pull {self.image}")
 
     def run(self, code, variables, config=None, result=None):
         errors = code_errors(code, hook=config is not None or result is not None)

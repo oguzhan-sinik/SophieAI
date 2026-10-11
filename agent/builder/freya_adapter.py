@@ -257,8 +257,8 @@ class FreyaAdapter:
             except Exception:
                 continue
 
-    def evaluate(self, cases, suite, folder):
-        if suite.evidence_type != "official_public":
+    def evaluate(self, cases, suite, folder, *, persona_specs=None):
+        if suite.evidence_type not in {"official_public", "freya_persona_diagnostic"}:
             raise ValueError("Freya runner only evaluates official public suites")
         if not os.getenv("FREYA_BANK_TEAM_KEY") or len(os.environ["FREYA_BANK_TEAM_KEY"]) < 16:
             raise ValueError("FREYA_BANK_TEAM_KEY must contain at least 16 characters")
@@ -269,7 +269,13 @@ class FreyaAdapter:
         scorer = load_module("score", KIT / "tools/score.py")
         runner = load_module("kit_public_runner", KIT / "tools/run_cases.py")
         ids = {}
-        persona_specs = [runner.persona_for(case, {"identity": case["identity"]}, suite.style or None) for case in cases]
+        if suite.evidence_type == "official_public" and persona_specs is not None:
+            raise ValueError("Custom personas require a diagnostic suite identity")
+        if suite.evidence_type == "freya_persona_diagnostic" and persona_specs is None:
+            raise ValueError("Persona diagnostics require frozen custom specifications")
+        persona_specs = persona_specs or [runner.persona_for(case, {"identity": case["identity"]}, suite.style or None) for case in cases]
+        if len(persona_specs) != len(cases):
+            raise ValueError("Persona count must match frozen cases")
         made = self.client.create_personas(persona_specs)["personas"]
         if len(made) != len(cases):
             raise ValueError("Persona response length mismatch")
@@ -329,6 +335,8 @@ class FreyaAdapter:
                 write_json(folder / "raw_runner.json", self.trace.redact(raw))
                 write_json(folder / f"iteration_{repetition}.json", self.trace.redact(iterations[-1]))
                 write_json(folder / f"ledgers_{repetition}.json", self.trace.redact(list(ledgers.values())))
+                if suite.evidence_type == "freya_persona_diagnostic":
+                    write_json(folder / f"ledgers_by_customer_{repetition}.json", self.trace.redact(ledgers))
                 write_json(folder / f"calls_{repetition}.json", self.trace.redact({row["id"]: compact_call(calls[row["call_id"]]) for row in rows if row.get("call_id") in calls}))
                 self.trace.event("official_result", suite_key=suite.key, repetition=repetition, passed=sum(r["pass"] for r in rows), total=len(rows), status=status)
             return raw

@@ -2,6 +2,11 @@ from pathlib import Path
 from types import SimpleNamespace
 import shutil
 import tempfile
+from threading import Barrier
+
+from agent.builder.adk import ADKRoles
+from agent.builder.artifacts import Trace
+from agent.builder.config import Config
 
 import pytest
 
@@ -16,7 +21,7 @@ def test_unsupported_execution_cannot_turn_into_a_failed_or_passing_suite():
         def __init__(self, *args, **kwargs): pass
         def run(self): return {"ended": None, "unknown": ["Unsupported audio"], "turns": [], "ledger": {"calls": []}}
     policy = sample_policy(42)
-    roles = SimpleNamespace(cfg=SimpleNamespace(builder_model="fixture"))
+    roles = SimpleNamespace(cfg=SimpleNamespace(builder_model="fixture", models={"hard": "fixture"}))
     (ROOT / "private").mkdir(exist_ok=True)
     path = Path(tempfile.mkdtemp(dir=ROOT / "private", prefix="test-eval-"))
     try:
@@ -40,3 +45,34 @@ def test_observed_policy_failure_survives_judge_abstention():
     judge = SimpleNamespace(grade=lambda *args: {"failed": [], "unknown": ["judge unavailable"], "hard_failures": []})
     result = grade_case(policy, customer, {"ended": "end_call", "unknown": [], "turns": [], "ledger": bank.ledger}, judge)
     assert result["pass"] is False and result["verified_hard_failure"] and result["unknown"]
+
+
+def test_two_offline_cases_run_concurrently_with_separate_roles(monkeypatch):
+    from generalisation_agent import evaluation
+    barrier = Barrier(2)
+    worker_roots = set()
+
+    class Runner:
+        def __init__(self, workflow, policy, mapping, customer, roles, deadline, **kwargs):
+            worker_roots.add(roles.root)
+
+        def run(self):
+            barrier.wait(timeout=3)
+            return {"ended":"end_call", "unknown":[], "turns":[], "ledger":{"calls":[]}}
+
+    monkeypatch.setattr(evaluation, 'grade_case', lambda *args: {
+        'pass':True, 'failed':[], 'unknown':[], 'verified_hard_failure':False})
+    policy = sample_policy(42)
+    (ROOT / 'private').mkdir(exist_ok=True)
+    path = Path(tempfile.mkdtemp(dir=ROOT / 'private', prefix='test-parallel-'))
+    try:
+        cfg = Config(tracing=False)
+        roles = ADKRoles(cfg, Deadline(60), Trace(path / 'parent-trace.jsonl', {}, remote=False), path)
+        report, raw = evaluate_workflow({'nodes':{}}, policy, sample_mapping(), customers_for(policy, 42, 2),
+                                        roles, roles.deadline, path / 'eval', 1, runner_factory=Runner, workers=2)
+        assert report['score']['complete'] and len(raw['all_rows'][0]) == 2
+        assert len(worker_roots) == 2
+        assert all((root / 'trace.jsonl').exists() for root in worker_roots)
+        assert roles.calls == 0
+    finally:
+        shutil.rmtree(path)

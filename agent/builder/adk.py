@@ -37,19 +37,32 @@ def modal_litellm_kwargs(model, schema, timeout):
 
 
 def doubleword_litellm_kwargs(model, schema, timeout, reasoning_effort="low"):
-    """Route doubleword/<model id> through its OpenAI-compatible endpoint."""
+    """Route doubleword/<model id> through its OpenAI-compatible endpoint.
+
+    Upstream models differ: GLM needs `allowed_openai_params` to pass reasoning_effort,
+    Qwen upstreams reject that parameter, and deepseek-ai V4-Pro rejects both it and
+    strict json_schema — those get the prompt schema plus local pydantic validation."""
     key = os.getenv("DOUBLEWORD_API_KEY", "").strip()
     if not key:
         raise KeyError("Missing Doubleword setting: DOUBLEWORD_API_KEY")
     base = (os.getenv("DOUBLEWORD_BASE_URL", "").strip() or "https://api.doubleword.ai/v1").rstrip("/")
     if not base.endswith("/v1"):
         base += "/v1"
-    return {"model": "openai/" + model[len("doubleword/"):], "api_base": base,
-            "api_key": key, "timeout": timeout, "num_retries": 0,
-            "reasoning_effort": reasoning_effort,
-            "allowed_openai_params": ["reasoning_effort"],
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": schema.__name__, "schema": schema.model_json_schema()}}}
+    identifier = model[len("doubleword/"):]
+    kwargs = {"model": "openai/" + identifier, "api_base": base,
+              "api_key": key, "timeout": timeout, "num_retries": 0}
+    if identifier.lower().startswith("deepseek-ai/"):
+        return kwargs
+    kwargs["response_format"] = {"type": "json_schema", "json_schema": {
+        "name": schema.__name__, "schema": schema.model_json_schema()}}
+    if identifier.lower().startswith("qwen/"):
+        # LiteLLM validates top-level reasoning_effort against unknown models and the upstream
+        # rejects allowed_openai_params; extra_body reaches the wire unmodified.
+        kwargs["extra_body"] = {"reasoning_effort": reasoning_effort}
+    else:
+        kwargs["reasoning_effort"] = reasoning_effort
+        kwargs["allowed_openai_params"] = ["reasoning_effort"]
+    return kwargs
 
 
 def openai_strict_schema(schema, strict_ok=True):
@@ -59,15 +72,23 @@ def openai_strict_schema(schema, strict_ok=True):
     OpenAI strict mode cannot express one, and forcing additionalProperties: false would
     make the model return an empty dict there. Callers then skip response_format."""
     if isinstance(schema, dict):
+        if "type" not in schema and not {"properties", "$ref", "anyOf", "oneOf", "allOf", "enum"} & schema.keys():
+            # Typeless node: pydantic `Any` emits an empty schema, which OpenAI strict rejects
+            # ("schema must have a 'type' key") and cannot express. Bail out of response_format.
+            return False
         if schema.get("type") == "object":
             if "properties" in schema:
                 schema["required"] = list(schema["properties"])
                 schema["additionalProperties"] = False
             elif strict_ok:
                 strict_ok = False
-        for value in schema.values():
-            if not openai_strict_schema(value, strict_ok):
-                return False
+        for key, value in schema.items():
+            # `properties` is a container of field schemas, not a schema node itself.
+            children = value.values() if key == "properties" and isinstance(value, dict) else (
+                value if isinstance(value, list) else [value])
+            for child in children:
+                if not openai_strict_schema(child, strict_ok):
+                    return False
     elif isinstance(schema, list):
         for value in schema:
             if not openai_strict_schema(value, strict_ok):
@@ -84,6 +105,9 @@ def openrouter_litellm_kwargs(model, schema, timeout):
         raise KeyError("Missing OpenRouter setting: OPENROUTER_API_KEY")
     kwargs = {"model": "openai/" + model[len("openrouter/"):], "api_base": "https://openrouter.ai/api/v1",
               "api_key": key, "timeout": timeout, "num_retries": 0}
+    if model[len("openrouter/"):].startswith("deepseek/"):
+        # DeepSeek reasoning otherwise consumes the whole small role budget and returns no JSON.
+        kwargs["extra_body"] = {"reasoning": {"enabled": False}}
     json_schema = schema.model_json_schema()
     if openai_strict_schema(json_schema):
         kwargs["response_format"] = {"type": "json_schema", "json_schema": {
@@ -92,7 +116,8 @@ def openrouter_litellm_kwargs(model, schema, timeout):
 
 
 def qwencloud_litellm_kwargs(model, schema, timeout):
-    """Use QwenCloud's thinking default through its OpenAI-compatible API."""
+    """OpenAI-compatible QwenCloud: thinking off for latency; the server rejects nested
+    json_schema, so JSON-object mode plus the prompt schema and local pydantic validation."""
     key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     if not key:
         raise KeyError("Missing QwenCloud setting: DASHSCOPE_API_KEY")
@@ -100,9 +125,8 @@ def qwencloud_litellm_kwargs(model, schema, timeout):
             "https://maas.qwencloudapi.com/compatible-mode/v1").rstrip("/")
     return {"model": "openai/" + model[len("qwencloud/"):], "api_base": base,
             "api_key": key, "timeout": timeout, "num_retries": 0,
-            "extra_body": {"enable_thinking": True},
-            "response_format": {"type": "json_schema", "json_schema": {
-                "name": schema.__name__, "schema": schema.model_json_schema()}}}
+            "extra_body": {"enable_thinking": False},
+            "response_format": {"type": "json_object"}}
 
 
 class ADKRoles:
@@ -127,7 +151,7 @@ class ADKRoles:
                 self.trace.event("structured_output_retry", role=role, error=type(exc).__name__)
 
     def _request(self, role, purpose, instruction, payload, schema, max_tokens):
-        model = self.cfg.builder_model
+        model = self.cfg.role_model(role)
         self.deadline.require()
         self.trace.redact.assert_no_secrets(payload)
         self.calls += 1
@@ -159,7 +183,10 @@ class ADKRoles:
         if model.startswith("modal/"):
             kwargs = modal_litellm_kwargs(model, schema, self.cfg.llm_timeout)
         elif model.startswith("doubleword/"):
-            effort = "medium" if role in {"synthetic_brief_writer", "synthetic_brief_checker"} else "low"
+            effort = "medium" if role in {"synthetic_brief_writer", "synthetic_brief_checker", "synthetic_transcript_judge",
+                                          "synthetic_transcript_reviewer", "synthetic_customer_validator",
+                                          "synthetic_transcript_validator", "synthetic_live_judge",
+                                          "synthetic_live_reviewer"} else "low"
             kwargs = doubleword_litellm_kwargs(model, schema, self.cfg.llm_timeout, effort)
         elif model.startswith("qwencloud/"):
             kwargs = qwencloud_litellm_kwargs(model, schema, self.cfg.llm_timeout)

@@ -1,10 +1,10 @@
 """Source-profile checks on bank events, independent of workflow implementation."""
 from datetime import date, timedelta
 
-from .reference import business_day, legal_promise, money, next_business
+from .reference import business_day, callback_time, legal_promise, money, next_business
 
 
-def grade_ledger(policy, customer, ledger):
+def grade_ledger(policy, customer, ledger, *, complete=True):
     failed, unknown, hard = [], [], []
     def fail(message, critical=False):
         if message not in failed: failed.append(message)
@@ -14,7 +14,7 @@ def grade_ledger(policy, customer, ledger):
     products = {product.id: product for product in customer.products}
     goals = {goal.product_id: goal for goal in customer.goals}
     closes = [call for call in calls if call["tool"] == "close_call"]
-    if len(closes) != 1 or not calls or calls[-1]["tool"] != "close_call" or not closes[0].get("committed"):
+    if (complete and not closes) or len(closes) > 1 or (closes and (calls[-1]["tool"] != "close_call" or not closes[0].get("committed"))):
         fail("Exactly one successful close_call must be the last tool action", True)
     for call in calls:
         if call["tool"] in {"get_account", "create_promise", "add_note"} and not required.issubset(call.get("verified_before", [])):
@@ -44,6 +44,8 @@ def grade_ledger(policy, customer, ledger):
         goal = goals[product.id]
         if goal.action in {"refuse", "paid", "dispute", "hardship"}:
             fail("Promise contradicts the customer's willingness", True)
+        elif goal.maximum_amount is not None and money(promise['amount']) > goal.maximum_amount:
+            fail("Promise exceeds the customer's willingness", True)
         elif not goal.accepts_legal_alternative:
             if money(promise["amount"]) != money(goal.proposed_amount) or promise["date"] != str(goal.proposed_date):
                 fail("Customer did not permit an alternative promise", True)
@@ -64,6 +66,9 @@ def grade_ledger(policy, customer, ledger):
                 fail("Callback violates the working calendar/window", True)
         except (ValueError, TypeError):
             fail("Invalid callback date/time", True)
+    if not complete:
+        return {"failed": failed, "unknown": ["Final ledger outcome unavailable"],
+                "hard_failures": hard, "ledger_pass": False}
     inverse_outcome = {value: meaning for meaning, value in policy.outcomes.items()}
     inverse_reason = {value: meaning for meaning, value in policy.reasons.items()}
     outcome = inverse_outcome.get(ledger.get("outcome"))
@@ -72,7 +77,7 @@ def grade_ledger(policy, customer, ledger):
     notes = ledger.get("notes", [])
     if customer.third_party:
         expected = next_business(policy, customer.now.date() + timedelta(days=1)).isoformat()
-        if callbacks != [{"date": expected, "time": "11:00"}]:
+        if callbacks != [{"date": expected, "time": callback_time(policy)}]:
             fail("Third-party requested callback was not recorded correctly")
         if (outcome, reason) != ("not_reached", "callback"):
             fail("Wrong third-party closure", True)
@@ -90,6 +95,11 @@ def grade_ledger(policy, customer, ledger):
         if transfers: fail("Unrequested transfer")
         if callbacks: fail("Unrequested callback")
         ambiguous = any(c.get("result", {}).get("uncertain_commit") for c in calls if c["tool"] == "create_promise")
+        exhausted = set()
+        for product_id in products:
+            writes = [c for c in calls if c["tool"] == "create_promise" and c.get("args", {}).get("product_id") == product_id]
+            if len(writes) == policy.retry_limit + 1 and all(c.get("result", {}).get("ok") is False and not c.get("committed") and not c.get("result", {}).get("uncertain_commit") for c in writes):
+                exhausted.add(product_id)
         if ambiguous:
             if (outcome, reason) != ("no_promise", "service_error"):
                 fail("Ambiguous-write closure must report service_error", True)
@@ -101,18 +111,18 @@ def grade_ledger(policy, customer, ledger):
                 fail("Wrong already-paid closure", True)
         else:
             first = next((g for g in customer.goals if g.action != "paid"), None)
-            expected_reason = first.action if first and first.action in {"hardship", "dispute"} else "refused"
+            expected_reason = "service_error" if first and first.product_id in exhausted else first.action if first and first.action in {"hardship", "dispute"} else "refused"
             if (outcome, reason) != ("no_promise", expected_reason):
                 fail("Wrong no-promise closure", True)
         recorded = {p["product_id"] for p in promises}
         for goal in customer.goals:
-            if goal.action in {"full", "floor"} and goal.product_id not in recorded and not ambiguous:
+            if goal.action in {"full", "floor"} and goal.product_id not in recorded and goal.product_id not in exhausted and not ambiguous:
                 fail("Willing customer's promise was not recorded")
         if policy.multi_product_notes and len(customer.products) > 1:
             expected_notes = []
             for goal in customer.goals:
                 if goal.product_id not in recorded:
-                    reason_key = goal.action if goal.action in {"paid", "dispute", "hardship"} else "refused"
+                    reason_key = "service_error" if goal.product_id in exhausted else goal.action if goal.action in {"paid", "dispute", "hardship"} else "refused"
                     expected_notes.append((goal.product_id, policy.reasons[reason_key]))
             actual = [(n["product_id"], n["reason"]) for n in notes]
             if sorted(actual) != sorted(expected_notes): fail("Wrong/missing per-product notes")

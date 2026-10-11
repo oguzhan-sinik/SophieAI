@@ -58,7 +58,9 @@ def test_calibration_invalidates_model_mapping_and_incomplete_controls():
     p, m = sample_policy(42), sample_mapping()
     api = openapi_for(p, m, "fingerprint")
     record = {"admitted": True, "fingerprint": fingerprint(p, m, api, "fixture"), "false_passes": 0,
-              "false_failures": 0, "unknowns": 0, "controls": [{}] * 11}
+              "false_failures": 0, "unknowns": 0, "controls": [{"target_detected": True}] * 12}
+    assert not admitted(record, p, m, api, "fixture")
+    record["actor"] = {"fingerprint": record["fingerprint"], "admitted": True, "controls": [{"passed": True}] * 9}
     assert admitted(record, p, m, api, "fixture")
     assert not admitted(record, p, m, api, "other-model")
     assert not admitted({**record, "unknowns": 1}, p, m, api, "fixture")
@@ -72,7 +74,8 @@ def test_official_ranking_is_separate_and_only_calibrated_exact_hash_can_veto():
     p, m = sample_policy(42), sample_mapping()
     api, customers = openapi_for(p, m, "selection"), customers_for(p, 42, 1)
     record = {"admitted": True, "fingerprint": fingerprint(p, m, api, "fixture"), "false_passes": 0,
-              "false_failures": 0, "unknowns": 0, "controls": [{}] * 11}
+              "false_failures": 0, "unknowns": 0, "controls": [{"target_detected": True}] * 12}
+    record["actor"] = {"fingerprint": record["fingerprint"], "admitted": True, "controls": [{"passed": True}] * 9}
     provider = GeneratedProvider(p, m, api, customers, "fixture", 1, record)
     official = Suite(("PUB-01",), "official", "official_public", 1)
     assert provider.bind(official, ["PUB-01"]) == (official, ["PUB-01"])
@@ -223,7 +226,7 @@ def test_holdout_users_only_enter_post_build_evaluation(monkeypatch, work):
     monkeypatch.setattr(integration, "missing_credentials", lambda cfg: [])
     trace = SimpleNamespace(close=lambda **k: None)
     roles = SimpleNamespace(cfg=Config(builder_model="fixture"))
-    monkeypatch.setattr(integration, "model_context", lambda cfg: (roles, trace, Deadline(1800), work))
+    monkeypatch.setattr(integration, "model_context", lambda *a, **k: (roles, trace, Deadline(1800), work))
     monkeypatch.setattr(integration, "interpret_source", lambda *a: (_ for _ in ()).throw(AssertionError("No holdout preparation")))
     monkeypatch.setattr(integration, "calibrate", lambda *a: (_ for _ in ()).throw(AssertionError("No holdout case feedback")))
     built = []
@@ -259,10 +262,10 @@ def test_calibration_abstention_blocks_admission(monkeypatch, work):
         def __init__(self, *a, **k): pass
         def run(self): return recording
     judge = SimpleNamespace(grade=lambda *a: {"failed": [], "unknown": ["independent judges disagree"], "hard_failures": []})
-    roles = SimpleNamespace(cfg=SimpleNamespace(builder_model="fixture"))
+    roles = SimpleNamespace(cfg=SimpleNamespace(builder_model="fixture", models={"hard": "fixture"}))
     result = calibration.calibrate(p, m, api, roles, Deadline(60), work / "calibration", runner_factory=Runner, judge=judge)
     assert not result["admitted"] and result["unknowns"] >= 1
-    assert len(result["controls"]) == 11
+    assert len(result["controls"]) == 12
 
 
 def test_confirmation_proofs_must_precede_the_exact_write():

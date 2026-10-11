@@ -3,9 +3,9 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 import random
 
-from .models import (Band, Customer, Fault, Goal, IdentityField, Mapping, OPERATIONS,
+from .models import (Band, Behaviour, BehaviourPlan, Customer, Fault, Goal, IdentityField, Mapping, OPERATIONS,
                      OUTCOMES, Policy, Product, REASONS)
-from .reference import deadline, floor
+from .reference import business_day, callback_time, deadline, floor
 
 FAMILIES = ("Full payment", "Third party", "Identity boundary", "Amount correction",
             "Calendar boundary", "Hardship", "Already paid or dispute",
@@ -103,12 +103,13 @@ def openapi_for(policy, mapping, pack_id):
             "promise_id": {"type": "string"}, "uncertain_commit": {"type": "boolean"},
             "status_code": {"type": "integer"},
         }}
-        response["properties"] = {mapping.response_fields[k]: v for k, v in response["properties"].items()}
+        response["properties"] = {mapping.response_fields[k]: v for k, v in response["properties"].items() if k in mapping.response_fields}
         if operation == "get_account":
             response["properties"][mapping.products_key] = {"type": "array", "items": {
                 "type": "object", "properties": {field: {"type": "number" if key in {"balance", "minimum"} else
                                                                "integer" if key == "days_late" else "string"}
-                                                          for key, field in mapping.product_fields.items()}}}
+                                                          for key, value in mapping.product_fields.items()
+                                                          for field in (value.values() if isinstance(value, dict) else [value])}}}
         if mapping.response_root:
             response = {"type": "object", "properties": {mapping.response_root: response}, "required": [mapping.response_root]}
         paths["/" + operation] = {"post": {"operationId": operation, "description": descriptions[operation],
@@ -121,30 +122,92 @@ def openapi_for(policy, mapping, pack_id):
             "servers": [{"url": f"https://{pack_id}.synthetic.invalid/v1"}], "paths": paths}
 
 
-def customers_for(policy, seed, count=10):
+def plan_for(customer, seed, profile='ordinary'):
+    events = []
+    if profile != 'baseline':
+        if customer.third_party:
+            events = [Behaviour(id='B15', kind='question', trigger='any')]
+        else:
+            field = next((k for k, v in customer.identity.items() if v.isdigit()), next(iter(customer.identity)))
+            choices = [Behaviour(id='B01', kind='fragment', trigger='identity', target=field),
+                       Behaviour(id='B10', kind='question', trigger='identity', question_topic='digital' if seed % 3 == 0 else 'purpose'),
+                       Behaviour(id='B09', kind='tangent', trigger='identity'),
+                       Behaviour(id='B07', kind='words', trigger='offer'),
+                       Behaviour(id='B04', kind='self_repair', trigger='offer')]
+            events = [choices[seed % len(choices)]]
+            if profile == 'stress':
+                slot = seed % 7
+                dob = next((k for k,v in customer.identity.items() if len(v) == 10 and v[4] == '-'), None)
+                if slot == 0 and dob:
+                    events = [Behaviour(id='B03', kind='date_split', trigger='identity', target=dob), choices[3]]
+                elif slot == 1:
+                    events = [Behaviour(id='B08', kind='relative', trigger='offer'), choices[4]]
+                elif slot == 2:
+                    events = [Behaviour(id='B11', kind='mixed', trigger='offer'), choices[3]]
+                elif slot == 3:
+                    events = [Behaviour(id='B12', kind='backchannel', trigger='readback'), choices[2]]
+                elif len(customer.products) > 1:
+                    events = [Behaviour(id='B13', kind='reference', trigger='offer'), choices[2], choices[3]]
+                else:
+                    events = [choices[0], Behaviour(id='B02', kind='question', trigger='identity', target=field), choices[3]]
+        if not customer.third_party and customer.identity_terminal:
+            field = next(iter(customer.wrong_answers))
+            events = [Behaviour(id='B10', kind='question', trigger='identity', target=field)] if profile == 'ordinary' else [Behaviour(id='B16', kind='tangent', trigger='identity', target=field)]
+        elif not customer.third_party and (customer.transfer or all(g.action not in {'full','floor'} for g in customer.goals)):
+            events = [Behaviour(id='B10',kind='question',trigger='identity')] if profile == 'ordinary' else [Behaviour(id='B09',kind='tangent',trigger='identity'), Behaviour(id='B14',kind='situation',trigger='any')]
+        elif customer.faults and profile == 'stress':
+            events = [Behaviour(id='B16',kind='tangent',trigger='identity'), choices[3]]
+        if customer.correction:
+            goal = next(g for g in customer.goals if g.action in {'full', 'floor'})
+            product = next(p for p in customer.products if p.id == goal.product_id)
+            revised = min(goal.maximum_amount or product.balance, product.minimum)
+            events.append(Behaviour(id='B05', kind='correction', trigger='readback', target=goal.product_id, amount=revised))
+    for event in events:
+        if event.kind == 'tangent':
+            event.amount = Decimal('17.40')
+            event.day = customer.now.date() + timedelta(days=2 + seed % 3)
+    return BehaviourPlan(seed=seed, profile=profile, events=events)
+
+
+def customers_for(policy, seed, count=10, *, campaign=False):
+    if campaign:
+        if count != 30:
+            raise ValueError('Release campaign has exactly thirty customers per pack')
+        base = customers_for(policy, seed, 10)
+        users = []
+        for profile in ('baseline', 'ordinary', 'stress'):
+            for index, original in enumerate(base):
+                customer = original.model_copy(deep=True)
+                customer.id += '_' + profile
+                customer.plan = plan_for(customer, seed + index, profile)
+                users.append(Customer.model_validate(customer.model_dump()))
+        return users
     if not 1 <= count <= 10:
         raise ValueError("The approved starting cap is ten users per pack/build")
     rng = random.Random(f"users:{seed}")
     users = []
-    for index in range(count):
-        now = datetime(2028, 12, 20 + index % 9, 11, 0)
+    anchor = min(policy.holidays) - timedelta(days=5) if policy.holidays else date(2028, 12, 20)
+    for index in range(10):
+        now = datetime.combine(anchor + timedelta(days=index % 9), datetime.min.time()).replace(hour=11)
         products = []
         total = 3 if index in {7, 9} else 1
         for j in range(total):
             balance = Decimal(rng.randrange(45000, 150000)) / 100
             products.append(Product(id=f"product_{j+1}", kind=("credit_card", "personal_loan", "car_loan")[j],
                                     balance=balance, minimum=(balance * Decimal(".20")).quantize(Decimal(".01")),
-                                    days_late=policy.bands[j % len(policy.bands)].first))
+                                    days_late=policy.bands[j % len(policy.bands)].last if index == 3 else policy.bands[j % len(policy.bands)].first,
+                                    card_last4=f"{rng.randrange(10000):04d}" if j == 0 else None))
         goals = []
         for j, product in enumerate(products):
-            action = "floor" if index in {3, 4} else "hardship" if index == 5 else "paid" if index == 6 else "refuse" if index == 7 and j else "full"
-            requested = date(2028, 12, 25) if index == 4 else deadline(policy, product, now) if index in {7, 9} else now.date()
+            action = "floor" if index in {3, 4} else "hardship" if index == 5 else ("paid" if seed % 2 == 0 else "dispute") if index == 6 else "refuse" if index == 7 and j else "full"
+            requested = next((now.date() + timedelta(days=d) for d in range(15) if not business_day(policy, now.date() + timedelta(days=d))), deadline(policy, product, now) + timedelta(days=1)) if index == 4 else deadline(policy, product, now) if index in {7, 9} else now.date()
             amount = floor(policy, product) if action == "floor" else product.balance
             if index == 3: amount -= Decimal(".01")
             goals.append(Goal(product_id=product.id, action=action, proposed_amount=amount if action in {"full", "floor"} else None,
-                              proposed_date=requested if action in {"full", "floor"} else None, accepts_legal_alternative=True))
+                              proposed_date=requested if action in {"full", "floor"} else None, accepts_legal_alternative=True,
+                              maximum_amount=floor(policy, product) if action == 'floor' else product.balance))
         identity = {f.name: "1988-03-14" if f.normalisation == "iso_date" else
-                    f"{rng.randrange(1000,9999)}" for f in policy.identity}
+                    f"{rng.randrange(0,10000):04d}" for f in policy.identity}
         wrong = {policy.identity[0].name: ["1991-07-12" if policy.identity[0].normalisation == "iso_date" else "999999"] * policy.wrong_answer_limit} if index == 2 else {}
         if index == 7:
             wrong = {policy.identity[-1].name: ["wrong-code"]}
@@ -152,11 +215,14 @@ def customers_for(policy, seed, count=10):
                         mode="pre_commit" if policy.failed_write_commit == "never" else "lost_reply")] if index == 8 else []
         users.append(Customer(id=f"SYN_{seed}_{index+1:02d}", name=f"{rng.choice(('Alex','Jordan','Morgan','Sam'))} {rng.choice(('Vale','Rowan','Ash','Reed'))}",
             family=FAMILIES[index], now=now, identity=identity, products=products, goals=goals, third_party=index == 1,
-            wrong_answers=wrong, style=STYLES[index % 5],
-            situation="You are the customer's partner; they can be called on the next working day at 11:00. Ask what this is about and offer to pay." if index == 1 else
+            wrong_answers=wrong, identity_terminal=index==2, style=STYLES[index % 5],
+            situation=f"You are the customer's partner; they can be called on the next working day at {callback_time(policy)}. Ask what this is about and offer to pay." if index == 1 else
                       "You lost your job and cannot pay. Decline a support transfer." if index == 5 else
-                      "You paid the overdue payment in the app this morning." if index == 6 else
+                      ("You paid the overdue payment in the app this morning." if seed % 2 == 0 else "You dispute this overdue payment; do not offer to pay.") if index == 6 else
                       "Negotiate according to your product goals; give security answers only when asked.",
-            correction="After the first read-back, correct the amount to your product's minimum; ask for another read-back before confirming." if index == 3 else "",
+            correction="After the first read-back, correct the first product's amount to its minimum; ask for another read-back before confirming." if index in {3, 7} else "",
             transfer="human" if index == 9 else "", faults=faults))
-    return users
+    for index, customer in enumerate(users):
+        customer.plan = plan_for(customer, seed + index)
+    priority = (0, 2, 8, 7, 3, 5, 4, 1, 6, 9)
+    return users if count == 10 else [users[i] for i in priority[:count]]

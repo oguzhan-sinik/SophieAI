@@ -12,7 +12,7 @@ from .models import Record
 from .sandbox import DockerCode, Unsupported
 
 CAPABILITIES = {
-    "version": "local-proxy-1", "nodes": ["conversation", "api_request", "code", "end_call"],
+    "version": "local-proxy-3", "nodes": ["conversation", "api_request", "code", "end_call"],
     "features": ["ordered deterministic/intent routes", "global routes", "pre-actions", "API mappings",
                  "Docker Python/hook execution", "fixed/LLM entry", "turn limits", "tool-call transitions"],
     "unsupported": ["audio", "lifecycle tools", "custom extraction_prompt", "history summarisation", "context_variables", "silent conversation waits", "previous-node routing", "suppressed tool results", "automatic tool retries"],
@@ -135,6 +135,7 @@ def capability_errors(workflow):
     for key, node in nodes.items():
         if node.get("node_type") not in CAPABILITIES["nodes"]: errors.append(key + ": unsupported node type")
         if node.get("on_enter", {}).get("type") not in {None, "tts", "llm", "silent"}: errors.append(key + ": unsupported entry mode (including audio)")
+        if node.get("node_type") in {"api_request", "code"} and node.get("on_enter", {}).get("type") == "llm": errors.append(key + ": LLM action entry ordering is unsupported")
         if node.get("node_type") == "conversation" and node.get("on_enter", {}).get("type") == "silent" and not node.get("passthrough"): errors.append(key + ": silent wait semantics")
         if node.get("suppress_tool_results"): errors.append(key + ": suppressed tool results")
         if any(r.get("target_node") == "__previous__" for r in node.get("transitions", [])): errors.append(key + ": previous-node routing")
@@ -148,14 +149,16 @@ def capability_errors(workflow):
 
 
 class Runner:
-    def __init__(self, workflow, policy, mapping, customer, roles, deadline, api=None, code=None, actor=None):
+    def __init__(self, workflow, policy, mapping, customer, roles, deadline, api=None, code=None, actor=None, repetition=0):
         self.workflow = deepcopy(workflow)
         self.roles, self.deadline = roles, deadline
         self.bank = Bank(policy, mapping, customer, api)
         self.code = code or DockerCode(deadline)
-        self.actor = actor or Actor(roles, customer)
+        self.actor = actor or Actor(roles, customer, repetition)
         names = customer.name.split(" ", 1)
         self.variables = {"customer_id": customer.id, "first_name": names[0], "last_name": names[-1], "now": customer.now.isoformat()}
+        for key in {**workflow.get("nodes", {}), **workflow.get("global_nodes", {})}:
+            self.variables[key + ".current_turns"] = self.variables[key + ".total_turns"] = 0
         self.turns = [{"role": "user", "text": "Hello?", "node": workflow.get("initial_node"), "step": 0}]
         self.visits, self.step, self.previous = {}, 0, None
 
@@ -171,7 +174,7 @@ class Runner:
         if node.get("truncation_strategy") == "keep_recent": history = history[-node.get("truncation_window_size", 10):]
         return history
 
-    def execute_tool(self, tool, supplied, node, stage):
+    def execute_tool(self, tool, supplied, node, stage, *, pre_action=False):
         function = tool["function"]
         config = parameters(function.get("parameters", {}), supplied, self.variables)
         if function["handler"] == "__function__:code_exec":
@@ -190,19 +193,20 @@ class Runner:
                 raise Unsupported("Workflow endpoint differs from the supplied bank contract")
             body = self.bank.invoke(name, config.get("body", {}))
             self.bank.ledger["calls"][-1]["step"] = self.step
-            inner = body.get(self.bank.mapping.response_root, body) if self.bank.mapping.response_root else body
-            status = inner.get(self.bank.mapping.response_fields["status_code"], 200)
+            status = self.bank.ledger["calls"][-1]["result"].get("status_code", 200)
             result = {"status": "success" if status < 400 else "error", "data": body, "status_code": status,
                       "message": "Local API response", "header": {"Content-Type": "application/json"}}
             if tool.get("post_process_code"):
                 output = self.code.run(tool["post_process_code"], self.variables, result=result)
                 self.variables, result = output["vars"], output["result"]
-        name = stage if function["handler"] == "__function__:code_exec" else function["name"]
+        name = stage if pre_action else function["name"]
+        for key in list(self.variables):
+            if key.startswith(name + "_response."): del self.variables[key]
         flatten(result, name + "_response", self.variables)
         self.variables[name + "_status_code"] = result["status_code"]
-        if result["status_code"] < 400:
-            self.variables[name + "_success_count"] = int(self.variables.get(name + "_success_count", 0)) + 1
-        for mapping in tool.get("response_mapping", []) + node.get("response_mapping", []):
+        counter = name + ("_success_count" if result["status_code"] < 400 else "_failure_count")
+        self.variables[counter] = int(self.variables.get(counter, 0)) + 1
+        for mapping in (node if pre_action else tool).get("response_mapping", []):
             value = read_path(result, mapping["path"])
             if value is not None: self.variables[mapping["variable"]] = scalar(value)
         self.turns.append({"role": "tool", "name": function["name"], "result": result, "node": stage, "step": self.step})
@@ -231,6 +235,12 @@ class Runner:
                 if condition_matches(route["condition"], self.variables, matches): return route["target_node"]
         return None
 
+    def clear_extracted(self, key):
+        for name in (key, key + '_said', key + '_iso'):
+            self.variables.pop(name, None)
+        if key + '_complete' in self.variables:
+            self.variables[key + '_complete'] = 'no'
+
     def run(self):
         errors = capability_errors(self.workflow)
         stage, entering, extract = self.workflow.get("initial_node"), True, True
@@ -243,7 +253,11 @@ class Runner:
                 node = nodes[stage]
                 if entering:
                     self.visits[stage] = self.visits.get(stage, 0) + 1
-                    for tool in node.get("pre_actions", []): self.execute_tool(tool, {}, node, stage)
+                    self.variables[stage + ".current_turns"] = 0
+                    entry = node.get("on_enter", {})
+                    if node["node_type"] in {"code", "api_request"} and entry.get("type") == "tts" and (not node.get("on_enter_first_entry_only") or self.visits[stage] == 1):
+                        self.speak(substitute(entry.get("text", ""), self.variables), stage)
+                    for tool in node.get("pre_actions", []): self.execute_tool(tool, {}, node, stage, pre_action=True)
                 if node["node_type"] == "end_call":
                     terminal = node.get("terminal", {}).get("function", {}).get("parameters", {})
                     args = parameters(terminal, {}, self.variables)
@@ -265,17 +279,26 @@ class Runner:
                     continue
                 if extract and node.get("extraction_schema"):
                     schema = node["extraction_schema"]
-                    output = self.model("proxy_extractor", "Extract only the declared speech variables. Preserve corrections. "
+                    output = self.model("proxy_extractor", "Extract only relevant answers to the current question. Preserve unfinished fragments across turns; never complete missing digits or a birth year. A question/tangent is not consent. Latest corrections supersede old values; return affected variables uncertain when incomplete. "
                                         "Return uncertain names separately and do not invent values. Dates are anchored to the call's now. "
                                         "Certainty is a local proxy, not Freya token probability.",
                                         {"schema": schema, "conversation": self.history(node), "now": self.variables["now"]}, Extracted)
                     fields = {f["name"]: f for f in schema}
                     if set(output.values) - set(fields): raise Unsupported("Extractor returned undeclared variables")
+                    if set(output.uncertain) - set(fields): raise Unsupported('Extractor marked undeclared variables uncertain')
+                    for key in output.uncertain:
+                        self.clear_extracted(key)
                     for key, value in output.values.items():
-                        if key in output.uncertain or value is None: continue
+                        if key in output.uncertain or value is None:
+                            self.clear_extracted(key)
+                            continue
                         field = fields[key]
-                        if field.get("enum_values") and value not in field["enum_values"]: continue
-                        if field.get("validation_pattern") and not re.fullmatch(field["validation_pattern"], str(value)): continue
+                        if field.get("enum_values") and value not in field["enum_values"]:
+                            self.clear_extracted(key)
+                            continue
+                        if field.get("validation_pattern") and not re.fullmatch(field["validation_pattern"], str(value)):
+                            self.clear_extracted(key)
+                            continue
                         self.variables[key] = value
                         self.turns.append({"role": "extracted", "name": key, "value": value, "node": stage, "step": self.step})
                 target = self.route(node, stage) if extract or node.get("passthrough") or node.get("pre_actions") else None
@@ -296,7 +319,7 @@ class Runner:
                     else:
                         if on_enter.get("type") == "silent" and node.get("passthrough"):
                             raise Unsupported("Silent passthrough conversation has no matched continuation")
-                        task = node.get("loop_prompt") if self.visits.get(stage, 0) > 1 and node.get("loop_prompt") else node.get("task_message", "")
+                        task = node.get("loop_prompt") if self.variables[stage + ".current_turns"] > 0 and node.get("loop_prompt") else node.get("task_message", "")
                         output = self.model("proxy_dialogue", "Act as the phone assistant in this current workflow stage. "
                                             "Follow the supplied system, role and task instructions. You know only call variables and conversation. "
                                             "Use only listed tools; arguments follow their function schemas, with baked defaults owned by the controller. "
@@ -324,20 +347,23 @@ class Runner:
                     if not self.turns or self.turns[-1]["role"] != "assistant": raise Unsupported("Conversation produced no speech")
                     reply = self.actor.reply([t for t in self.turns if t["role"] in {"user", "assistant"}])
                     self.turns.append({"role": "user", "text": reply.message, "node": stage, "step": self.step})
+                    for suffix in (".current_turns", ".total_turns"):
+                        self.variables[stage + suffix] += 1
                     if reply.hang_up:
                         ended = "customer_hangup"
                         break
-                    if sum(t["role"] == "user" for t in self.turns) >= 30: raise Unsupported("User-turn cap reached")
+                    if sum(t["role"] == "user" for t in self.turns) >= 50: raise Unsupported("User-turn cap reached")
                     extract = True
-                    self.visits[stage] = self.visits.get(stage, 0) + 1
-                    if self.visits[stage] >= node.get("max_node_turns", 1000):
+                    if self.variables[stage + ".current_turns"] >= node.get("max_node_turns", 10):
                         target = node.get("max_turn_transition")
                         if not target: raise Unsupported("Node turn limit has no continuation")
                         self.previous, stage, entering = stage, target, True
                     continue
                 continue
             if not ended: raise Unsupported("Workflow step cap reached")
-        except (Unsupported, TimeoutError, KeyError, ValueError, TypeError) as exc:
+        except (Unsupported, TimeoutError, KeyError, ValueError, TypeError, RuntimeError) as exc:
             errors.append(str(exc))
+        quality = self.actor.quality(ended, self.bank.ledger, self.turns) if hasattr(self.actor, 'quality') else None
         return {"case_id": self.bank.customer.id, "ended": ended, "turns": self.turns,
-                "ledger": self.bank.ledger, "unknown": errors, "capabilities": CAPABILITIES}
+                "ledger": self.bank.ledger, "unknown": errors, "capabilities": CAPABILITIES, 'actor_quality': quality,
+                "now": self.variables["now"]}

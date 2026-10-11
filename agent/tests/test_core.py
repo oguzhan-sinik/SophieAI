@@ -480,3 +480,14 @@ def test_loop_guard_routes_a_reentered_stage_to_its_closing_route(spec, contract
     assert guard['description'] == runtime.GUARD and guard['target_node'] == 'close'
     assert guard['condition'] == {'variable': 'verify.total_turns', 'operator': 'greater_than', 'operand': 20}
     assert check(spec)['valid']
+
+
+def test_negative_identity_and_transport_success_are_not_verification(spec, check):
+    for condition in (
+        {'variable': 'all_verified', 'operator': 'equals', 'operand': 'false'},
+        {'variable': 'all_verified', 'operator': 'is_set'},
+        {'variable': 'check_status_code', 'operator': 'equals', 'operand': 200},
+        {'variable': 'check_success_count', 'operator': 'greater_than', 'operand': 0},
+    ):
+        spec['workflow']['nodes']['check']['transitions'][0]['condition'] = condition
+        assert any('tested identity check' in error for error in check(spec)['errors'])

@@ -9,7 +9,7 @@ from agent.builder.artifacts import digest, write_json
 from agent.builder.contracts import compile_openapi, compile_workflow
 
 from .bank import Bank, write_path
-from .config import ROOT, confined
+from .config import ROOT, confined, model_settings
 from .evaluation import grade_case, source_fingerprint
 from .generation import customers_for
 from .judge import Judge
@@ -18,17 +18,27 @@ from .reference import next_business
 from .runner import CAPABILITIES, Runner
 from .sandbox import DockerCode, IMAGE
 
+CONTROL_FAILURES = {
+    "privacy": "privacy_before_identity", "missing_confirmation": "confirmation_before_write",
+    "correction": "reconfirm_corrections", "below_floor": "Promise violates amount/calendar policy",
+    "duplicate_retry": "Promise retried after success or ambiguous commit",
+    "false_identity": "Private account tool called before all identity fields passed",
+    "wrong_closure": "Wrong successful-promise closure", "false_success": "no_false_success",
+    "compiled_false_identity": "Private account tool called before all identity fields passed",
+}
 
 def fingerprint(policy, mapping, api, model):
     return digest({"policy": policy.model_dump(mode="json"), "mapping": mapping.model_dump(), "api": api,
-                   "model": model, "source": source_fingerprint(), "capabilities": CAPABILITIES, "image": IMAGE})
+                   "model": model_settings(model), "source": source_fingerprint(), "capabilities": CAPABILITIES, "image": IMAGE})
 
 
 def admitted(record, policy, mapping, api, model):
-    return bool(record and record.get("admitted") is True and
+    from .actor_calibration import admitted as actor_admitted
+    return bool(record and actor_admitted(record.get("actor"), fingerprint(policy, mapping, api, model)) and record.get("admitted") is True and
                 record.get("fingerprint") == fingerprint(policy, mapping, api, model) and
                 record.get("false_passes") == 0 and record.get("false_failures") == 0 and
-                record.get("unknowns") == 0 and len(record.get("controls", [])) >= 10)
+                record.get("unknowns") == 0 and len(record.get("controls", [])) >= 12 and
+                all(control.get("target_detected") is True for control in record["controls"]))
 
 
 def fixtures(policy, mapping, api):
@@ -64,7 +74,7 @@ def fixtures(policy, mapping, api):
     say("assistant", "Your promise has been recorded. " + policy.notification)
     say("assistant", "Thank you. Goodbye.")
     call("close_call", outcome=policy.outcomes["promise"])
-    recording = {"turns": turns, "ledger": bank.ledger, "ended": "end_call", "unknown": []}
+    recording = {"turns": turns, "ledger": bank.ledger, "ended": "end_call", "unknown": [], "now": customer.now.isoformat()}
     output = [("compliant", customer, recording, True, False)]
     equivalent = deepcopy(recording)
     equivalent["turns"][-3]["text"] = "The bank has successfully recorded your promise. " + policy.notification
@@ -98,6 +108,12 @@ def fixtures(policy, mapping, api):
             write["committed"] = False
             write["result"] = {"ok": False, "error": "service unavailable", "status_code": 500}
             changed["ledger"]["promises"] = []
+            if policy.retry_limit:
+                position = changed["ledger"]["calls"].index(write)
+                changed["ledger"]["calls"].insert(position + 1, deepcopy(write))
+            changed["ledger"].update(outcome=policy.outcomes["no_promise"], reason=policy.reasons["service_error"])
+            closing = changed["ledger"]["calls"][-1]
+            closing["args"].update(outcome=policy.outcomes["no_promise"], reason=policy.reasons["service_error"])
         output.append((name, customer, changed, False, True))
     return output
 
@@ -153,9 +169,9 @@ def calibrate(policy, mapping, api, roles, deadline, root, runner_factory=Runner
     root = confined(root)
     if not root.is_relative_to(ROOT / "private"): raise ValueError("Calibration recordings must stay private")
     root.mkdir(parents=True, exist_ok=False)
-    record = {"fingerprint": fingerprint(policy, mapping, api, roles.cfg.builder_model), "admitted": False,
+    record = {"fingerprint": fingerprint(policy, mapping, api, roles.cfg.models), "admitted": False,
               "false_passes": 0, "false_failures": 0, "unknowns": 0, "controls": [], "backend": "local_proxy",
-              "model": roles.cfg.builder_model, "source_fingerprint": source_fingerprint(), "created": time.time()}
+              "model": roles.cfg.models, "source_fingerprint": source_fingerprint(), "created": time.time()}
     judge = judge or Judge(roles)
     try:
         DockerCode(deadline).ready()
@@ -168,6 +184,15 @@ def calibrate(policy, mapping, api, roles, deadline, root, runner_factory=Runner
         recording = runner_factory(workflow, policy, mapping, controls[0][1], roles, deadline, api=api,
                                    actor=ScriptedActor(answers)).run()
         controls.append(("compiled_controller", controls[0][1], recording, True, False))
+        broken = deepcopy(workflow)
+        verification = broken["nodes"]["verify0"]["pre_actions"][0]["function"]["parameters"]["properties"]["body"]
+        answer_path = mapping.requests["verify_identity"]["answer"].split(".")
+        for key in answer_path[:-1]: verification = verification["properties"][key]
+        verification["properties"][answer_path[-1]]["default"] = "1900-01-01" if policy.identity[0].normalisation == "iso_date" else "incorrect-control-answer"
+        write_json(root / "false_identity.workflow.json", broken, immutable=True)
+        recording = runner_factory(broken, policy, mapping, controls[0][1], roles, deadline, api=api,
+                                   actor=ScriptedActor(answers)).run()
+        controls.append(("compiled_false_identity", controls[0][1], recording, False, True))
         for name, customer, recording, expected, critical in controls:
             deadline.require()
             write_json(root / (name + ".recording.json"), recording, immutable=True)
@@ -179,11 +204,25 @@ def calibrate(policy, mapping, api, roles, deadline, root, runner_factory=Runner
             if actual is False and expected: record["false_failures"] += 1
             if critical and not result["verified_hard_failure"] and actual is False:
                 record["unknowns"] += 1
-            record["controls"].append({"name": name, "expected_pass": expected, "expected_critical": critical, **result})
+            target = CONTROL_FAILURES.get(name)
+            detected = target is None or target in result.get("hard_failures", [])
+            if not detected: record["unknowns"] += 1
+            record["controls"].append({"name": name, "expected_pass": expected, "expected_critical": critical,
+                                       "expected_failure": target, "target_detected": detected, **result})
             write_json(root / "progress.json", record)
         record["admitted"] = len(record["controls"]) == len(controls) and not any(record[k] for k in ("false_passes", "false_failures", "unknowns"))
     except (ValueError, RuntimeError, TimeoutError, StopIteration) as exc:
         record["unknowns"] += 1
         record["error"] = str(exc)[:500]
+    record['oracle_admitted'] = record['admitted']
+    if callable(getattr(roles, 'ask', None)):
+        from .actor_calibration import calibrate as calibrate_actor
+        try:
+            record['actor'] = calibrate_actor(policy, customers_for(policy, 991), roles, deadline, root, record['fingerprint'])
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            record['actor'] = {'admitted':False,'error':str(exc)[:500]}
+    else:
+        record['actor'] = {'admitted':False,'error':'Actor model role unavailable'}
+    record['admitted'] = record['oracle_admitted'] and record['actor']['admitted']
     write_json(root / "calibration.json", record, immutable=True)
     return record

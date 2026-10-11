@@ -22,6 +22,10 @@ def next_business(policy, day):
     raise ValueError("No business day in the calendar horizon")
 
 
+def callback_time(policy):
+    return max(policy.callback_start, min("11:00", policy.callback_end))
+
+
 def band_for(policy, product):
     for band in policy.bands:
         if band.first <= product.days_late <= band.last:

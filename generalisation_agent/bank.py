@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal
 import re
+from jsonschema import Draft4Validator, FormatChecker, SchemaError, ValidationError
 
 from .generation import openapi_for
 
@@ -23,6 +24,10 @@ def write_path(value, path, item):
 
 
 def check_schema(value, schema):
+    try:
+        Draft4Validator(schema, format_checker=FormatChecker()).validate(value)
+    except ValidationError as exc:
+        raise ValueError(exc.message) from exc
     kind = schema.get("type")
     matches = {"object": isinstance(value, dict), "string": isinstance(value, str),
                "number": type(value) in (int, float, Decimal), "integer": type(value) is int,
@@ -82,7 +87,10 @@ class Bank:
             result = {"ok": False, "error": str(exc), "status_code": 400}
         event["result"] = deepcopy(result)
         self.ledger["calls"].append(event)
-        payload = {self.mapping.response_fields.get(k, k): v for k, v in result.items()}
+        schema = self.operations[operation]["responses"]["200"]["content"]["application/json"]["schema"]
+        if self.mapping.response_root: schema = schema_at(schema, self.mapping.response_root)
+        payload = {self.mapping.response_fields.get(k, k): v for k, v in result.items()
+                   if self.mapping.response_fields.get(k, k) in schema.get("properties", {})}
         return {self.mapping.response_root: payload} if self.mapping.response_root else payload
 
     def _execute(self, operation, args, event):
@@ -99,6 +107,11 @@ class Bank:
                 if rule.normalisation == "casefold": return value.strip().casefold()
                 if rule.normalisation == "iso_date": return date.fromisoformat(value).isoformat()
                 return value
+            if rule.normalisation == "iso_date" and self.mapping.response_fields.get("hint"):
+                expected = date.fromisoformat(customer.identity[field])
+                if args["answer"] == f"{expected.year:04d}-{expected.day:02d}-{expected.month:02d}" and expected.day != expected.month:
+                    return {"ok": True, "field_verified": False, "all_verified": False,
+                            "attempts_left": policy.wrong_answer_limit - used, "hint": "day_month_swapped"}
             correct = not customer.third_party and normalise(args["answer"]) == normalise(customer.identity[field])
             if correct: self.verified.add(field)
             else: self.wrong[scope] = used + 1
@@ -108,8 +121,10 @@ class Bank:
         if operation in {"get_account", "create_promise", "add_note"} and len(self.verified) != len(policy.identity):
             raise ValueError("identity not verified")
         if operation == "get_account":
-            products = [{field: float(getattr(product, meaning)) if meaning in {"balance", "minimum"} else getattr(product, meaning)
-                         for meaning, field in self.mapping.product_fields.items()} for product in customer.products]
+            products = [{(field[product.kind] if isinstance(field, dict) else field):
+                         float(getattr(product, meaning)) if meaning in {"balance", "minimum"} else getattr(product, meaning)
+                         for meaning, field in self.mapping.product_fields.items()
+                         if meaning != "card_last4" or (product.kind == "credit_card" and product.card_last4 is not None)} for product in customer.products]
             return {"ok": True, self.mapping.products_key: products}
         if operation in {"create_promise", "add_note"}:
             if args["product_id"] not in {p.id for p in customer.products}:
@@ -160,6 +175,26 @@ def schema_at(schema, path):
     return schema
 
 
+def supported_schema(schema):
+    if schema.get("nullable") or set(schema) - set(Draft4Validator.META_SCHEMA["properties"]) - {"example", "nullable", "readOnly", "writeOnly", "deprecated", "xml", "externalDocs", "discriminator"}:
+        raise ValueError("Unsupported API schema constraint")
+    if schema.get("format") and schema["format"] not in FormatChecker.checkers:
+        raise ValueError("Unsupported API schema format")
+    try:
+        Draft4Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise ValueError("Invalid API schema: " + exc.message) from exc
+    if isinstance(schema.get("items"), list):
+        raise ValueError("Unsupported API schema tuple items")
+    children = [child for key in ("properties", "patternProperties", "definitions", "dependencies")
+                for child in schema.get(key, {}).values() if isinstance(child, dict)]
+    for key in ("items", "additionalProperties", "additionalItems", "not"):
+        if isinstance(schema.get(key), dict): children.append(schema[key])
+    for key in ("allOf", "anyOf", "oneOf"):
+        children.extend(schema.get(key, []))
+    for child in children: supported_schema(child)
+
+
 def validate_mapping(policy, mapping, operations):
     if set(operations) != set(mapping.requests):
         raise ValueError("Unsupported operation set for local bank")
@@ -167,6 +202,7 @@ def validate_mapping(policy, mapping, operations):
         if operation["method"] != "POST":
             raise ValueError("Local bank supports only explicit POST operations")
         body = operation["body"]
+        supported_schema(body)
         fields = mapping.requests[name]
         for semantic, path in fields.items():
             prop = schema_at(body, path)
@@ -174,7 +210,8 @@ def validate_mapping(policy, mapping, operations):
             if prop.get("type") != expected:
                 raise ValueError(name + ": incompatible/missing request binding " + semantic)
             enum = prop.get("enum")
-            values = [f.name for f in policy.identity] if semantic == "field" else list(policy.queues.values()) if semantic == "queue" else list(policy.outcomes.values()) if semantic == "outcome" else list(policy.reasons.values()) if semantic == "reason" else []
+            reason_keys = ("refused", "hardship", "dispute", "paid", "service_error") if name == "add_note" else policy.reasons
+            values = [f.name for f in policy.identity] if semantic == "field" else list(policy.queues.values()) if semantic == "queue" else list(policy.outcomes.values()) if semantic == "outcome" else [policy.reasons[k] for k in reason_keys] if semantic == "reason" else []
             if enum is not None and not set(values).issubset(enum):
                 raise ValueError(name + ": policy enum is absent from the supplied API")
         def leaves(node, prefix=""):
@@ -190,7 +227,7 @@ def validate_mapping(policy, mapping, operations):
         if mapping.response_root:
             schema = schema_at(schema, mapping.response_root)
         required = {"ok": "boolean"}
-        if name == "verify_identity": required.update(field_verified="boolean", all_verified="boolean", attempts_left="integer", locked="boolean")
+        if name == "verify_identity": required.update(field_verified="boolean", all_verified="boolean", attempts_left="integer")
         if name == "create_promise": required["promise_id"] = "string"
         for meaning, kind in required.items():
             if schema_at(schema, mapping.response_fields[meaning]).get("type") != kind:
@@ -200,5 +237,6 @@ def validate_mapping(policy, mapping, operations):
             if products.get("type") != "array": raise ValueError("Missing account array")
             for meaning, field in mapping.product_fields.items():
                 kind = "number" if meaning in {"balance", "minimum"} else "integer" if meaning == "days_late" else "string"
-                if schema_at(products.get("items", {}), field).get("type") != kind:
-                    raise ValueError("Unsupported account/product response schema")
+                for property_name in (field.values() if isinstance(field, dict) else [field]):
+                    if schema_at(products.get("items", {}), property_name).get("type") != kind:
+                        raise ValueError("Unsupported account/product response schema")

@@ -1,6 +1,7 @@
 """Optional fixed-suite provider. Official ranking and local veto evidence stay separate."""
 from dataclasses import asdict, replace
 import json
+import os
 from pathlib import Path
 import time
 
@@ -10,7 +11,7 @@ from agent.builder.config import Config, missing_credentials
 from agent.builder.scoring import verdicts
 
 from .calibration import admitted, calibrate
-from .config import ROOT, confined
+from .config import ROOT, confined, model_settings
 from .evaluation import evaluate_workflow, read_workflow, source_fingerprint, suite_for
 from .generation import customers_for
 from .packs import interpret_source, model_context
@@ -56,7 +57,8 @@ class GeneratedProvider:
         critical = sorted({row["id"] for rows in raw["all_rows"] for row in rows if row.get("verified_hard_failure")})
         self.results[digest(workflow)] = {"score": report["score"], "critical_failures": critical,
                                         "calibration_fingerprint": self.calibration.get("fingerprint"),
-                                        "selection_eligible": report["selection_eligible"], "recording_root": str(folder / "synthetic")}
+                                        "selection_eligible": report["selection_eligible"], "recording_root": str(folder / "synthetic"),
+                                        "seconds_per_case": sum(s["seconds"] for s in raw["simulations"]) / (len(self.customers) * self.repetitions)}
         if self.calibrated:
             failed, visited = call_records(folder / "synthetic", raw)
             self.feedbacks[digest(workflow)] = {"verdicts": verdicts(raw, self.generated_suite),
@@ -79,7 +81,8 @@ class GeneratedProvider:
 def freeze_source(root, cfg, settings):
     """Capture before source interpretation/building, including code the holdout must not change."""
     fingerprint = source_fingerprint()
-    write_json(root / "frozen.json", {"source_fingerprint": fingerprint, "config": asdict(cfg), "settings": settings.manifest()}, immutable=True)
+    write_json(root / "frozen.json", {"source_fingerprint": fingerprint, "config": asdict(cfg), "settings": settings.manifest(),
+                                      "model_settings": model_settings(cfg.models)}, immutable=True)
     for directory in (ROOT, ROOT.parent / "agent" / "builder"):
         for path in directory.glob("*.py"):
             destination = root / "source_code" / path.relative_to(ROOT.parent)
@@ -89,7 +92,7 @@ def freeze_source(root, cfg, settings):
 
 
 def run_build(settings, brief_paths, api_path=None, *, pack=None, holdout=False, cfg=None, seed=42, users=10,
-              builder_factory=Builder):
+              builder_factory=Builder, seconds_per_case=120):
     if not settings.enabled:
         raise ValueError("Disabled builds must delegate directly to the existing entry point")
     cfg = cfg or Config.from_env()
@@ -100,38 +103,56 @@ def run_build(settings, brief_paths, api_path=None, *, pack=None, holdout=False,
     if missing: raise ValueError("Missing credentials: " + ", ".join(missing))
     brief_paths, api_path = inputs(brief_paths, api_path)
     cfg = replace(cfg, artifacts=ROOT / "private" / "builds", runtime=ROOT / ".runtime", official=False if offline else cfg.official)
-    roles, trace, deadline, root = model_context(cfg)
+    # Offline rehearsals sit outside the 30-minute benchmark build budget (like the release
+    # campaign): REHEARSAL_WALL_SECONDS sizes their own wall; production builds stay capped.
+    roles, trace, deadline, root = model_context(
+        cfg, seconds=int(os.getenv("REHEARSAL_WALL_SECONDS", "1800")), campaign=offline)
     frozen = freeze_source(root, cfg, settings)
     provider, reading, calibration, diagnostic = None, None, None, None
     preparation_error = None
     customers = []
     started = time.monotonic()
     try:
-        if settings.users and not holdout:
-            try:
-                DockerCode(deadline).ready()
-            except RuntimeError as exc:
-                preparation_error = str(exc)
-            api = json.loads(Path(api_path).read_text())
-            if preparation_error:
-                policy, mapping = None, None
-            elif pack:
-                _, policy, mapping, customers = pack
-            else:
+        build_end = deadline.end
+        # Bounded prep share by default; PREPARATION_BUDGET_SECONDS raises it for slower
+        # model providers (still capped at three quarters of the remaining build budget).
+        try:
+            preparation_cap = int(os.getenv("PREPARATION_BUDGET_SECONDS", "300"))
+        except ValueError:
+            preparation_cap = 300
+        preparation_budget = min(preparation_cap, deadline.remaining() * 0.75)
+        deadline.end = min(build_end, time.monotonic() + deadline.reserve + preparation_budget)
+        try:
+            if settings.users and not holdout:
                 try:
-                    reading = interpret_source("\n\n".join(Path(p).read_text() for p in brief_paths), api, roles)
-                    write_json(root / "source_reading.json", reading.model_dump(mode="json"), immutable=True)
-                except (ValueError, RuntimeError) as exc:
-                    preparation_error = trace.redact(str(exc))[:500]
-                policy, mapping, customers = (reading.policy, reading.mapping, []) if reading else (None, None, [])
-                if reading and not reading.unresolved and policy and mapping:
-                    # Admit the size before freezing; two candidate evaluations must fit the estimated budget.
-                    count = min(users, max(1, int(deadline.remaining() / (2.4 * 120 * cfg.repetitions))))
-                    customers = customers_for(policy, seed, count)
-            if policy and mapping and customers and not (reading and reading.unresolved):
-                write_json(root / "users.json", [c.model_dump(mode="json") for c in customers], immutable=True)
-                calibration = calibrate(policy, mapping, api, roles, deadline, root / "calibration")
-                provider = GeneratedProvider(policy, mapping, api, customers, cfg.builder_model, cfg.repetitions, calibration)
+                    DockerCode(deadline).ready()
+                except RuntimeError as exc:
+                    preparation_error = str(exc)
+                api = json.loads(Path(api_path).read_text())
+                if preparation_error:
+                    policy, mapping = None, None
+                elif pack:
+                    _, policy, mapping, customers = pack
+                else:
+                    try:
+                        reading = interpret_source("\n\n".join(Path(p).read_text() for p in brief_paths), api, roles)
+                        write_json(root / "source_reading.json", reading.model_dump(mode="json"), immutable=True)
+                    except (ValueError, RuntimeError, TimeoutError) as exc:
+                        preparation_error = trace.redact(str(exc))[:500]
+                    policy, mapping, customers = (reading.policy, reading.mapping, []) if reading else (None, None, [])
+                    if reading and not reading.unresolved and policy and mapping:
+                        # Admit the size before freezing; two candidate evaluations must fit the estimated budget.
+                        count = min(users, max(1, int((build_end - time.monotonic() - deadline.reserve) / (2.4 * 120 * cfg.repetitions))))
+                        customers = customers_for(policy, seed, count)
+                if policy and mapping and customers and not (reading and reading.unresolved):
+                    write_json(root / "users.json", [c.model_dump(mode="json") for c in customers], immutable=True)
+                    calibration = calibrate(policy, mapping, api, roles, deadline, root / "calibration")
+                    provider = GeneratedProvider(policy, mapping, api, customers, cfg.models, cfg.repetitions, calibration)
+        except (ValueError, RuntimeError, TimeoutError) as exc:
+            preparation_error = trace.redact(str(exc))[:500]
+            provider = None
+        finally:
+            deadline.end = build_end
         # A failed admission costs no ranking authority. The original compiler/build path still runs.
         deadline.require()
         from .local_adapter import LocalAdapter
@@ -143,14 +164,21 @@ def run_build(settings, brief_paths, api_path=None, *, pack=None, holdout=False,
             publish_progress(builder.trace)
         if holdout:
             builder.slot += "-holdout"
-        result = builder.run()
+        export_reserve = deadline.reserve
+        if holdout and pack:
+            diagnostic_budget = min(deadline.remaining() * .55, 1.2 * seconds_per_case * len(pack[3]) * cfg.repetitions)
+            deadline.reserve += diagnostic_budget
+        try:
+            result = builder.run()
+        finally:
+            deadline.reserve = export_reserve
         if result.get("export_path") and settings.users and (holdout or (provider and not provider.results)):
             if pack:
                 _, policy, mapping, customers = pack
                 api = json.loads(Path(api_path).read_text())
             if customers:
                 kwargs = {}
-                estimate = 1.2 * 120 * len(customers) * cfg.repetitions
+                estimate = 1.2 * seconds_per_case * len(customers) * cfg.repetitions
                 if deadline.remaining() < estimate:
                     class BudgetAbstention:
                         def __init__(self, *a, **k):
@@ -158,12 +186,16 @@ def run_build(settings, brief_paths, api_path=None, *, pack=None, holdout=False,
                     kwargs["runner_factory"] = BudgetAbstention
                 diagnostic, _ = evaluate_workflow(read_workflow(Path(result["export_path"])), policy, mapping, customers,
                                                 roles, deadline, root / "final_diagnostic", cfg.repetitions, api=api,
-                                                calibration=None if holdout else calibration, **kwargs)
+                                                calibration=None if holdout else calibration, split="holdout" if holdout else "development", **kwargs)
         if frozen != source_fingerprint(): raise ValueError("Builder/evaluator source changed after freezing")
         calibration_summary = {key: calibration[key] for key in ("fingerprint", "admitted", "false_passes", "false_failures", "unknowns", "created") if key in calibration} if calibration else None
         if calibration_summary: calibration_summary["record"] = str(root / "calibration" / "calibration.json")
+        if result.get("export_path"):
+            result["workflow_sha256"] = digest(read_workflow(Path(result["export_path"])))
         result.update(settings=settings.manifest(), preparation_error=preparation_error, synthetic_preparation_seconds=round(time.monotonic()-started-result.get("seconds", 0), 2),
                       calibration=calibration_summary, diagnostic=diagnostic, holdout=holdout, export_type="local_compiled" if offline else "freya_export", source_fingerprint=frozen)
+        durations = [r["seconds_per_case"] for r in provider.results.values() if r["score"]["complete"] and r["seconds_per_case"] > 0] if provider else []
+        if durations: result["synthetic_seconds_per_case"] = max(durations)
         # Detailed prompts/cases remain private; publish aggregate evidence and exact export only.
         released = ROOT / "artifacts" / root.name
         write_json(released / "report.json", result, immutable=True)

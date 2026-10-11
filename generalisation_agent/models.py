@@ -98,8 +98,8 @@ class Policy(Record):
 class Mapping(Record):
     requests: dict[str, dict[str, str]] = Field(description="For each bank operation, map INTERNAL semantic argument names to actual API request paths; never reverse this direction.")
     response_root: str = Field(description="Actual API response wrapper property, or empty string for an unwrapped response.")
-    product_fields: dict[str, str] = Field(description="Keys must be exactly the INTERNAL semantic names: id, kind, balance, minimum, days_late. Each value is the corresponding actual API product property. Never use API property names as keys.")
-    response_fields: dict[str, str] = Field(description="Keys must be exactly the INTERNAL semantic names: ok, error, field_verified, all_verified, attempts_left, locked, promise_id, uncertain_commit, status_code. Each value is the corresponding actual API response property. Never reverse the mapping or use API property names as keys.")
+    product_fields: dict[str, str | dict[str, str]] = Field(description="Required semantic keys: id, kind, balance, minimum, days_late; optional card_last4. Values are API properties. minimum may instead map credit_card, personal_loan, car_loan to their different API properties.")
+    response_fields: dict[str, str] = Field(description="Required semantic keys: ok, error, field_verified, all_verified, attempts_left, promise_id. Optional locked, uncertain_commit, status_code, hint: include only if declared by the API. Values are actual API response properties.")
     products_key: str = Field(description="Actual API property containing the product array inside response_root.")
 
     @model_validator(mode="after")
@@ -119,15 +119,19 @@ class Mapping(Record):
                 raise ValueError(f"Incomplete/duplicate semantic binding for {operation}")
             if any(not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)?", p) for p in fields.values()):
                 raise ValueError("Unsupported request field path")
-        expected_response = {"ok", "error", "field_verified", "all_verified", "attempts_left", "locked",
-                             "promise_id", "uncertain_commit", "status_code"}
-        if set(self.response_fields) != expected_response or len(set(self.response_fields.values())) != len(expected_response):
+        expected_response = {"ok", "error", "field_verified", "all_verified", "attempts_left", "promise_id"}
+        if not expected_response.issubset(self.response_fields) or set(self.response_fields) - expected_response - {"locked", "uncertain_commit", "status_code", "hint"} or len(set(self.response_fields.values())) != len(self.response_fields):
             raise ValueError("Incomplete/duplicate response semantic bindings")
-        if set(self.product_fields) != {"id", "kind", "balance", "minimum", "days_late"}:
+        if set(self.product_fields) - {"id", "kind", "balance", "minimum", "days_late", "card_last4"} or not {"id", "kind", "balance", "minimum", "days_late"}.issubset(self.product_fields):
             raise ValueError("Incomplete product mapping")
-        if len(set(self.product_fields.values())) != 5:
-            raise ValueError("Product fields must be unique")
-        for name in [self.products_key, *self.product_fields.values(), *self.response_fields.values()]:
+        for meaning, value in self.product_fields.items():
+            if isinstance(value, dict) and (meaning != "minimum" or set(value) != {"credit_card", "personal_loan", "car_loan"}):
+                raise ValueError("Only minimum supports a complete per-product-kind binding")
+        names = [v for value in self.product_fields.values() for v in (value.values() if isinstance(value, dict) else [value])]
+        for kind in ("credit_card", "personal_loan", "car_loan"):
+            fields = [v[kind] if isinstance(v, dict) else v for v in self.product_fields.values()]
+            if len(set(fields)) != len(fields): raise ValueError("Product fields must be unique")
+        for name in [self.products_key, *names, *self.response_fields.values()]:
             if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
                 raise ValueError("Unsupported response field name")
         if self.response_root and not re.fullmatch(r"[a-z][a-z0-9_]*", self.response_root):
@@ -141,6 +145,7 @@ class Product(Record):
     balance: Decimal = Field(gt=0)
     minimum: Decimal = Field(gt=0)
     days_late: int = Field(ge=1)
+    card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
 
     @model_validator(mode="after")
     def amounts(self):
@@ -155,12 +160,40 @@ class Goal(Record):
     proposed_amount: Decimal | None
     proposed_date: date | None
     accepts_legal_alternative: bool
+    maximum_amount: Decimal | None = Field(default=None, gt=0)
 
 
 class Fault(Record):
     operation: Literal["create_promise", "get_account", "verify_identity"]
     occurrence: int = Field(ge=1)
     mode: Literal["pre_commit", "lost_reply"]
+
+
+class Behaviour(Record):
+    id: str = Field(pattern=r"^B(0[1-9]|1[0-6])$")
+    kind: Literal["fragment", "question", "tangent", "words", "self_repair", "correction", "date_split", "relative", "mixed", "backchannel", "reference", "situation"]
+    trigger: Literal["identity", "offer", "readback", "any"]
+    target: str = ""
+    question_topic: Literal["purpose", "digital", "product"] = "purpose"
+    amount: Decimal | None = None
+    day: date | None = None
+
+
+class BehaviourPlan(Record):
+    version: str = "human-1"
+    seed: int = 0
+    profile: Literal["baseline", "ordinary", "stress"] = "ordinary"
+    events: list[Behaviour] = Field(default_factory=list, max_length=6)
+    patience: int = Field(default=40, ge=8, le=60)
+
+    @model_validator(mode="after")
+    def unique(self):
+        if len({e.id for e in self.events}) != len(self.events):
+            raise ValueError("Behaviour ids must be unique within a plan")
+        for event in self.events:
+            if event.kind == "correction" and (not event.target or event.amount is None and event.day is None):
+                raise ValueError("A correction needs a product and a revised amount/date")
+        return self
 
 
 class Customer(Record):
@@ -172,18 +205,41 @@ class Customer(Record):
     products: list[Product] = Field(min_length=1, max_length=3)
     goals: list[Goal]
     third_party: bool
+    identity_terminal: bool = False
     wrong_answers: dict[str, list[str]]
     style: Literal["pieces", "corrects", "talkative", "asks_back", "in_words"]
     situation: str
     correction: str
     transfer: Literal["", "support", "human", "restructuring"]
     faults: list[Fault]
+    plan: BehaviourPlan | None = None
 
     @model_validator(mode="after")
     def references(self):
         ids = [p.id for p in self.products]
         if len(set(ids)) != len(ids) or {g.product_id for g in self.goals} != set(ids) or len(self.goals) != len(ids):
             raise ValueError("Exactly one goal per unique product is required")
+        for goal in self.goals:
+            product = next(p for p in self.products if p.id == goal.product_id)
+            for value in (goal.proposed_amount, goal.maximum_amount):
+                if value is not None and (not value.is_finite() or value <= 0 or value != value.quantize(Decimal('.01'))):
+                    raise ValueError("Willingness amounts must be positive finite cents")
+            if goal.maximum_amount is not None and goal.maximum_amount > product.balance:
+                raise ValueError("Willingness cannot exceed the product balance")
+            if goal.action in {'full', 'floor'} and (goal.proposed_amount is None or goal.proposed_date is None):
+                raise ValueError("A payment goal needs amount and date")
+        if self.plan:
+            for event in self.plan.events:
+                if event.target and event.target not in ids and event.target not in self.identity:
+                    raise ValueError("Behaviour targets an unknown slot/product")
+                if event.kind == 'correction' and event.target not in ids:
+                    raise ValueError("Correction must target a product")
+                if event.kind in {'fragment', 'date_split'} and event.target not in self.identity:
+                    raise ValueError("A fragmented answer must target an identity slot")
+                if self.third_party and (event.trigger == "identity" or event.kind == "correction"):
+                    raise ValueError("Third parties cannot perform private identity/product events")
+                if event.amount is not None and (not event.amount.is_finite() or event.amount <= 0 or event.amount != event.amount.quantize(Decimal('.01'))):
+                    raise ValueError("Correction amounts must be positive finite cents")
         return self
 
 

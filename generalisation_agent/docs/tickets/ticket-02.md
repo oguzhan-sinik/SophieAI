@@ -1,6 +1,6 @@
 # TICKET-02 — Synthetic briefs and users for unseen debt-collection requirements
 
-**Status:** Implementation in place; 154 local tests and three real Docker tests pass. Final model-backed generation, calibration and two-pack rehearsal verification are pending because the configured endpoint rejects requests for unavailable shared-endpoint billing.
+**Status:** Correctness milestone implemented; 213 ordinary tests and four explicit Docker tests pass. Model-backed generation produced two independently checked ten-user packs using the configured OpenRouter model. Live calibration did not admit feedback; the rehearsal stopped before holdout evaluation. Completed two-pack workflow measurements remain unverified. See the [implementation and verification report](../ticket-02-correctness-implementation.md); this is not full Ticket 2 acceptance.
 **Reviewed baseline:** `48ac224d78bf00fb9ab06df0f9a8c69ef49fc355`, 11 October 2026.
 
 **Owner and output boundary:** `generalisation_agent/`.

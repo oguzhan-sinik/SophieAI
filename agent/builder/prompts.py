@@ -75,6 +75,26 @@ built from values that may be empty. An engine-run call
 flattens its result under <stage name>_response.data.*, a model-called tool under
 <tool name>_response.data.*; prefer mapped variables in routes.
 
+HUMAN SPEECH. Callers split answers across turns, ask questions, correct themselves and mention
+unrelated numbers/dates. Keep one pending slot, its ordered fragments, raw words, completeness,
+source turn and revision. Never pad missing digits or guess a birth year. Security dates need an
+explicit year; capture partial security dates as strings, clarify, and assemble before verification.
+Ask only for the missing part. Answer questions safely, then resume; a question, tangent or brief
+acknowledgement is not consent or a refusal. Latest explicit self-correction wins. Clarify ambiguous
+product references; never copy a loan correction onto the card. Preserve known amount while asking
+for an uncertain date. Do not extract the first date/money from an unrelated story.
+The runtime also provides ctl_digits(said) (ordered digit words, preserves zeros),
+ctl_identity_date(said) (complete identity date only, never substitutes a year),
+ctl_slot(vars,name,value,raw,complete,turn,correction=False) (clears incomplete routable values),
+ctl_proposal(vars,product,amount,day) (returns tuple revision and invalidates changed consent),
+ctl_invalidate(vars,product), ctl_consent(vars,product,revision,explicit), and
+ctl_write_ready(vars,product,amount,day). Use these in code stages. Money passed to these helpers is
+already unambiguous numeric cents; spoken ambiguity must be clarified first. Before read-back save
+the proposal revision; explicit agreement is scoped to that exact revision. Every correction,
+including "yes, but...", invalidates old consent. Require ctl_write_ready plus source policy checks
+before each write. These helpers do not enforce the bank's policy. For grouped consent check every
+named member's current revision and source permission; no blanket yes for other products.
+
 DATES. The controller provides these functions inside every code stage; use them and never write
 your own calendar loop or spoken-date parser. weekdays is the list of business weekdays with
 Monday=0 and excluded the list of non-business ISO dates, both always taken from the source:
@@ -84,8 +104,8 @@ Monday=0 and excluded the list of non-business ISO dates, both always taken from
   ctl_last_business_day_of_week(day, weekdays, excluded) -> last business day of day's Mon-Sun week
   ctl_date(said, call_now, next_weekday='following_week' or 'next_occurrence') -> the day a phrase names
 All return YYYY-MM-DD text, or '' when the day cannot be worked out.
-Declare every calendar date the customer may say (a payment day, a callback day, a date of birth)
-as extraction type date. A complete date with its year arrives as YYYY-MM-DD; anything else is
+Declare payment and callback days as extraction type date. Security dates are strings: preserve
+fragments, require an explicit year, and call ctl_identity_date on the assembled complete words. A complete date with its year arrives as YYYY-MM-DD; anything else is
 captured as the customer's words and, before any code stage or bound tool call, replaced by the day
 resolved against call now, with <name>_said keeping the words. The variable is filled only when the
 customer names one single day; a vague period leaves it unset or ''. So a stage that asks for a day

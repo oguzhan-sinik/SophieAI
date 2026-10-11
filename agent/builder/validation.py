@@ -114,7 +114,9 @@ def _is_proof(condition, spoken):
         checks = [_is_proof(child, spoken) for child in condition["conditions"]]
         return all(checks) if condition.get("logic") == "or" else any(checks)
     variable = str(condition.get("variable") or "")
-    return bool(variable) and condition.get("operator") not in ("always", "matches_intent") and variable not in spoken and not variable.endswith("_turns")
+    return (bool(variable) and variable not in spoken and
+            not variable.endswith(("_turns", "_status_code", "_success_count", "_failure_count")) and
+            condition.get("operator") == "equals" and str(condition.get("operand")).lower() in {"true", "verified", "authenticated", "passed"})
 
 
 def _variable_use(node):
