@@ -1,6 +1,6 @@
 # Ticket 06 — The caller speaks like a person, in Turkish
 
-Status: built and run live three times, 11 October 2026, 17:10 UTC; section 12 lists what is open. First written
+Status: the final case is submitted, 11 October 2026, 19:30 UTC; section 12 lists what was done and what is open. First written
 14:40 UTC; rewritten 15:00 UTC around what the organisers said about how callers talk.
 
 Sources: the official page as it reads today (`freyavoice.ai/hackathon`, tabs Overview, Evaluation,
@@ -187,7 +187,7 @@ account: `npx wrangler login`, `npx wrangler deploy`.
 - Tool contracts with path or query parameters stop the build with a named error.
 - Times of day in words ("öğleden sonra üçte").
 
-## 12. Status (11 October 2026, 17:10 UTC)
+## 12. Status (11 October 2026, 19:35 UTC)
 
 Built and checked here:
 
@@ -267,6 +267,32 @@ Third live test, 16:57 to 17:09 UTC, Briefs A and B again, run `20261011T175718_
 - PUB-11 wrote three promises, PUB-12 one promise and two `refused` notes, PUB-13 two promises.
 - One rule was added after this build started and has not been in a build: the agent never says
   goodbye outside a closing stage.
+
+The final case, 17:45 to 19:30 UTC (Freya Bank, credit card statement debt; folder with eighteen files,
+seven lookup services, calls in Turkish, no practice customers):
+
+- **Submitted:** `submission/final.workflow.json`, `traces/final.log`, `submission.json`; builder code
+  `550ffd5`, mock `https://freya-bank-mock.ogzdlk06.workers.dev`. The builder's own test passed 13 of 14
+  simulated callers (the six example scenarios of the case and seven of eight it wrote itself); six
+  callers written by hand from the examples passed 6 of 6. The one failure, a caller who stays silent,
+  cannot be played by a chat simulation.
+- **What the case broke in the builder, each fixed in general terms:** service names with dots; request
+  and answer fields inside objects; an object in an answer never reached code (every balance read as
+  missing); a 707 KB data file sent whole; a designer that withheld the workflow because the bank has no
+  closing service; consent helpers that accepted only an amount on a day (no week change, no e-mail);
+  repairs that could not reach interrupt stages; a rule list that timed out, then lost every rule of the
+  main documents to a completeness check meant for whole lists.
+- **What was added, beyond a bug fix:** test callers written from a case's example calls plus up to
+  eight from its documents, and the repair loop on them; the rule list in parts with a one-line digest
+  (569 rules listed, 131 kept, 34,000 characters); `--no-rule-list`; `--resume-best`.
+- **Platform facts from a probe call:** a nested request template is sent as written; after an HTTP
+  404 or 500 no answer field is mapped and no hook runs, and `<stage>_status_code` holds the status.
+- **Mock:** the pushed Worker serves the seven services from the bank's own answers (1,041 lookups
+  exact locally). The deployed one is another version: 622 of 623 listed answers exact, an empty
+  `intAddressInfoType` answers 200 where the contract says 400.
+- **Not done:** the submitted workflow came from two runs (a design, then a resumed run that repaired
+  it), not one fresh run of the submitted command; no independent held-out score; the build with the
+  compact rule list scored 0 of 6 on its first test and was stopped for time.
 
 Open:
 
