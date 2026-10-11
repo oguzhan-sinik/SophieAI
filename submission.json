@@ -11,7 +11,7 @@
     }
   ],
   "repo": "https://github.com/oguzhan-sinik/build-the-builder",
-  "commit": "550ffd5b9355e2881a2757a0fa03f361327b46e4",
+  "commit": "4b9032e61f79a4df088d4a599442dee84dc9f2e4",
   "run_command": "LLM_CALL_TIMEOUT_SECONDS=1800 MAX_WALL_SECONDS=10800 EVAL_MAX_SIMULATIONS=5 python3 agent/builder/build.py {case_folder} https://freya-bank-mock.ogzdlk06.workers.dev --no-rule-list",
   "workflow": "submission/final.workflow.json",
   "trace": "traces/final.log",
