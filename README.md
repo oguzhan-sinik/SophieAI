@@ -7,6 +7,13 @@ edit of the agent.
 
 Team: Burak Alican Kılınç and Oğuzhan Şinik.
 
+![The final build in the dashboard: the live log, the workflow of one version and the lineage of the design from 4 to 13 of 14 callers passed](docs/images/builder-studio-run.png)
+
+*The final build, seen in our dashboard. Left: the live log. Centre: the workflow of one version,
+77 steps and 292 routes. Right: how the design evolved, from 4 of 14 simulated callers passed on
+the first design to 7, 9 and 13 after three repair rounds. The picture was taken while a fourth
+round was being tested; it scored 12 and was not kept.*
+
 The organisers' own starter-kit instructions are in [docs/kit-readme.md](docs/kit-readme.md).
 
 ## What the builder does
@@ -105,6 +112,23 @@ lower limits of 1800 and 480 seconds; a large case folder needs more than those.
 
 Every run leaves a folder under `agent/artifacts/` with its trace, each version of the design,
 every model call and every test call.
+
+## Watching a build
+
+The dashboard reads those run folders, live while a build runs or afterwards. It needs nothing
+installed beyond Python:
+
+```bash
+python3 -m observability.serve --artifacts-dir agent/artifacts
+```
+
+Then open `http://127.0.0.1:8765`. Pick a run to see its log, every version of the design with
+its score, what changed between versions, and the workflow as a graph.
+
+![A stage opened in the dashboard: what it says on entry, its instruction to the phone model and its routes](docs/images/builder-studio-stage.png)
+
+*Clicking a stage shows what it says on entry, what the phone model is told, and its routes in the
+order they are checked. Here: the calming reply to an upset caller, limited to three turns.*
 
 ## How callers are understood
 
