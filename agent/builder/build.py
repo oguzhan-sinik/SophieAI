@@ -36,7 +36,7 @@ SPAN_KEPT = 240          # characters of a cited passage kept in a large case's 
 
 def source_manifest(documents, api_path):
     paths = [Path(d['path']) for d in documents] + ([api_path] if api_path else [])
-    paths += [KIT / f for f in ('README.md', 'VERSION', 'docs/api.md', 'docs/workflow-format.md', 'docs/tools-and-code.md', 'freya.py', 'tools/run_cases.py', 'tools/score.py')]
+    paths += [KIT / f for f in ('docs/kit-readme.md', 'VERSION', 'docs/api.md', 'docs/workflow-format.md', 'docs/tools-and-code.md', 'freya.py', 'tools/run_cases.py', 'tools/score.py')]
     return [{'path': str(p.resolve()), 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()} for p in paths]
 
 

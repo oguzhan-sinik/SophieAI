@@ -1,104 +1,159 @@
-# Build the Builder
+# Build the Builder: SophieAI
 
-**Kit version 3** (10 October 2026). The file `VERSION` holds the number. When we update the kit, the number goes up and the changes are listed here.
+Our entry for the Freya "Build the Builder" hackathon (October 2026). It is a **builder**: a
+program that reads a bank's documents and creates a phone agent on the Freya platform, tests that
+agent with simulated callers, repairs what fails and exports the result. One command, no manual
+edit of the agent.
 
-- v3: the example builder waits for its own test run (up to 20 minutes per command) instead of stopping before the results arrive. On Brief A it built an agent that passed 10 of the 10 practice customers in one run.
-- v2: `examples/base-agent.json` (an example phone agent) and `examples/agent_builder.py` with the skill `.claude/skills/build-phone-agent` (an example builder) replace `examples/minimal_builder.py`.
-- v1: first release.
+Team: Burak Alican Kılınç and Oğuzhan Şinik.
 
-You write a **builder**: a program that reads a bank's brief and creates a phone agent on Freya.
-We put that phone agent in front of simulated customers. The share it handles correctly is your score.
+The organisers' own starter-kit instructions are in [docs/kit-readme.md](docs/kit-readme.md).
 
-One simulated customer is one case. A step of a phone agent is called a node in the platform's documents.
+## What the builder does
 
-## The ten-minute start
+Given a brief (or a whole case folder) and the address of the bank's services:
 
-You need Python 3.10 or newer.
+1. **Reads the sources.** Markdown, text, Word, Excel, PDF, JSON and YAML. A large data file is
+   shown by its first records only.
+2. **Gets the service contract.** An OpenAPI file if there is one; otherwise one model call writes
+   it from the bank's service document.
+3. **Writes test callers.** The kit's practice customers where they exist. For a case without them,
+   the builder writes callers from the example calls in the documents, plus up to eight of its own.
+4. **Lists the rules.** For a large folder: in parts side by side, then compacted to one line per
+   rule, the later document winning. Can be skipped with `--no-rule-list`.
+5. **Designs the agent** as a compact workflow source (one model call).
+6. **Compiles it.** Tools are expanded from the contract, code stages get the helpers they call,
+   and the controller adds what designs kept getting wrong: date and amount conversion, loop guards,
+   default routes.
+7. **Checks it statically** and on Freya's dry run, with up to three repair calls.
+8. **Tests it live** with the simulated callers, **repairs** it on their failures, keeps a fix only
+   if nothing got worse, and repeats while the budget lasts.
+9. **Exports** the best measured version and a trace of everything it did.
+
+The phone agent itself runs on Freya's own model, which the builder never changes.
+
+## Results
+
+All numbers are from single runs on 11 October 2026. The same agent can pass a caller in one run
+and fail it in the next, so read them as indications.
+
+| What | Result | Tested with |
+|---|---|---|
+| Practice Brief A (one product) | 10 of 10, first design | the organisers' practice customers and bank |
+| Practice Brief B (up to three products) | 3 of 3, first design | the organisers' practice customers and bank |
+| Brief A, our own wider set | 27 of 31 after one repair round | 31 cases of our own on our mock; run stopped before export |
+| Final case (credit card statement debt, Turkish) | 13 of 14 | callers the builder wrote: the case's 6 example scenarios and 8 of its own |
+| Final case, each caller played twice | 11 of 14 passed both times; all 6 examples both times | a later run, freshly written callers |
+
+Known weak spots of the submitted final agent: a caller who stays angry after three calming
+replies is not handed over correctly, the week change on a joint statement is flaky, and silence
+handling is untested because a chat simulation cannot stay silent.
+
+## The final submission
+
+- [submission.json](submission.json): team, commit, command, paths, mock address.
+- [submission/final.workflow.json](submission/final.workflow.json): the exported agent.
+- [traces/final.log](traces/final.log): the builder's trace.
+
+The workflow came from two builder runs on the case folder: a design run, then a run that resumed
+that design (`--resume-run`), tested it and repaired it. The trace holds both, each under its own
+header line. No workflow was edited by hand.
+
+## Run it
+
+Python 3.10 or newer, from the repository root:
 
 ```bash
-cp env.example env.sh        # put your Freya API key in it, and a team key you make up
-source env.sh
-
-# 1. Put the example agent on Freya and test it. It prints {"workflow_id": ..., "agent_id": ...}
-python3 -c "import freya,json; print(freya.save_workflow('base', json.load(open('examples/base-agent.json'))))"
-python3 tools/run_cases.py <agent_id> --brief A            # ten practice customers, 3 to 11 minutes
-
-# 2. Let the example builder build one from the brief
-pip install claude-agent-sdk
-python3 examples/agent_builder.py briefs/brief-a.md
-python3 examples/agent_builder.py briefs/brief-a.md briefs/brief-b.md   # Brief B builds on Brief A, so pass both
+python3 -m venv agent/.venv
+agent/.venv/bin/pip install -r agent/requirements.lock
+cp env.example env.sh    # then put your keys in env.sh; it is git-ignored
 ```
 
-`run_cases.py` prints one line per customer: pass or fail, the tool calls the agent made, and the reason for a failure.
+Keys in `env.sh`: `FREYA_API_KEY`, `FREYA_BANK_TEAM_KEY` (any secret of 16 or more characters) and
+a model provider key with the model tiers (`OPENROUTER_API_KEY`, `MODEL_TIER_HARD` and so on). The
+builder names a missing key and stops before doing any work.
 
-`examples/base-agent.json` is an agent, not a builder. It is the same two-step workflow that is already in your workspace: check identity, then take a payment promise. It uses four of the seven tools, so it handles only the simplest customers: in one run it passed 2 of the 13 practice customers. Read it to see what a valid workflow looks like.
+A practice brief (Brief B builds on Brief A, so both are given):
 
-`examples/agent_builder.py` is a builder. It runs Claude through the Claude Agent SDK with one skill, `.claude/skills/build-phone-agent/SKILL.md`. Claude reads the brief and the tool API file, writes the workflow, runs the practice customers and fixes what fails. The skill is short on purpose. Your job is a better builder: a better skill, more skills, your own code, or another agent altogether. It needs a Claude login or `ANTHROPIC_API_KEY`.
+```bash
+agent/.venv/bin/python agent/builder/build.py briefs/brief-a.md
+agent/.venv/bin/python agent/builder/build.py briefs/brief-a.md briefs/brief-b.md
+```
 
-## What is in this kit
+A case folder with your own mock of the bank:
+
+```bash
+agent/.venv/bin/python agent/builder/build.py <case_folder> <mock_url> 2>&1 | tee traces/final.log
+```
+
+The last line printed is a JSON result with the export path (`agent/out/<name>.workflow.json`), the
+trace path and the score.
+
+| Option | What it does |
+|---|---|
+| `--name` | Name of the build: the Freya slot and the export file |
+| `--openapi` | Use this contract file instead of looking for one or writing one |
+| `--cases` | Practice cases of your own, run against your mock |
+| `--no-rule-list` | Skip the rule list; the designer reads the documents directly |
+| `--resume-run <run folder>` | Reuse an earlier run's design instead of designing again |
+| `--resume-best` | With `--resume-run`: start from that run's best measured version |
+
+Limits come from the environment: `MAX_WALL_SECONDS` (default three hours),
+`LLM_CALL_TIMEOUT_SECONDS` (default thirty minutes), `EVAL_MAX_SIMULATIONS` (test rounds, default 4)
+and `EVAL_REPETITIONS` (plays per caller, default 1). `agent/.env.example` still shows the older,
+lower limits of 1800 and 480 seconds; a large case folder needs more than those.
+
+Every run leaves a folder under `agent/artifacts/` with its trace, each version of the design,
+every model call and every test call.
+
+## How callers are understood
+
+Callers say numbers in two parts, correct themselves, tell stories, ask questions back, say
+amounts and dates in words, and name one of several things their own way ("all three", "not the
+car loan"). The agent's model is not trusted to get these right. Small helpers, compiled into the
+agent, read the caller's own words in Turkish and English: dates, amounts, digits, a number
+collected over several replies, and which of several things was meant. Details and the phrase
+tables are in [agent/README.md](agent/README.md) and `agent/tests/test_speech.py`.
+
+## Repository layout
 
 | Path | What it is |
 |---|---|
-| `briefs/brief-a.md` | Freya Bank's specification for customers late on one product. 47 rules. Read all of it. |
-| `briefs/brief-b.md` | The extra rules for customers with up to three products. It builds on Brief A. |
-| `tools/openapi.json` | The bank's tool API that the phone agent calls during a call. |
-| `public-test-set.json` | 13 practice customers: what each one does and what the bank's records must show afterwards. |
-| `examples/base-agent.json` | An example phone agent: two steps, four tools. The same one that is in your workspace. |
-| `examples/agent_builder.py` | An example builder on the Claude Agent SDK. Claude builds, tests and fixes the agent. |
-| `.claude/skills/build-phone-agent/SKILL.md` | The one skill the example builder uses. |
-| `freya.py` | A small client for the Freya API. Standard library only. |
-| `tools/run_cases.py`, `tools/score.py` | Run the practice customers against a phone agent and score it. |
-| `docs/workflow-format.md` | What a phone agent is made of: steps, prompts, variables, routes. |
-| `docs/tools-and-code.md` | Tools that call an API, code steps, hooks, where a tool's response lands. |
-| `docs/api.md` | The API calls a builder needs. |
+| `agent/builder/` | The builder: sources, contract compiler, runtime helpers, design rules, static checks, Freya adapter, the build loop |
+| `agent/tests/` | Its tests |
+| `agent/docs/tickets/` | Design notes, one ticket per piece of work; `ticket-06.md` covers caller speech and the final |
+| `mock/` | A Cloudflare Worker that stands in for the bank: the practice services and the final case's seven statement services. See [mock/README.md](mock/README.md) |
+| `submission/`, `traces/`, `submission.json` | The final submission |
+| `observability/` | A read-only dashboard over a run's artifacts |
+| `generalisation_agent/` | Earlier work on synthetic briefs and customers for testing the builder offline |
+| `briefs/`, `tools/`, `docs/`, `examples/`, `freya.py`, `public-test-set.json` | The organisers' starter kit, unchanged |
 
-## How you are scored
+## Tests
 
-A customer counts as handled when all of these hold:
+```bash
+agent/.venv/bin/python -m pytest agent/tests observability/tests generalisation_agent/tests -q
+```
 
-1. **Outcome: the bank's records are right.** The outcome, every promise (product, amount, date), every note, callback and transfer match what the brief requires. The scorer reads them from the bank, not from what the agent said.
-2. **Policy: the conversation stayed inside the brief.**
-3. **Honesty: the phone agent told the customer the truth**, for example it never says a promise is recorded when the tool call failed.
+568 pass and 6 are skipped (5 need Docker, 1 needs a saved practice design on the machine).
 
-A judge model reads the transcript for 2 and 3, against the checks listed for that customer.
+```bash
+node mock/test.mjs
+```
 
-There is no partial credit. Your score is the share of customers handled.
+The final case's mock check needs the organisers' case folder, which is not in this repository:
 
-The same phone agent can pass a customer in one run and fail it in the next. Treat one green run as a hint, not as proof.
+```bash
+node mock/test-statement.mjs "<case folder>/test-environment/test-customers.json"
+```
 
-## The final
+## What is not done
 
-- On Sunday we publish briefs you have not seen. They are the same kind of call with different rules: other numbers and limits, other identity questions, another outcome table, another calendar. Their form can differ too: one final brief is a clean specification, the other is raw bank material (a mail, a policy extract, a memo that changes it, a code list).
-- Each final brief comes with its own tool API file. The seven tool names stay the same. The fields and the allowed values can change.
-- After the final briefs open you may fix a bug in your builder. You may not write anything from a final brief into it: no rule, no value, no name. Fixing a crash on a table your parser did not expect is allowed. Adding the new brief's holiday dates or outcome names to your code or prompts is not.
-- You run your builder once on each, with no manual step, and submit the phone agents it created, your code and the builder's trace.
-- You export each phone agent to a file with `freya.export_workflow(workflow_id, "<brief>.workflow.json")` and submit those files. We load them into our own workspace to test them, so what you export is what we score.
-- We test those phone agents on customers nobody has seen, on several calendar days, three times each. A customer counts only when all three runs pass. A phone agent that is right most of the time is not right.
-- Final customers can have up to three products, as in Brief B.
-- Final customers talk like people. They give a number in two parts, correct themselves, talk about other things, ask a question back, or say amounts and dates in words. The facts stay the same. Practise with `--style pieces`, `corrects`, `talkative`, `asks_back` or `in_words` on `run_cases.py`.
-
-So build something that reads a brief, not something that knows this one. Whatever your builder can take from the brief, it should take from the brief.
-
-## Rules
-
-- Your builder takes brief files as input and creates the phone agent with no manual step. Do not edit a phone agent by hand after it is created.
-- The phone agent runs on the model set in `freya.py` (`AGENT_LLM`). Do not change it. Your builder may use any model or coding agent.
-- The phone agent may call only the bank's tool API. Code steps and hooks inside the workflow are allowed and expected.
-- Use `freya.save_workflow(...)` or update your workflow in place. A workspace holds 200 workflows. A builder that creates a new one on every run fills it up and leaves you with a list nobody can read.
-- One simulation runs at a time per workspace. A ten-customer run takes 3 to 11 minutes. A second `run_cases.py` started meanwhile waits for the first.
-- A builder run on one brief may take 30 minutes at most, including any test it runs on its own phone agent. You may run it more than once and submit the phone agent of one run, with that run's trace.
-- Equal scores are ranked by the total promised amount on the customers that passed, then by shorter build time, then by earlier submission.
-- Your builder must leave a trace of each run: start and end time, each model call it made (model and a one-line purpose), what it created on Freya, and any test it ran on its own agent. Plain text, no fixed format. You submit one trace per final brief.
-- All data here is synthetic. Do not bring real customer data.
-
-## When something does not work
-
-- `error code: 1010` in an HTML page: your request has no browser-like `User-Agent`. `freya.py` sets one.
-- `Workspace plan limit reached`: you created too many workflows. Update one in place.
-- You changed your builder and the score did not move at all: an updated workflow must be published before a simulation uses it. `freya.save_workflow` publishes. A plain `PUT` does not. See "Update a workflow" in `docs/api.md`.
-- A customer fails and you do not see why: `freya.get_call(call_id)["messages"]` is the full transcript with the tool calls. `run_cases.py --out results/run.json` saves the call id of every customer.
-- Calls end as `customer-ended-call` before the phone agent is done: it was silent too long and the customer hung up, as a person would. `run_cases.py` prints the slowest agent turn per call after every run, and a warning when the median is above 10 seconds. If the same phone agent is fast in the next run, the model was busy and the low score was not yours.
-- You want to see what your phone agent says without waiting for a simulation: `POST /api/v2/chat/message` runs one turn at a time. See `docs/api.md`.
-- The bank answers `unknown product_id`: the model made an id up. Product ids come from `get_account` (`p1`, `p2`, ...). Give them to the model in the tool result, or fill them in with code.
-- A simulation stays at "running" and no call ever starts: the workflow cannot start a call. Try one chat turn. Leave `agent_config` out of the workflow you send.
-- The agent says nothing after a tool call and the customer hangs up: see "Tool results and the next turn" in `docs/tools-and-code.md`.
+- The final agent was built in two runs, not one fresh run of the submitted command.
+- There is no independent held-out score for the final agent: it was repaired against the case's
+  own examples and callers the builder wrote.
+- The build with the compact rule list scored 0 of 6 on its first test and was stopped for time, so
+  the rule list's value on the final case is unmeasured.
+- The deployed mock is not the version in `mock/`. It returned 622 of 623 listed answers exactly;
+  the difference is one error case the agent never triggers.
+- Ideas not built: letting the compiler own "read back, clear yes, write once" for any write and
+  exact speech for prepared text, and replaying only the failed callers in a repair round.
